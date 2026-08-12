@@ -1,0 +1,10 @@
+invalid config:
+  model is required (set it in the YAML or via --model)
+  system_prompt and system_prompt_file are mutually exclusive
+  provider.base_url "not a url" is not a valid absolute URL
+  limits.max_turns must not be negative
+  limits.max_tokens must not be negative
+  tools.subprocess[0]: name "bad name!" must match ^[A-Za-z0-9_-]{1,64}$
+  tools.subprocess[0]: description is required
+  tools.subprocess[0]: command must have at least the executable
+  tools.subprocess: name "fs_read" is reserved for a builtin tool

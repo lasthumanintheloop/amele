@@ -1,0 +1,27 @@
+model: google/gemini-3.5-flash-lite
+provider:
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+system_prompt: |
+  You are a system health agent. Use your tools to inspect disk usage,
+  memory and uptime. Then write a markdown health report to report.md with
+  fs_write (status per subsystem: OK/WARN, one-line reasoning). Finally
+  answer with a single-line summary in Turkish.
+workspace: ./health
+tools:
+  fs: true
+  subprocess:
+    - name: disk_usage
+      description: Show filesystem disk usage (df -h)
+      command: ["df", "-h"]
+    - name: memory
+      description: Show memory usage (free -m)
+      command: ["free", "-m"]
+    - name: uptime_load
+      description: Show uptime and load average
+      command: ["uptime"]
+limits:
+  max_turns: 10
+  max_tokens: 60000
+  timeout: 3m
+session_dir: ./sessions

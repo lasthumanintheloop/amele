@@ -1,0 +1,20 @@
+model: openai/gpt-5.6-luna
+provider:
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+system_prompt: |
+  You are an LLM judge. Use the ask_model tool THREE times with the SAME
+  question but different --model values to collect answers from three
+  models, then compare them and output a ranking (best to worst) with a
+  one-line justification each. Models to use:
+  gpt-5.6-luna=openai/gpt-5.6-luna, gemini=google/gemini-3.5-flash-lite,
+  qwen=qwen/qwen3.7-flash. Pass args as: ["run","solver.yaml","--model","<model-id>","<the question>"].
+workspace: .
+tools:
+  subprocess:
+    - name: ask_model
+      description: Run a solver agent with a chosen model. args = [run, solver.yaml, --model, MODEL_ID, QUESTION]
+      command: ["/home/workstation/Projects/amele/amele"]
+      allow_args: true
+      timeout: 90s
+limits: { max_turns: 8, max_tokens: 80000, timeout: 4m }

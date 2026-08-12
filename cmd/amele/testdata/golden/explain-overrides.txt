@@ -1,0 +1,60 @@
+OVERRIDES
+  --set model="cli-model"
+  --set workspace="<TMP>/other-ws"
+  --set limits.max_turns="3"
+  --set limits.max_tokens="500"
+  --set session_dir=""
+  --set output.max_schema_retries="4"
+  --set prompt="summarize {{input}}"
+
+MODEL & PROVIDER
+  model:           "cli-model" (overridden via --set)
+  provider type:   "openai"
+  base_url:        "https://api.example.com/v1"
+  request_timeout: default (120s)
+
+TOOLS
+  workspace: "<TMP>/other-ws" (overridden via --set)
+  fs builtins (fs_read, fs_write, fs_list): enabled
+  shell: ENABLED (model-written command lines run via sh -c)
+    allow patterns: (none)
+    deny patterns:  (none)
+    timeout: default (60s)
+  subprocess tools:
+    - "grep_logs": exec ["sh" "-c" "grep -i error /var/log/app.log"] (timeout 30s, model-supplied args: no)
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+  executables:
+    "sh"                      ✓ found
+  env allowlists (variables the tool's process may read):
+    "shell"         "TZ"
+    "grep_logs"     "TZ", "LOG_DIR"
+
+PERMISSIONS
+  default policy: "allow"
+  per-tool overrides:
+    "fs_write": "ask"
+    "ghost_tool": "deny"
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  3 (overridden via --set)
+  max_tokens: 500 (overridden via --set)
+  timeout:    5m0s
+
+CONCURRENCY
+  lock: enabled (a run started while another holds <config>.lock exits 7)
+
+OUTPUT
+  schema: present (stdout carries only schema-valid JSON)
+  max_schema_retries: 4 (overridden via --set)
+
+SESSION
+  session_dir: none (no audit log) (overridden via --set)
+
+WARNINGS
+  - permission entry "ghost_tool" matches no tool - typo?
+  - tools.shell is enabled with no allow or deny patterns: any command the model writes will run
+  - session_dir is not set: no session log (audit trail) will be written

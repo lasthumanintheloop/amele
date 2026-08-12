@@ -1,0 +1,156 @@
+// Package tools implements the builtin tools (sandboxed filesystem access,
+// subprocess execution, an opt-in shell) and the registry the agent loop
+// dispatches through.
+//
+// Design rules carried by this package:
+//   - fs tools never escape the configured workspace (path sandbox),
+//   - subprocess tools execute a fixed argv vector declared in the YAML - the
+//     model supplies stdin, never the command,
+//   - the shell tool is the one exception and is therefore disabled by
+//     default; its allow/deny patterns are accident prevention, and the real
+//     boundary is the OS/container (see shell.go, docs/threat-model.md),
+//   - every child process goes through one helper (runCommand) so the process
+//     group, output caps and timeout attribution cannot drift apart,
+//   - tool failures are returned as result text for the model to react to,
+//     not as Go errors; Go errors are reserved for harness-level problems.
+package tools
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	"github.com/lasthumanintheloop/amele/internal/llm"
+)
+
+// Tool is one callable capability offered to the model.
+type Tool interface {
+	// Def returns the definition advertised to the provider.
+	Def() llm.ToolDef
+	// Invoke executes the tool. The returned string is shown to the model
+	// verbatim. An error return means the harness itself failed (not the
+	// tool's task); the loop converts it to an error result for the model.
+	Invoke(ctx context.Context, rawArgs string) (string, error)
+}
+
+// Outcome classifies how one tool call ended, for callers that need to tell a
+// working tool from a failing one.
+//
+// It exists because Invoke's `(string, error)` pair deliberately cannot express
+// this: a rejected command, a non-zero exit and a timeout are TASK information
+// the model must read as ordinary result text, so they come back with a nil
+// error (see the package comment). That is right for the model and useless for
+// an operator watching `amele run -v`, who was told every one of them was "ok".
+// The outcome is the second, out-of-band answer to "what happened", carried
+// beside the text instead of inside it.
+//
+// CONTRACT: this type is INTERNAL and stays that way - its kinds are the
+// runner's vocabulary for what a child process did, not the log's. The session
+// event publishes a separate, frozen enum (session.ToolOutcome,
+// docs/contracts/jsonl-events.md) that internal/loop maps onto; adding a kind
+// here therefore needs a deliberate decision about which published outcome it
+// becomes, and renaming one must not touch the schema at all.
+//
+// The zero value is the OK outcome, so a tool that does not classify its
+// endings (the fs tools: they either succeed or return a Go error) needs to say
+// nothing.
+type Outcome struct {
+	// Kind is what happened.
+	Kind OutcomeKind
+	// ExitCode is the process exit status; meaningful only for OutcomeExit.
+	ExitCode int
+}
+
+// OutcomeKind enumerates the ways a tool call can end without a Go error.
+type OutcomeKind int
+
+// Outcome kinds. OutcomeOK is the zero value on purpose: an unclassified call
+// is a successful one, because everything else is a Go error the loop already
+// reports.
+const (
+	// OutcomeOK means the tool did its job.
+	OutcomeOK OutcomeKind = iota
+	// OutcomeRejected means an operator policy refused the call before it ran
+	// (the shell tool's allow/deny patterns).
+	OutcomeRejected
+	// OutcomeTimedOut means the tool's own timeout killed the command.
+	OutcomeTimedOut
+	// OutcomeAborted means the RUN ended under the command - its overall
+	// timeout or a SIGINT/SIGTERM - not the tool's own budget.
+	OutcomeAborted
+	// OutcomeExit means the command ran to completion and failed; ExitCode
+	// carries its status.
+	OutcomeExit
+)
+
+// String renders the outcome as the short operator-facing phrase progress
+// consumers embed verbatim ("ok", "rejected", "timed out", "aborted",
+// "exit 3"). It lives here, next to the code that knows WHY a call ended, so
+// there is one wording rather than one per consumer. The phrasing is
+// human-facing text, not a parsing contract.
+func (o Outcome) String() string {
+	switch o.Kind {
+	case OutcomeRejected:
+		return "rejected"
+	case OutcomeTimedOut:
+		return "timed out"
+	case OutcomeAborted:
+		return "aborted"
+	case OutcomeExit:
+		return fmt.Sprintf("exit %d", o.ExitCode)
+	case OutcomeOK:
+		return "ok"
+	default:
+		// Unreachable unless a kind is added without a case here; naming the
+		// number beats printing a confident "ok" over an unknown state.
+		return fmt.Sprintf("outcome %d", int(o.Kind))
+	}
+}
+
+// Registry holds the enabled tools for one run, preserving registration
+// order (definition order is part of the harness token budget and must be
+// stable for deterministic replay).
+type Registry struct {
+	byName map[string]Tool
+	order  []string
+}
+
+// NewRegistry returns an empty registry.
+func NewRegistry() *Registry {
+	return &Registry{byName: map[string]Tool{}}
+}
+
+// Register adds a tool. Duplicate names are a programming error caught at
+// startup rather than a silent overwrite mid-run.
+func (r *Registry) Register(t Tool) error {
+	name := t.Def().Name
+	if _, exists := r.byName[name]; exists {
+		return fmt.Errorf("tool %q registered twice", name)
+	}
+	r.byName[name] = t
+	r.order = append(r.order, name)
+	return nil
+}
+
+// Get looks a tool up by name.
+func (r *Registry) Get(name string) (Tool, bool) {
+	t, ok := r.byName[name]
+	return t, ok
+}
+
+// Defs returns all tool definitions in registration order.
+func (r *Registry) Defs() []llm.ToolDef {
+	defs := make([]llm.ToolDef, 0, len(r.order))
+	for _, name := range r.order {
+		defs = append(defs, r.byName[name].Def())
+	}
+	return defs
+}
+
+// Names returns the registered tool names sorted alphabetically, for stable
+// log/error output.
+func (r *Registry) Names() []string {
+	names := append([]string(nil), r.order...)
+	sort.Strings(names)
+	return names
+}

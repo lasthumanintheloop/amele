@@ -1,0 +1,6 @@
+/amele
+/dist/
+/coverage.out
+/sessions/
+.context/
+.gstack/

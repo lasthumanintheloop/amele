@@ -1,0 +1,46 @@
+PROBLEMS (this config would fail `amele run`)
+  - undefined environment variable(s): PACK_KEY - set them before running (see REQUIREMENTS below)
+  - model is required (set it in the YAML or via --model)
+
+MODEL & PROVIDER
+  model:           (unset)
+  provider type:   "openai"
+  base_url:        "https://api.example.com/v1"
+  request_timeout: default (120s)
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): disabled
+  shell: disabled
+  subprocess tools:
+    - "notify": exec ["/opt/nonexistent/notify"] (timeout default (60s), model-supplied args: no)
+
+REQUIREMENTS
+  env:
+    PACK_KEY        ✗ MISSING
+  executables:
+    "/opt/nonexistent/notify" ✗ MISSING
+  env allowlists (variables the tool's process may read):
+    "notify"        "MAILTO"
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  4
+  max_tokens: 1000
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+
+WARNINGS
+  - session_dir is not set: no session log (audit trail) will be written

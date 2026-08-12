@@ -1,0 +1,51 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "openai"
+  base_url:        "https://api.example.com/v1"
+  request_timeout: default (120s)
+
+TOOLS
+  workspace: "<TMP>/ws"
+  fs builtins (fs_read, fs_write, fs_list): enabled
+  shell: ENABLED (model-written command lines run via sh -c)
+    allow patterns: (none)
+    deny patterns:  (none)
+    timeout: default (60s)
+  subprocess tools:
+    - "grep_logs": exec ["sh" "-c" "grep -i error /var/log/app.log"] (timeout 30s, model-supplied args: no)
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+  executables:
+    "sh"                      ✓ found
+  env allowlists (variables the tool's process may read):
+    "shell"         "TZ"
+    "grep_logs"     "TZ", "LOG_DIR"
+
+PERMISSIONS
+  default policy: "allow"
+  per-tool overrides:
+    "fs_write": "ask"
+    "ghost_tool": "deny"
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  10
+  max_tokens: UNBOUNDED (no token budget)
+  timeout:    5m0s
+
+CONCURRENCY
+  lock: enabled (a run started while another holds <config>.lock exits 7)
+
+OUTPUT
+  schema: present (stdout carries only schema-valid JSON)
+  max_schema_retries: 2 (default)
+
+SESSION
+  session_dir: "<TMP>/sessions"
+
+WARNINGS
+  - permission entry "ghost_tool" matches no tool - typo?
+  - tools.shell is enabled with no allow or deny patterns: any command the model writes will run
+  - limits.max_tokens is 0: no token budget bounds this run

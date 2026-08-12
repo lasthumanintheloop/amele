@@ -1,0 +1,11 @@
+{"v":1,"type":"run_start","ts":"2026-08-12T09:00:02Z","model":"test-model","task":"task"}
+{"v":1,"type":"llm_response","ts":"2026-08-12T09:00:03Z","turn":1,"tool_call_ids":["c1"],"input_tokens":10,"output_tokens":5,"finish_reason":"tool_calls"}
+{"v":1,"type":"tool_call","ts":"2026-08-12T09:00:04Z","tool_call_id":"c1","tool":"shell","args":"{\"command\":\"rm -rf /tmp/x\"}"}
+{"v":1,"type":"tool_result","ts":"2026-08-12T09:00:05Z","tool_call_id":"c1","tool":"shell","result":"command rejected by shell policy: the line \"rm -rf /tmp/x\" matches the deny pattern \"rm *\". Try a different command.","outcome":"denied_policy","result_bytes":116}
+{"v":1,"type":"llm_response","ts":"2026-08-12T09:00:06Z","turn":2,"tool_call_ids":["c2"],"input_tokens":10,"output_tokens":5,"finish_reason":"tool_calls"}
+{"v":1,"type":"tool_call","ts":"2026-08-12T09:00:07Z","tool_call_id":"c2","tool":"shell","args":"{\"command\":\"echo out; echo err \u003e\u00262; exit 3\"}"}
+{"v":1,"type":"tool_result","ts":"2026-08-12T09:00:08Z","tool_call_id":"c2","tool":"shell","result":"exit status 3\nstdout:\nout\n\nstderr:\nerr","outcome":"nonzero_exit","result_bytes":38,"exit_code":3}
+{"v":1,"type":"llm_response","ts":"2026-08-12T09:00:09Z","turn":3,"tool_call_ids":["c3"],"input_tokens":10,"output_tokens":5,"finish_reason":"tool_calls"}
+{"v":1,"type":"tool_call","ts":"2026-08-12T09:00:10Z","tool_call_id":"c3","tool":"shell","args":"{\"command\":\"sleep 5\"}"}
+{"v":1,"type":"tool_result","ts":"2026-08-12T09:00:11Z","tool_call_id":"c3","tool":"shell","result":"command timed out after 100ms\nstdout:\n","outcome":"timeout","result_bytes":38}
+{"v":1,"type":"llm_response","ts":"2026-08-12T09:00:12Z","turn":4,"content":"done","input_tokens":20,"output_tokens":5,"finish_reason":"stop"}

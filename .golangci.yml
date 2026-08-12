@@ -1,0 +1,35 @@
+# Lint policy (docs/engineering.md §5.1). Violations block merge; //nolint requires a
+# same-line justification comment.
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - revive
+    - gosec
+    - misspell
+    - gocyclo
+    - nolintlint
+  settings:
+    gocyclo:
+      min-complexity: 15
+    # nolintlint machine-enforces the docs/engineering.md §5.1 rule that every //nolint
+    # is linter-specific and carries a justification.
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    revive:
+      rules:
+        # Exported-symbol comments are mandatory (docs/engineering.md §5.2).
+        - name: exported
+          severity: error
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

@@ -1,0 +1,12 @@
+model: openai/gpt-5.6-luna
+# api_key is quoted: inside a YAML flow mapping the "{" of ${VAR} would
+# otherwise terminate the plain scalar and break the parse.
+provider: { base_url: https://openrouter.ai/api/v1, api_key: "${OPENROUTER_API_KEY}" }
+system_prompt: "You must ALWAYS call the poke tool. Never answer directly. Keep poking forever."
+workspace: .
+tools:
+  subprocess:
+    - name: poke
+      description: poke the system, returns ok
+      command: ["echo", "ok, keep going"]
+limits: { max_turns: 3, max_tokens: 100000, timeout: 60s }
