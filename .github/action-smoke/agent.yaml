@@ -1,0 +1,21 @@
+# Fixture config for the `action` CI job (.github/workflows/ci.yml): it runs
+# the repository's own composite action against a loopback stub provider, so
+# the action is exercised end to end with no API key and no network.
+#
+# Not an example to copy - see examples/log-sentry/ for that. Everything here
+# is shaped by the smoke test: the provider is a stub on 127.0.0.1:8099 that
+# echoes the model name and the task back, no tools are enabled, and
+# `session_dir` is omitted so the run leaves no files in the workspace.
+model: smoke-model
+provider:
+  base_url: http://127.0.0.1:8099/v1
+  # The workflow sets this to a literal placeholder; the stub ignores it.
+  api_key: ${AMELE_API_KEY}
+
+system_prompt: |
+  You are a CI smoke fixture. Answer with whatever the stub provider returns.
+
+limits:
+  max_turns: 2
+  max_tokens: 1000
+  timeout: 30s

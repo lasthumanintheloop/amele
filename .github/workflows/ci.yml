@@ -1,0 +1,98 @@
+# CI gate: every PR must pass formatting, lint, tests (with race detector),
+# the coverage budget and the binary size budget (docs/engineering.md §8).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Reproducible-build gate (docs/engineering.md §8): the dependency graph must be
+      # tidy and go.sum must verify before anything else runs.
+      - name: Verify modules
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: Format check
+        run: make fmt
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned (not "latest"): an unpinned linter makes the merge gate
+          # drift over time, against the reproducibility rule.
+          version: v2.12.2
+
+      - name: Tests
+        run: make test
+
+      - name: Race detector
+        run: make race
+
+      - name: Coverage budget (>= 80%)
+        run: make cover
+
+      - name: Binary size budget (<= 10 MB)
+        run: make budget
+
+  # The composite action at the repository root is shipped code that no other
+  # job touches, so without this it can rot while ci stays green. The job runs
+  # the action from the checkout (`uses: ./`) against a loopback stub provider:
+  # hermetic - no repository secret, no traffic beyond 127.0.0.1 and what
+  # setup-go already fetches - and it asserts what the action promises, that
+  # every input reaches `amele run` and its stdout comes back as `answer`.
+  action:
+    runs-on: ubuntu-latest
+    # Job-level env, the form docs/github-action.md documents. The value is a
+    # literal placeholder: the stub never checks it, it only has to exist so
+    # the config's ${AMELE_API_KEY} interpolates.
+    env:
+      AMELE_API_KEY: not-a-real-key
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stub provider
+        run: |
+          python3 .github/action-smoke/stub_provider.py 8099 &
+          # Wait for the listener instead of sleeping: a fixed sleep is either
+          # flaky or slow, and a stub that never comes up must fail here
+          # rather than as a confusing provider error inside the action.
+          for _ in $(seq 50); do
+            curl -fs -o /dev/null http://127.0.0.1:8099/ && exit 0
+            sleep 0.2
+          done
+          echo "stub provider did not start" >&2
+          exit 1
+
+      - id: smoke
+        uses: ./
+        with:
+          config: .github/action-smoke/agent.yaml
+          task: action smoke
+          model: smoke-model-override
+
+      - name: Assert the answer came back through the action
+        # The stub echoes "<model>|<task>", so this one assertion covers all
+        # three inputs plus the output plumbing. ANSWER travels via env, never
+        # spliced into the script (same rule as docs/github-action.md).
+        env:
+          ANSWER: ${{ steps.smoke.outputs.answer }}
+        run: printf '%s' "$ANSWER" | grep -Fqx 'smoke-model-override|action smoke'

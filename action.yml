@@ -1,0 +1,89 @@
+# amele as a GitHub Action: build the bundled source, run one agent, expose
+# its stdout as an output. Usage and examples: docs/github-action.md.
+#
+# The action lives inside the amele repository and builds from its own bundled
+# source (github.action_path), so the `uses: lasthumanintheloop/amele@<ref>` line already
+# pins the amele version. A separate `version` input was considered and
+# dropped: it would let the action's script and the binary it builds drift
+# apart, for no gain over pinning the ref.
+name: amele
+description: >-
+  Run an amele agent - one YAML config, one static Go binary - as a CI step
+  and capture its answer as a step output.
+
+# Marketplace listing looks: a terminal glyph because that is what amele is (a
+# CLI in CI), in the sober end of the palette rather than a color that competes
+# for attention in a workflow log.
+branding:
+  icon: terminal
+  color: gray-dark
+
+inputs:
+  config:
+    description: Path to the agent YAML config, relative to the workspace.
+    required: true
+  task:
+    description: >-
+      Task text passed to `amele run`. Optional; without it the agent uses the
+      config's prompt/stdin rules (docs/contracts/cli.md).
+    required: false
+    default: ""
+  model:
+    description: Override the config's `model` for this run (`--model`).
+    required: false
+    default: ""
+
+outputs:
+  answer:
+    description: >-
+      The agent's final answer - `amele run` stdout, which is exactly the
+      answer on success and empty on any failure.
+    value: ${{ steps.run.outputs.answer }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache-dependency-path: ${{ github.action_path }}/go.sum
+
+    - name: Build amele
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/amele" ./cmd/amele
+
+    - name: Run amele
+      id: run
+      shell: bash
+      # SECURITY: inputs reach the script as environment variables, never via
+      # ${{ }} interpolation inside `run:` - task text with quotes/backticks
+      # must not become shell syntax.
+      env:
+        AMELE_ACTION_CONFIG: ${{ inputs.config }}
+        AMELE_ACTION_TASK: ${{ inputs.task }}
+        AMELE_ACTION_MODEL: ${{ inputs.model }}
+      run: |
+        args=("$AMELE_ACTION_CONFIG")
+        if [ -n "$AMELE_ACTION_MODEL" ]; then
+          args+=(--model "$AMELE_ACTION_MODEL")
+        fi
+        if [ -n "$AMELE_ACTION_TASK" ]; then
+          args+=("$AMELE_ACTION_TASK")
+        fi
+        # CONTRACT: stdout carries the product (docs/contracts/cli.md), so it
+        # goes to a file first - that preserves the run's exit code, which
+        # must propagate so workflows fail when the agent fails.
+        out="$RUNNER_TEMP/amele-answer.txt"
+        code=0
+        "$RUNNER_TEMP/amele" run "${args[@]}" > "$out" || code=$?
+        # Multiline-output heredoc pattern; $RANDOM keeps an answer that
+        # happens to contain the delimiter from terminating it early.
+        delim="AMELE_EOF_$RANDOM"
+        {
+          echo "answer<<$delim"
+          cat "$out"
+          echo "$delim"
+        } >> "$GITHUB_OUTPUT"
+        exit "$code"
