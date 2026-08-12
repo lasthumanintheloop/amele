@@ -1,11 +1,11 @@
 # amele
 
-<!-- Badge row - uncomment once CI has run on GitHub:
 [![CI](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml/badge.svg)](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/lasthumanintheloop/amele)](https://goreportcard.com/report/github.com/lasthumanintheloop/amele)
 ![Go version](https://img.shields.io/github/go-mod/go-version/lasthumanintheloop/amele)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+<!-- release badge lands with the first tag:
 ![Release](https://img.shields.io/github/v/release/lasthumanintheloop/amele)
-(license badge lands with the LICENSE decision)
 -->
 
 *amele /ah-meh-leh/ - an old word for the one who quietly does the work,
