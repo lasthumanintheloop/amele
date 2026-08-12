@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "amele agent configuration",
+  "description": "The single YAML file that defines an amele agent: model, provider endpoint, prompts, tools, budgets and output contract. Any string value may contain ${ENV_VAR} references, which amele substitutes from the process environment at load time (write $$ for a literal $); this schema mostly describes the shape after that interpolation. Integer and duration fields additionally accept a whole-value ${VAR} reference, because filling budgets from the environment is the normal headless/cron idiom. Known editor-time limitation: boolean fields (e.g. tools.fs) and enum fields (provider.type, permission policies) remain strictly typed here, so a ${VAR} placeholder in those is flagged by editors even though amele itself would accept and interpolate it. Unknown keys are rejected at load time, mirrored here by additionalProperties: false.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "model": {
+      "type": "string",
+      "description": "Model identifier sent to the provider, e.g. \"gpt-4.1-mini\" or \"openai/gpt-5.6-luna\". Required unless overridden on the command line with --model."
+    },
+    "provider": {
+      "type": "object",
+      "description": "The LLM endpoint the agent talks to: an OpenAI-compatible HTTP API (the default) or the native Anthropic Messages API, selected by type.",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": ["openai", "anthropic"],
+          "description": "Wire protocol: \"openai\" for OpenAI-compatible endpoints (also the meaning when omitted), \"anthropic\" for the native Anthropic Messages API."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "API root, e.g. \"https://api.openai.com/v1\". Required for OpenAI-compatible endpoints. With type \"anthropic\" it may be omitted (the client defaults to the official endpoint) and must NOT end with /v1 - the client appends /v1/messages itself."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "Bearer token for the provider. Must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are rejected at load time. An empty key is valid for local endpoints such as Ollama."
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/duration",
+          "description": "Upper bound for a single HTTP round-trip to the provider, e.g. \"120s\". Empty or omitted means the client default (120s). Distinct from limits.timeout, which bounds the whole run: slow reasoning models can need several minutes for one generation."
+        },
+        "max_output_tokens": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Per-request output token ceiling sent as max_tokens on the Anthropic path (that API requires the field; 0 means the client default). Ignored by the OpenAI path, where the server-side default applies. May also be a whole-value ${VAR} environment reference resolved at load time."
+        }
+      }
+    },
+    "system_prompt": {
+      "type": "string",
+      "description": "Inline system prompt for the agent. Mutually exclusive with system_prompt_file."
+    },
+    "system_prompt_file": {
+      "type": "string",
+      "description": "Path to a file holding the system prompt, resolved relative to the config file. Keeps long prompts out of the YAML. Mutually exclusive with system_prompt."
+    },
+    "prompt": {
+      "type": "string",
+      "description": "User-message template. May reference {{args}} (task text from the command line) and {{input}} (piped stdin). Omitted means a sensible default combining both."
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Directory sandbox for the fs tools and working directory for subprocess and shell tools. Relative paths are resolved against the config file's directory, which is also the default."
+    },
+    "tools": {
+      "type": "object",
+      "description": "Selects which builtin tools are enabled and declares custom subprocess tools.",
+      "additionalProperties": false,
+      "properties": {
+        "fs": {
+          "type": "boolean",
+          "description": "Enables the builtin sandboxed filesystem tools (fs_read/fs_write/fs_list). They cannot reach outside the workspace."
+        },
+        "shell": {
+          "type": "object",
+          "description": "The builtin `shell` tool, which runs a model-written command line through `sh -c` in the workspace. Absent means disabled. SECURITY: allow/deny patterns are accident prevention, not a security boundary - the boundary is the OS/container the agent runs in.",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Turns the shell tool on. Default (false) means the model has no shell; nothing else can enable it."
+            },
+            "allow": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Glob patterns (`*` matches any substring) matched against the whole command string. An empty list allows everything Deny does not catch; a non-empty list requires at least one match."
+            },
+            "deny": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Glob patterns checked BEFORE allow. Any match rejects the command."
+            },
+            "env": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "uniqueItems": true,
+              "description": "Environment allowlist for shell commands. When non-empty, the child process is started with ONLY the listed variables (plus PATH, HOME and LANG, which are always passed so basic tools keep working); values are taken from amele's own environment and listed names that are unset are silently skipped. Empty or omitted means the child inherits amele's entire environment. SECURITY: this reduces credential exposure to model-written commands, but the boundary remains the OS/container the agent runs in."
+            },
+            "timeout": {
+              "$ref": "#/$defs/duration",
+              "description": "Upper bound for a single shell command, e.g. \"60s\". Empty or omitted means the default (60s)."
+            }
+          }
+        },
+        "subprocess": {
+          "type": "array",
+          "description": "Custom executable tools. Each command is a fixed argv vector - no shell is involved, so the model can never inject into a shell string.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "description", "command"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,64}$",
+                "description": "Tool name exposed to the model. Restricted to letters, digits, `_` and `-` (max 64 chars). The builtin names fs_read, fs_write, fs_list and shell are reserved."
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Tells the model what the tool does and when to use it. Required - an undescribed tool is unusable to the model."
+              },
+              "command": {
+                "type": "array",
+                "prefixItems": [{ "type": "string", "minLength": 1 }],
+                "items": { "type": "string" },
+                "minItems": 1,
+                "description": "Argv vector to execute; the first element is the executable and must be non-empty. The model writes to the process's stdin and reads its stdout. Path-like relative commands (containing a path separator, e.g. ./tools/scan.sh) resolve against the config file's directory; bare names resolve from PATH."
+              },
+              "timeout": {
+                "$ref": "#/$defs/duration",
+                "description": "Upper bound for a single invocation, e.g. \"30s\". Empty or omitted means the default (60s)."
+              },
+              "allow_args": {
+                "type": "boolean",
+                "description": "Lets the model append extra argv elements after command. SECURITY: disabled by default - with it off the model controls stdin only, never the argument vector."
+              },
+              "env": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "uniqueItems": true,
+                "description": "Environment allowlist for this tool's process. When non-empty, the child is started with ONLY the listed variables (plus PATH, HOME and LANG, which are always passed so basic tools keep working); values are taken from amele's own environment and listed names that are unset are silently skipped. Empty or omitted means the child inherits amele's entire environment. SECURITY: this reduces credential exposure to model-driven commands, but the boundary remains the OS/container the agent runs in."
+              }
+            }
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "description": "Run budgets - the kill switches that make an agent safe to leave unattended in cron. Exceeding any of them ends the run with exit code 3.",
+      "additionalProperties": false,
+      "properties": {
+        "max_turns": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Upper bound on provider round-trips. 0 (or omitted) means the default (20). May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "max_tokens": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Upper bound on cumulative input+output tokens as reported by the provider - the primary budget unit. 0 (or omitted) disables the token budget. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "timeout": {
+          "$ref": "#/$defs/duration",
+          "description": "Wall-clock bound for the whole run (`amele run`) or for one exchange (`amele chat`), e.g. \"5m\". Empty or omitted disables it."
+        }
+      }
+    },
+    "session_dir": {
+      "type": "string",
+      "description": "Enables append-only JSONL session logging into this directory when non-empty. Relative paths are resolved against the config file's directory. Interpolated environment values are redacted from the log."
+    },
+    "lock": {
+      "type": "boolean",
+      "description": "Makes `amele run` single-flight per config file: it takes a non-blocking advisory lock on \"<config path>.lock\" before contacting the provider, and a run that finds the lock held exits with code 7 without doing anything. Only run locks - validate, explain and chat never do. Default false (opt-in), so the same config can still be run concurrently with different tasks; cron jobs that must not overlap themselves set it to true."
+    },
+    "output": {
+      "type": "object",
+      "description": "Constrains the run's final answer to a JSON Schema. With a schema set, stdout carries only JSON that validated against it, and a run whose answers never validate exits with code 6.",
+      "additionalProperties": false,
+      "properties": {
+        "schema": {
+          "type": "object",
+          "description": "Inline JSON Schema (draft 2020-12 by default) written as a YAML mapping. External $ref targets are rejected - inline everything with $defs. Empty or omitted means no constraint: the final answer is plain text."
+        },
+        "max_schema_retries": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "How many times the model receives validator feedback before the run fails with exit 6. 0 (or omitted) means the default (2). May also be a whole-value ${VAR} environment reference resolved at load time."
+        }
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "description": "Per-run tool approval profile: one fallback policy plus per-tool overrides. An absent block allows every tool. With no TTY attached, every \"ask\" degrades to a logged denial.",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/policy",
+          "description": "Policy applied to any tool without an entry in tools. Omitted means allow."
+        },
+        "tools": {
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/policy" },
+          "description": "Maps a tool name to its policy, overriding default. Entries for tools that do not exist in this config are inert, so profiles can be shared across configs."
+        }
+      }
+    }
+  },
+  "$defs": {
+    "duration": {
+      "type": "string",
+      "anyOf": [
+        { "pattern": "^(([0-9]+(\\.[0-9]+)?(ns|us|µs|μs|ms|s|m|h))+)?$" },
+        { "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$" }
+      ],
+      "description": "Go duration string: one or more number+unit segments, e.g. \"30s\", \"5m\", \"1h30m\", \"1.5s\". Units: ns, us (or µs), ms, s, m, h. Negative durations are rejected; an empty string means \"use the default\". May also be a whole-value ${VAR} environment reference resolved at load time."
+    },
+    "policy": {
+      "enum": ["allow", "ask", "deny"],
+      "description": "Permission ruling for a tool call: \"allow\" runs it without asking, \"ask\" prompts the human on the terminal (degrading to deny when no TTY is attached), \"deny\" refuses the call while the run continues with the remaining tools."
+    }
+  }
+}
