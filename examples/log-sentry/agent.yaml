@@ -1,0 +1,53 @@
+# log-sentry: the canonical agent pack demo.
+#
+# Scans application logs and emails a triage summary. Deploy with exactly one
+# folder plus one crontab line:
+#
+#   0 3 * * *  cd /srv/myapp && amele run log-sentry/ "daily log triage"
+#
+# Requires: AMELE_API_KEY (a key for the endpoint in base_url below - any
+# OpenAI-compatible one works) and a sendmail-compatible binary (msmtp,
+# sendmail) for the email tool.
+
+model: gpt-4.1-mini
+provider:
+  base_url: https://api.openai.com/v1
+  # AMELE_API_KEY, not OPENAI_API_KEY: the variable belongs to this agent, not
+  # to the vendor behind base_url, and every amele doc (init, deployment, the
+  # GitHub Action) names it that way. Point base_url elsewhere and the key
+  # changes without the config having to.
+  api_key: ${AMELE_API_KEY}
+
+system_prompt: |
+  You are a log triage agent. Read the application logs in the workspace
+  with fs_read/fs_list, identify errors and anomalies from the last 24
+  hours, and send a short email report with the send_email tool.
+
+  Email format: subject line first ("Subject: ..."), blank line, then a
+  plain-text summary. Severity first, details after. If the logs are clean,
+  send a one-line all-clear instead.
+
+# The workspace is the log directory; the agent cannot read outside it.
+workspace: ./logs
+
+tools:
+  fs: true
+  subprocess:
+    - name: send_email
+      description: >
+        Send an email. Pipe the full RFC-822 message (To/Subject headers,
+        blank line, body) to stdin.
+      command: ["msmtp", "-t"]
+      timeout: 30s
+
+limits:
+  max_turns: 15
+  max_tokens: 150000
+  timeout: 5m
+
+session_dir: ./sessions
+
+# Single-flight: if a run ever outlives the interval between crontab ticks,
+# the next tick exits 7 instead of starting a second triage that would read
+# the same logs and send a duplicate email.
+lock: true
