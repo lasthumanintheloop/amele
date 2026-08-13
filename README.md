@@ -14,6 +14,8 @@ from the Semitic root ʿ-m-l, "to labor": Hebrew ʿamal (עָמָל, toil), Arab
 **Your agent is a single YAML file. Its runtime is a single static binary.
 Together they run anywhere - no Python, no Node, no platform, no account.**
 
+![an agent in a pipe: log in, JSON out, then a crontab line](docs/demos/pipe.gif)
+
 - **Agent as an artifact.** Your agent *is* a file: version it, diff it,
   review it in a pull request, share it as a folder. Deleting an agent is
   `rm`.
@@ -98,6 +100,11 @@ $ amele run log-sentry/ "daily log triage"
 ✓ 4 turns, 6 tool calls, 21.3k tokens, 27.8s
 ```
 
+Here it is live - an 11-line agent finding the root cause in last night's
+logs (and dismissing a red herring on the way):
+
+![log triage live: the agent names the incident and its deploy](docs/demos/logsentry.gif)
+
 That folder is a *pack*: config, prompt and helper scripts travelling
 together, runnable from anywhere by path. Sharing an agent is sending a
 folder. See [docs/packs.md](docs/packs.md).
@@ -167,6 +174,18 @@ up to `max_schema_retries` repair rounds. And because an agent is just a
 process, agents compose like processes: a config whose subprocess tool runs
 `amele run` is an LLM judge with different models for worker and judge - no
 framework feature required. Details: [docs/features.md](docs/features.md).
+
+## Bring the tools you already have
+
+Any executable becomes a tool: name it, describe it, give the argv. No
+wrapper, no SDK, no rewrite - here is a 2007 Perl script answering
+questions as an agent tool, six YAML lines later:
+
+![a 2007 Perl CLI called live as an agent tool](docs/demos/perltool.gif)
+
+More demos: [build an agent in 40 seconds](docs/demos/d1-build.gif) ·
+[it fails like a program - exit 2, 3, 7](docs/demos/failmodes.gif) ·
+[audit an agent someone sent you](docs/demos/audit.gif)
 
 ## GitHub Action
 
