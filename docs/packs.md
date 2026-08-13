@@ -41,7 +41,8 @@ bare names resolve from PATH:
           command: ["./tools/scan.sh"]   # resolves against this folder
         - name: send_email
           description: Send a mail via msmtp
-          command: ["msmtp", "-t"]       # bare name: PATH lookup
+          command: ["msmtp", "${AMELE_MAIL_TO}"]   # bare name: PATH lookup;
+                                                   # recipient pinned in argv
 
 `workspace`, `session_dir` and `system_prompt_file` also resolve against
 the config file's directory, so the folder works from any cwd.

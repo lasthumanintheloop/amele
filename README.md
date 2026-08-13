@@ -86,7 +86,8 @@ tools:
   subprocess:
     - name: send_email
       description: Send an email. Pipe the RFC-822 message to stdin.
-      command: ["msmtp", "-t"]       # executable + argv, never a shell string
+      command: ["msmtp", "${AMELE_MAIL_TO}"]   # argv is fixed; the model
+                                     # writes the mail, never the recipient
       timeout: 30s
 
 limits: {max_turns: 15, max_tokens: 150000, timeout: 5m}

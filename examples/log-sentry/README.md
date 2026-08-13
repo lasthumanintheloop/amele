@@ -7,10 +7,13 @@ is an amele *pack*: `agent.yaml` is the whole agent; run it from anywhere.
 
 - `AMELE_API_KEY` - a key for the endpoint in `provider.base_url` (any
   OpenAI-compatible one; the config ships with OpenAI's).
+- `AMELE_MAIL_TO` - the address the report is sent to. It is interpolated
+  into the tool's argv, so the model never chooses the recipient (an
+  injected log line cannot redirect the mail).
 - `msmtp` (or another sendmail-compatible binary) on PATH for the
   `send_email` tool.
 
-Check both with: `amele explain log-sentry/`
+Check all three with: `amele explain log-sentry/`
 
 ## Run
 

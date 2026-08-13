@@ -6,8 +6,8 @@
 #   0 3 * * *  cd /srv/myapp && amele run log-sentry/ "daily log triage"
 #
 # Requires: AMELE_API_KEY (a key for the endpoint in base_url below - any
-# OpenAI-compatible one works) and a sendmail-compatible binary (msmtp,
-# sendmail) for the email tool.
+# OpenAI-compatible one works), AMELE_MAIL_TO (where the report goes), and a
+# sendmail-compatible binary (msmtp, sendmail) for the email tool.
 
 model: gpt-4.1-mini
 provider:
@@ -25,7 +25,8 @@ system_prompt: |
 
   Email format: subject line first ("Subject: ..."), blank line, then a
   plain-text summary. Severity first, details after. If the logs are clean,
-  send a one-line all-clear instead.
+  send a one-line all-clear instead. The recipient is fixed by the
+  operator; do not write a To header.
 
 # The workspace is the log directory; the agent cannot read outside it.
 workspace: ./logs
@@ -35,9 +36,15 @@ tools:
   subprocess:
     - name: send_email
       description: >
-        Send an email. Pipe the full RFC-822 message (To/Subject headers,
-        blank line, body) to stdin.
-      command: ["msmtp", "-t"]
+        Send an email to the operator. Pipe the message (Subject header,
+        blank line, body) to stdin; the recipient is already set.
+      # SECURITY: the recipient lives in the argv, which the model cannot
+      # touch - not in a To: header, which it writes. With `msmtp -t` an
+      # injected instruction in the logs could redirect the report (and
+      # whatever it quotes) to an attacker's address; with a fixed argv
+      # recipient, msmtp ignores whatever To: the model invents. Same
+      # rule as the threat model's hardened example (fixed argv).
+      command: ["msmtp", "${AMELE_MAIL_TO}"]
       timeout: 30s
 
 limits:
