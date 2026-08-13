@@ -13,9 +13,7 @@ no Python · no Node · no platform · no account
 [![CI](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml/badge.svg)](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml)
 ![Go version](https://img.shields.io/github/go-mod/go-version/lasthumanintheloop/amele)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-<!-- release badge lands with the first tag:
-![Release](https://img.shields.io/github/v/release/lasthumanintheloop/amele)
--->
+[![Release](https://img.shields.io/github/v/release/lasthumanintheloop/amele)](https://github.com/lasthumanintheloop/amele/releases/latest)
 
 </div>
 
