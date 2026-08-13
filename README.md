@@ -1,4 +1,14 @@
+<div align="center">
+
 # amele
+
+*/ah-meh-leh/ - an old word for the one who quietly does the work,
+from the Semitic root ʿ-m-l, "to labor":<br>
+Hebrew ʿamal (עָמָל, toil) · Arabic ʿāmil (عامل, worker) · Turkish amele (laborer)*
+
+### Your agent is a single YAML file.<br>Its runtime is a single static binary.<br>Together they run anywhere.
+
+no Python · no Node · no platform · no account
 
 [![CI](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml/badge.svg)](https://github.com/lasthumanintheloop/amele/actions/workflows/ci.yml)
 ![Go version](https://img.shields.io/github/go-mod/go-version/lasthumanintheloop/amele)
@@ -7,14 +17,7 @@
 ![Release](https://img.shields.io/github/v/release/lasthumanintheloop/amele)
 -->
 
-*amele /ah-meh-leh/ - an old word for the one who quietly does the work,
-from the Semitic root ʿ-m-l, "to labor": Hebrew ʿamal (עָמָל, toil), Arabic
-ʿāmil (عامل, worker), Turkish amele (laborer).*
-
-**Your agent is a single YAML file. Its runtime is a single static binary.
-Together they run anywhere - no Python, no Node, no platform, no account.**
-
-![an agent in a pipe: log in, JSON out, then a crontab line](docs/demos/pipe.gif)
+</div>
 
 - **Agent as an artifact.** Your agent *is* a file: version it, diff it,
   review it in a pull request, share it as a folder. Deleting an agent is
@@ -34,6 +37,8 @@ Together they run anywhere - no Python, no Node, no platform, no account.**
 - **A well-mannered process.** Meaningful exit codes, schema-guaranteed JSON
   on stdout, one JSONL log per run - your scripts get a contract, not a
   chatbot.
+
+![an agent in a pipe: log in, JSON out, then a crontab line](docs/demos/hero.gif)
 
 And it is one file in many seats - the *same* agent, unchanged:
 
@@ -184,6 +189,7 @@ questions as an agent tool, six YAML lines later:
 ![a 2007 Perl CLI called live as an agent tool](docs/demos/perltool.gif)
 
 More demos: [build an agent in 40 seconds](docs/demos/d1-build.gif) ·
+[the full pipe demo](docs/demos/pipe.gif) ·
 [it fails like a program - exit 2, 3, 7](docs/demos/failmodes.gif) ·
 [audit an agent someone sent you](docs/demos/audit.gif)
 
