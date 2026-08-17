@@ -84,7 +84,7 @@
             },
             "env": {
               "type": "array",
-              "items": { "type": "string", "minLength": 1 },
+              "items": { "type": "string", "minLength": 1, "pattern": "^[^=]+$" },
               "uniqueItems": true,
               "description": "Environment allowlist for shell commands. When non-empty, the child process is started with ONLY the listed variables (plus PATH, HOME and LANG, which are always passed so basic tools keep working); values are taken from amele's own environment and listed names that are unset are silently skipped. Empty or omitted means the child inherits amele's entire environment. SECURITY: this reduces credential exposure to model-written commands, but the boundary remains the OS/container the agent runs in."
             },
@@ -129,7 +129,7 @@
               },
               "env": {
                 "type": "array",
-                "items": { "type": "string", "minLength": 1 },
+                "items": { "type": "string", "minLength": 1, "pattern": "^[^=]+$" },
                 "uniqueItems": true,
                 "description": "Environment allowlist for this tool's process. When non-empty, the child is started with ONLY the listed variables (plus PATH, HOME and LANG, which are always passed so basic tools keep working); values are taken from amele's own environment and listed names that are unset are silently skipped. Empty or omitted means the child inherits amele's entire environment. SECURITY: this reduces credential exposure to model-driven commands, but the boundary remains the OS/container the agent runs in."
               }

@@ -49,6 +49,11 @@ Within a frozen version, changes must be additive and backwards-compatible:
   published schema now rejects `command: [""]` (`prefixItems` +
   `minLength: 1`), matching what `amele validate` already enforced at
   runtime. Documents the existing runtime contract; no behavior change.
+- **2026-08-18 - schema encodes the env-names-not-assignments rule.** The
+  `env` allowlists (`tools.shell.env`, `tools.subprocess[].env`) now carry
+  `pattern: "^[^=]+$"`, so `env: ["PATH=/usr/bin"]` fails schema validation
+  the same way `amele validate` already rejected it. Documents the existing
+  runtime contract; no behavior change.
 
 ## Schema versioning note (`$id`)
 

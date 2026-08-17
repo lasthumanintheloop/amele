@@ -289,3 +289,44 @@ tools:
 		t.Error("schema accepts command [\"\"] although the runtime rejects it")
 	}
 }
+
+// TestSchemaRejectsEnvAssignment pins runtime/schema agreement for env
+// allowlists: Validate rejects "NAME=value" entries (the list carries names,
+// not assignments), so the published schema must reject them too - for both
+// the shell tool and subprocess tools.
+func TestSchemaRejectsEnvAssignment(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	docs := map[string]string{
+		"shell": `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+tools:
+  shell:
+    enabled: true
+    env: ["PATH=/usr/bin"]
+`,
+		"subprocess": `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+tools:
+  subprocess:
+    - name: t
+      description: d
+      command: ["true"]
+      env: ["KEY=val"]
+`,
+	}
+	for name, doc := range docs {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := validator.Validate(yamlToJSON(t, []byte(doc))); ok {
+				t.Error("schema accepts an env assignment although the runtime rejects it")
+			}
+		})
+	}
+}
