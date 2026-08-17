@@ -266,6 +266,29 @@ scheduler schedules, your shell pipes, and new capabilities arrive as
 subprocess tools in the language of your choice (with MCP as the planned
 second road), not as core features.
 
+## Roadmap
+
+Direction, not dates. Details and discussion live in
+[issues](https://github.com/lasthumanintheloop/amele/issues) and
+[milestones](https://github.com/lasthumanintheloop/amele/milestones).
+
+- **v0.2 - connected and fast.** MCP client (stdio first); parallel tool
+  calls within a turn; sampling parameters (`temperature`, `top_p`) and a
+  provider-normalized `reasoning` setting (effort / thinking budget) that
+  survives tool loops across OpenAI, Anthropic, DeepSeek and OpenRouter;
+  configurable retry policy.
+- **v0.3 - cheap and durable.** Prompt caching (Anthropic `cache_control`,
+  cache-hit reporting for every dialect); provider fallback; guards against
+  oversized tool results; `--resume` for interrupted runs.
+- **v0.4 - a person at the keyboard.** Streaming output; a nicer `chat`
+  (history, multi-line input); default config discovery; `amele doctor`.
+- **v1.0** - not a feature: the contracts have held long enough to promise
+  they will keep holding.
+
+Not planned, on purpose: GUI/TUI, embedded RAG, workflow DSL, plugin
+system, built-in scheduler, multi-agent orchestration (fallback is not
+orchestration), Authenticode/notarization.
+
 ## Built for nobody watching
 
 Headless operation is the design center, not an afterthought:
