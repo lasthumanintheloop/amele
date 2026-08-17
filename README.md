@@ -49,6 +49,10 @@ And it is one file in many seats - the *same* agent, unchanged:
 | part of your app | spawn `amele run` from PHP, Python, anything; read stdout |
 | a terminal chat | `amele chat agent.yaml` - same tools, same budgets, interactive |
 
+**Get started in a minute:** [download a binary](#install), then
+[build your own agent](#build-your-own-in-five-minutes) - `amele init`,
+set `AMELE_API_KEY`, `amele run`.
+
 ## Why this exists
 
 amele started as an internal tool. Doing harness engineering, we needed
@@ -291,13 +295,48 @@ changes require a semver major and a migration note.
 
 ## Install
 
-From a checkout (Go 1.25+):
+Prebuilt static binaries for Linux, macOS and Windows (x86-64 and ARM64) are
+on the [releases page](https://github.com/lasthumanintheloop/amele/releases/latest).
+Unpack, put `amele` on your `PATH`; that is the whole installation.
 
 ```console
-$ CGO_ENABLED=0 go build -o amele ./cmd/amele   # static binary in ./amele
-$ go install ./cmd/amele                        # or straight into $GOBIN
+$ v=0.1.0; os=linux; arch=amd64        # or darwin/arm64, windows/amd64 (.zip), ...
+$ curl -fsSLO https://github.com/lasthumanintheloop/amele/releases/download/v$v/amele_${v}_${os}_${arch}.tar.gz
+$ tar xzf amele_${v}_${os}_${arch}.tar.gz amele && sudo install amele /usr/local/bin/
+$ amele version
 ```
 
-Copy the binary anywhere; that is the whole installation. Pure Go, no CGO -
-it cross-compiles to everything Go supports, x86 or ARM. Shell completions:
-`amele completion bash|zsh|fish` prints a static script.
+Or with Go 1.25+, straight into `$GOBIN`:
+
+```console
+$ go install github.com/lasthumanintheloop/amele/cmd/amele@latest
+```
+
+Or from a checkout: `CGO_ENABLED=0 go build -o amele ./cmd/amele` (`make
+dist` builds every platform's archive). Pure Go, no CGO - it cross-compiles
+to everything Go supports. Shell completions: `amele completion
+bash|zsh|fish` prints a static script.
+
+### Verify a download
+
+Every release ships a `SHA256SUMS` file, and `SHA256SUMS.sigstore.json`, a
+[Sigstore](https://www.sigstore.dev/) keyless signature over it made by the
+release workflow's own GitHub identity - no long-lived key anyone could
+leak. Releases built by the workflow also carry SLSA build provenance
+(`multiple.intoto.jsonl`).
+
+```console
+$ sha256sum -c --ignore-missing SHA256SUMS
+amele_0.1.0_linux_amd64.tar.gz: OK
+$ cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+    --certificate-identity-regexp '^https://github.com/lasthumanintheloop/amele/\.github/workflows/release\.yml@refs/tags/v' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com
+Verified OK
+```
+
+The binaries are **not** Authenticode-signed or Apple-notarized (that takes
+a paid certificate; not planned for now), so Windows SmartScreen and macOS
+Gatekeeper will warn on first launch. The checksum plus the Sigstore
+signature is the integrity check; the warning is about the absence of a
+vendor certificate, not about the file. On macOS `xattr -d
+com.apple.quarantine amele` clears it once.

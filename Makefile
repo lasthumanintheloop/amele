@@ -8,7 +8,7 @@ COVER_BUDGET      := 80        # minimum % statement coverage over internal/
 GOFLAGS := -trimpath
 LDFLAGS := -s -w -X main.version=$(shell git describe --tags --always --dirty) -X main.commit=$(shell git rev-parse --short HEAD) -X main.date=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: build test race cover lint fmt budget clean all
+.PHONY: build test race cover lint fmt budget dist clean all
 
 all: fmt lint test race cover budget
 
@@ -46,5 +46,25 @@ budget: build
 	echo "binary size: $$size bytes (budget $(SIZE_BUDGET_BYTES))"; \
 	if [ "$$size" -gt "$(SIZE_BUDGET_BYTES)" ]; then echo "FAIL: binary exceeds size budget"; exit 1; fi
 
+# dist cross-compiles the release archives into dist/: one archive per
+# platform (binary + LICENSE + README.md) and a SHA256SUMS file over them.
+# VERSION defaults to the tag; the release workflow runs exactly this target
+# so a local `make dist` reproduces what a tag ships (up to the build date).
+VERSION   ?= $(shell git describe --tags --always --dirty | sed 's/^v//')
+PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+dist:
+	rm -rf dist && mkdir -p dist
+	@set -e; for p in $(PLATFORMS); do \
+	  os=$${p%/*}; arch=$${p#*/}; ext=; [ "$$os" = windows ] && ext=.exe; \
+	  stage=dist/stage/amele_$(VERSION)_$${os}_$${arch}; mkdir -p $$stage; \
+	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build $(GOFLAGS) -ldflags="$(LDFLAGS)" -o $$stage/amele$$ext ./cmd/amele; \
+	  cp LICENSE README.md $$stage/; \
+	  if [ "$$os" = windows ]; then (cd $$stage && zip -q -X ../../$$(basename $$stage).zip amele.exe LICENSE README.md); \
+	  else tar -C $$stage -czf dist/$$(basename $$stage).tar.gz amele LICENSE README.md; fi; \
+	  echo "built $$(basename $$stage)"; \
+	done
+	rm -rf dist/stage
+	cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
+
 clean:
-	rm -f amele coverage.out
+	rm -rf amele coverage.out dist
