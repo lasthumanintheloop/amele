@@ -322,8 +322,10 @@ bash|zsh|fish` prints a static script.
 Every release ships a `SHA256SUMS` file, and `SHA256SUMS.sigstore.json`, a
 [Sigstore](https://www.sigstore.dev/) keyless signature over it made by the
 release workflow's own GitHub identity - no long-lived key anyone could
-leak. Releases built by the workflow also carry SLSA build provenance
-(`multiple.intoto.jsonl`).
+leak. Releases built by the workflow (tag identity, `@refs/tags/v...`) also
+carry SLSA build provenance (`multiple.intoto.jsonl`); v0.1.0 predates the
+workflow and was signed after the fact from `main` (`@refs/heads/main`),
+without provenance.
 
 ```console
 $ sha256sum -c --ignore-missing SHA256SUMS
