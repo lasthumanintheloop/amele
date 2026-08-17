@@ -53,6 +53,44 @@ And it is one file in many seats - the *same* agent, unchanged:
 [build your own agent](#build-your-own-in-five-minutes) - `amele init`,
 set `AMELE_API_KEY`, `amele run`.
 
+## Runs everywhere
+
+<div align="center">
+
+**One binary. No runtime. Every box you already have.**
+
+![Linux](https://img.shields.io/badge/Linux-x86--64%20%C2%B7%20ARM64%20%C2%B7%20ARMv6%20%C2%B7%20RISC--V%20%C2%B7%20s390x%20%C2%B7%20ppc64le-2d3748?logo=linux&logoColor=white)
+![macOS](https://img.shields.io/badge/macOS-Intel%20%C2%B7%20Apple%20Silicon-2d3748?logo=apple&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-x64%20%C2%B7%20ARM64%20%C2%B7%20x86-2d3748?logo=windows&logoColor=white)
+<br>
+![FreeBSD](https://img.shields.io/badge/FreeBSD-x86--64%20%C2%B7%20ARM64-2d3748?logo=freebsd&logoColor=white)
+![OpenBSD](https://img.shields.io/badge/OpenBSD-x86--64%20%C2%B7%20ARM64-2d3748?logo=openbsd&logoColor=white)
+![NetBSD](https://img.shields.io/badge/NetBSD-x86--64-2d3748?logo=netbsd&logoColor=white)
+![illumos](https://img.shields.io/badge/illumos-x86--64-2d3748?logo=oracle&logoColor=white)
+![Android](https://img.shields.io/badge/Android%20%2F%20Termux-ARM64-2d3748?logo=android&logoColor=white)
+<br>
+![Docker](https://img.shields.io/badge/scratch%20%C2%B7%20distroless%20%C2%B7%20Alpine-container%20ready-2d3748?logo=docker&logoColor=white)
+![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Zero%20to%205-2d3748?logo=raspberrypi&logoColor=white)
+![OpenWrt](https://img.shields.io/badge/OpenWrt-routers-2d3748?logo=openwrt&logoColor=white)
+
+</div>
+
+`CGO_ENABLED=0` and no dependency outside the Go standard library, so the
+same source becomes a static executable for **21 OS/arch pairs** - every
+one of them ships as a release archive (`make dist` builds them all). The
+platform-specific surface is tiny and on purpose: `flock(2)` for the run
+lock, a process group so a timed-out tool cannot leave orphans, `SIGTERM`
+handling. Everything else is portable by construction.
+
+| tier | platforms | what it means |
+|---|---|---|
+| **tested** | Linux (amd64, arm64) | CI runs the full suite here; this is where amele lives in production |
+| **expected to work** | macOS, Windows, FreeBSD, OpenBSD, NetBSD, DragonFly, illumos, Android/Termux, every other Linux arch | built from the same tree; the unix code path is byte-identical to Linux. Windows: `lock:` says "unsupported" instead of pretending; everything else works |
+| **build it yourself** | anything in `go tool dist list` with an OS that has processes and signals | `GOOS=… GOARCH=… go build` - and open an issue if it does not |
+
+Put it in a `FROM scratch` image, `scp` it to a Raspberry Pi, drop it on a
+NAS, run it from a router's cron - the agent YAML travels with it, unchanged.
+
 ## Why this exists
 
 amele started as an internal tool. Doing harness engineering, we needed
@@ -295,8 +333,9 @@ changes require a semver major and a migration note.
 
 ## Install
 
-Prebuilt static binaries for Linux, macOS and Windows (x86-64 and ARM64) are
-on the [releases page](https://github.com/lasthumanintheloop/amele/releases/latest).
+Prebuilt static binaries for Linux, macOS, Windows, the BSDs and more (see
+[Runs everywhere](#runs-everywhere)) are on the
+[releases page](https://github.com/lasthumanintheloop/amele/releases/latest).
 Unpack, put `amele` on your `PATH`; that is the whole installation.
 
 ```console

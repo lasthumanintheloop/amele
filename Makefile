@@ -51,7 +51,13 @@ budget: build
 # VERSION defaults to the tag; the release workflow runs exactly this target
 # so a local `make dist` reproduces what a tag ships (up to the build date).
 VERSION   ?= $(shell git describe --tags --always --dirty | sed 's/^v//')
-PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
+# Every target that builds and whose unix/windows code paths are exercised
+# (README "Runs everywhere" lists the tested tier vs the built tier).
+PLATFORMS := linux/amd64 linux/arm64 linux/arm linux/386 linux/riscv64 linux/ppc64le linux/s390x linux/mips64le \
+             darwin/amd64 darwin/arm64 \
+             windows/amd64 windows/arm64 windows/386 \
+             freebsd/amd64 freebsd/arm64 openbsd/amd64 openbsd/arm64 netbsd/amd64 dragonfly/amd64 \
+             illumos/amd64 android/arm64
 dist:
 	rm -rf dist && mkdir -p dist
 	@set -e; for p in $(PLATFORMS); do \
