@@ -60,6 +60,12 @@ const (
 	// config already holds its lock: this run did nothing at all. Added
 	// additively in the exit-code contract v1.1; codes 0-6 are unchanged.
 	ExitLockHeld = 7
+	// ExitMCPUnavailable means a `required: true` MCP server could not be
+	// brought up (spawn, connect, handshake, protocol or auth failure). It is
+	// distinct from ExitProviderError on purpose: 5 says "retry", 8 says "a
+	// declared dependency is missing - page a human".
+	// CONTRACT: docs/contracts/exit-codes.md v1.2 (additive).
+	ExitMCPUnavailable = 8
 )
 
 // defaultMaxSchemaRetries is the feedback-retry budget used when
@@ -132,6 +138,7 @@ Exit codes:
   0 success · 1 task failed · 2 config error · 3 budget exceeded
   4 permission denied · 5 provider error · 6 output schema unmet
   7 run lock held (another run of this config is in progress)
+  8 required MCP server unavailable
 `
 
 // The one-line usage strings printed when an invocation is malformed.
@@ -295,6 +302,8 @@ EXIT CODES
   5  provider or network failure after the client's retries were exhausted
   6  output.schema was never satisfied within max_schema_retries
   7  lock: true is set and another run of this config holds the lock
+  8  a required MCP server (mcp.servers[].required: true) could not be started
+     or reached
 
 EXAMPLES
   Run a task written on the command line:
@@ -398,6 +407,8 @@ EXIT CODES
   3  the session budget pool is spent, or one exchange hit limits.timeout
   4  a permission denial aborted the session
   5  provider or network failure after the client's retries were exhausted
+  8  a required MCP server (mcp.servers[].required: true) could not be started
+     or reached
 
 EXAMPLES
   Talk to the agent a config defines:

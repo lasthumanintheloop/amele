@@ -206,8 +206,8 @@ run for single-flight purposes. Applies to `run`, `chat`, `validate`,
 
 **Exit codes**: the full [table](exit-codes.md) - 0 success, 1 task failed /
 interrupted, 2 config error, 3 budget, 4 aborting permission denial,
-5 provider, 6 schema unmet, 7 run lock held. Ctrl-C and SIGTERM land on 1; see
-[Signals](#signals).
+5 provider, 6 schema unmet, 7 run lock held, 8 required MCP server
+unavailable. Ctrl-C and SIGTERM land on 1; see [Signals](#signals).
 
 ## `amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]`
 

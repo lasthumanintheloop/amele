@@ -1,10 +1,11 @@
 # Exit code contract
 
-**v1.1 - FROZEN as of v0.1; code 7 added additively (0–6 unchanged).**
+**v1.2 - FROZEN as of v0.1; codes 7 and 8 added additively (0–6 unchanged).**
 Scripts, cron jobs and CI pipelines branch on these values; changing the
 meaning of any code is a breaking change (see
 [Change policy](#change-policy)). Adding a code for a new outcome - as v1.1
-did for the run lock - is additive and stays within v1.
+did for the run lock and v1.2 for the MCP dependency - is additive and stays
+within v1.
 
 Every `amele` command maps every outcome onto this table. The mapping lives in
 `cmd/amele/main.go` (`exitCodeFor` plus the per-command handlers) and is grep-able
@@ -20,6 +21,7 @@ via `// CONTRACT:` markers.
 | 5 | provider error | The LLM provider or the network failed after the client's retries were exhausted. |
 | 6 | output schema unmet | `output.schema` is set, the model produced answers, but none validated within the retry budget. |
 | 7 | lock held | `lock: true` is set and another run of this config is in progress; this run did nothing. |
+| 8 | MCP unavailable | a required MCP server failed to start/connect/authenticate |
 
 ## Per-code semantics
 
@@ -132,6 +134,35 @@ only excludes other cooperating `amele` processes. Only `run` locks -
 
 A cron wrapper that treats overlap as normal should special-case 7:
 `amele run cfg.yaml "task"; [ $? -eq 7 ] && exit 0`.
+
+### 8 - required MCP server unavailable
+
+An MCP server declared with `required: true` could not be brought up: the
+process failed to spawn, the transport never connected, the `initialize`
+handshake failed or was rejected, the peer spoke something other than the
+expected protocol, or authentication was refused. The run stops before the
+agent loop starts - no provider call is made. stdout stays empty; stderr names
+the server and the error class:
+
+```
+amele: mcp server "github": auth: 401 Unauthorized
+```
+
+Distinct from exit 5 on purpose. 5 means "the provider or the network was
+flaky, retry the same command later"; 8 means "a dependency this config
+declares is not there - a token expired, a binary is missing, an endpoint
+moved - and retrying will keep failing until a human fixes it".
+
+A server with `required: false` never produces this code: its failure is a
+warning on stderr plus an `mcp_connect` event with `ok: false` in the session
+log, and the run continues without that server's tools.
+
+A cron wrapper that wants a soft-fail on flakiness but a page on a missing
+dependency:
+
+```sh
+amele run agent.yaml || case $? in 5) exit 75;; 8) mail -s "amele: dependency down" ops@example.com </dev/null;; esac
+```
 
 ## Signals
 

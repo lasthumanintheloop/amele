@@ -10,7 +10,7 @@ The four contract artifacts:
 
 | Artifact | Surface |
 |----------|---------|
-| [exit-codes.md](exit-codes.md) | The 0..7 process exit code table. |
+| [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
 | [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
@@ -54,6 +54,13 @@ Within a frozen version, changes must be additive and backwards-compatible:
   `pattern: "^[^=]+$"`, so `env: ["PATH=/usr/bin"]` fails schema validation
   the same way `amele validate` already rejected it. Documents the existing
   runtime contract; no behavior change.
+- **2026-08-19 - exit code 8, required MCP server unavailable.** The exit-code
+  contract moves to **v1.2**: code `8` is added for "an MCP server declared
+  with `required: true` could not be started, connected to or authenticated
+  against". Additive - codes 0-7 are unchanged, and a script that does not
+  know 8 sees a non-zero exit exactly as before. Migration: none required;
+  callers that already special-case 5 as "retry" may want to route 8 to a
+  human instead.
 
 ## Schema versioning note (`$id`)
 

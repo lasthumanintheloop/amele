@@ -4020,3 +4020,16 @@ func TestHelpPagesListEverySettableKey(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageListsExitCode8 pins exit code 8 into the general usage text.
+// CONTRACT: docs/contracts/exit-codes.md v1.2 - an operator scripting around a
+// missing MCP dependency must find the code without leaving the CLI.
+func TestUsageListsExitCode8(t *testing.T) {
+	code, stdout, _ := execCLI(t, []string{"help"}, "")
+	if code != ExitOK {
+		t.Fatalf("help exit %d", code)
+	}
+	if !strings.Contains(stdout, "8") || !strings.Contains(stdout, "required MCP server unavailable") {
+		t.Fatalf("usage does not document exit code 8:\n%s", stdout)
+	}
+}

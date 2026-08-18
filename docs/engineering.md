@@ -107,8 +107,8 @@ Breaking any of these requires a semver major and a migration note in
 
 1. **Exit codes** (`docs/contracts/exit-codes.md`): 0 success, 1 task
    failed/interrupted, 2 config error, 3 budget exceeded, 4 permission
-   denied, 5 provider error, 6 output schema unmet, 7 run lock held. New
-   codes are additive.
+   denied, 5 provider error, 6 output schema unmet, 7 run lock held,
+   8 required MCP server unavailable. New codes are additive.
 2. **The YAML config schema**, published as JSON Schema.
 3. **The JSONL event schema** (`docs/contracts/jsonl-events.md`).
 4. **The CLI surface**: command and flag names.
