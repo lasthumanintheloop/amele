@@ -1,8 +1,9 @@
 # JSONL event schema
 
-**v1.1 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
-`result_bytes` added additively (every v1 field unchanged, and the on-the-wire
-`v` stays `1`).** This is the format of the session log: one append-only JSONL
+**v1.2 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+`result_bytes` (v1.1) and the MCP events plus `run_end.mcp_errors` (v1.2)
+added additively (every v1 field unchanged, and the on-the-wire `v` stays
+`1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
 and (future) replay input are deliberately the same format. Source of truth:
 `session.Event` in `internal/session/session.go`.
@@ -29,7 +30,7 @@ Every line is one JSON object with three always-present fields:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `v` | int | Wire schema version. Always `1` for this document - the `v1.1` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
-| `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `run_end`. |
+| `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
 All other fields are declared with `omitempty`: **a zero value is omitted**.
@@ -102,6 +103,8 @@ non-zero exit were all indistinguishable from a clean run in the log.
 | `denied_no_tty` | An `ask` policy auto-denied because no TTY was attached to ask a human on (the headless fail-safe). | `true` |
 | `ask_refused` | A human was asked and said no. | `true` |
 | `error` | The harness could not dispatch the call at all. | `true` |
+| `tool_error` | An MCP tool ran and reported its own failure (`isError` in the MCP result). Like `nonzero_exit`, this is the tool's answer, not a harness failure. Since v1.2. | absent |
+| `indeterminate` | The response was lost after the request was sent; the side effect may or may not have happened; amele never retries. Since v1.2. | absent |
 
 `denied_policy` covers the **two** operator policies that refuse a call before
 it runs, because both make the same statement about the call: the permission
@@ -115,6 +118,48 @@ and adapts to (`is_error` absent, `tool: shell`, result starting
 Consumers must treat an **unknown** `outcome` value as "something else
 happened", never as a failure to parse: new values may be added additively.
 
+### `mcp_connect` - one connection attempt to one MCP server
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `server` | string | The server's name from the config. |
+| `transport` | string | How it was reached: `stdio` or `http`. |
+| `ok` | bool | Whether the handshake completed. **Always present**, including `false` (like `run_end.exit_code`, it is exempt from omit-zero). |
+| `error_class` | string | Failure group for aggregation (`transport`, `auth`, `protocol`, ...). Absent on success. |
+| `error` | string | Human-readable failure text (clipped + redacted). Absent on success. |
+| `duration_ms` | int | How long the attempt took, in milliseconds. |
+| `protocol_version` | string | MCP protocol version agreed on. Absent on failure. |
+| `server_name` | string | The server's self-reported name (may differ from `server`, which is the config's name). |
+| `server_version` | string | The server's self-reported version. |
+| `session_fp` | string | Short SHA-256 fingerprint of the MCP session id, for correlating events across a run. The raw session id is a bearer credential and is **never** written to the log. |
+| `tool_count` | int | How many tools the server advertised. |
+
+### `mcp_tools_listed` - the tool inventory taken from one server
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `server` | string | The server's name from the config. |
+| `tools` | object[] | The definitions actually exposed to the model (see below). |
+| `total_bytes` | int | Summed size of those definitions - the harness token budget this server cost. |
+| `skipped` | object[] | Advertised tools that were **not** exposed: `{ "name": <server's name>, "reason": <e.g. "excluded", "name_conflict"> }`. Absent when nothing was skipped. |
+
+Each `tools` entry:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `name` | string | The tool name as amele exposed it to the model (server-prefixed, normalized to the provider's allowed character set when needed). |
+| `original_name` | string | The server's own name, present **only** when normalization rewrote it. |
+| `sha256` | string | Hex SHA-256 of the tool definition amele sent to the model - proof after the fact of *which* definition the model was shown, since a server may change a description between runs. |
+| `bytes` | int | Size of that definition. |
+| `annotations` | object | MCP tool hints amele understood, as `name -> bool`: `readOnly`, `destructive`, `openWorld`, `idempotent`. Only keys the server actually sent are present; an absent key means "the server said nothing", **not** `false`. |
+
+### `mcp_disconnect` - a server connection ended
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `server` | string | The server's name from the config. |
+| `reason` | string | `run_end` (the run finished), `reconnect` (amele is re-establishing the connection) or `error`. |
+
 ### `run_end` - last event of every file
 
 | Field | Type | Meaning |
@@ -124,6 +169,7 @@ happened", never as a failure to parse: new values may be added additively.
 | `turns` | int | **Attempted** provider round-trips. An attempt is counted before its provider call, so when the final attempt fails (e.g. a provider error) `turns` can exceed the highest logged `turn` by one. |
 | `tool_calls` | int | Tool calls dispatched - equals the number of `tool_result` events. Denied-and-continued calls, unknown-tool recoveries and erroring tools all count; only a call whose denial aborts the run is logged (as a `tool_result`) but not counted. |
 | `total_tokens` | int | Cumulative input + output tokens. |
+| `mcp_errors` | int | MCP-attributable failures over the whole run (failed connects, lost responses, tool-listing failures). Absent means **0**. Since v1.2. |
 | `duration_ms` | int | Loop time in milliseconds, **not** process wall clock: `run` measures the agent loop only (config loading and the stdin read are excluded), and `chat` sums the per-exchange loop durations - time idle at the prompt is excluded. |
 
 `run_end` is written for failed runs too - especially for failed runs - with
@@ -134,6 +180,10 @@ truthful partial accounting.
 - Events are written in strict chronological order; `ts` is non-decreasing.
 - Exactly one `run_start` (first line) and at most one `run_end` (last line;
   absent only after a hard kill) per file.
+- All MCP events (`mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`) occur
+  strictly between `run_start` and `run_end`. Connects and tool listings
+  happen before the first `llm_response` of the run; a `mcp_disconnect` for
+  every connected server precedes `run_end`.
 - Within a turn: the `llm_response` comes first, then its tool calls as
   `tool_call` immediately followed by the matching `tool_result`, in dispatch
   order. Correlation is by `tool_call_id`, not by position.
@@ -202,3 +252,24 @@ written by an older amele. Concretely:
   collected a status (a command stopped by its own `timeout` or by the run
   ending is reported as `timeout`/`aborted`, not as an exit);
 - absent `result_bytes` means an empty result (or a pre-v0.1.0 log).
+
+### v1.2 (amele v0.2.0) - MCP observability (additive, `v` stays `1`)
+
+Added three event types - `mcp_connect`, `mcp_tools_listed`,
+`mcp_disconnect` - one optional field to `run_end` (`mcp_errors`), and two
+values to the `tool_result.outcome` enum (`tool_error`, `indeterminate`).
+Nothing was removed, renamed or re-typed, and no existing event type changed a
+byte.
+
+**Migration:** none required. A consumer written against v1.0/v1.1 keeps
+working: it must already ignore unknown event types and unknown fields, which
+is exactly what the additions are. A consumer that wants them must tolerate
+their absence, which is also how it reads a log written by an older amele.
+Concretely:
+
+- absent `mcp_errors` on `run_end` means **0** MCP-attributable failures (and
+  is also what every pre-v0.2.0 log says);
+- absent MCP events mean the run configured no MCP servers - or predates
+  v0.2.0;
+- the two new `outcome` values follow the standing rule: an unknown `outcome`
+  is "something else happened", never a parse failure.

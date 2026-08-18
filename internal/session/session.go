@@ -66,6 +66,25 @@ type Event struct {
 	Outcome     ToolOutcome `json:"outcome,omitempty"`
 	ResultBytes int         `json:"result_bytes,omitempty"`
 
+	// MCP events (v1.2). Server names one server; the rest is per event type.
+	// OK is a pointer for the same reason ExitCode is: `ok:false` is the
+	// interesting half of a connect attempt and omitempty would delete it.
+	Server          string           `json:"server,omitempty"`
+	Transport       string           `json:"transport,omitempty"`
+	OK              *bool            `json:"ok,omitempty"`
+	ErrorClass      string           `json:"error_class,omitempty"`
+	Error           string           `json:"error,omitempty"`
+	ProtocolVersion string           `json:"protocol_version,omitempty"`
+	ServerName      string           `json:"server_name,omitempty"`
+	ServerVersion   string           `json:"server_version,omitempty"`
+	SessionFP       string           `json:"session_fp,omitempty"`
+	ToolCount       int              `json:"tool_count,omitempty"`
+	Tools           []MCPToolListed  `json:"tools,omitempty"`
+	TotalBytes      int              `json:"total_bytes,omitempty"`
+	Skipped         []MCPSkippedTool `json:"skipped,omitempty"`
+	Reason          string           `json:"reason,omitempty"`
+	MCPErrors       int              `json:"mcp_errors,omitempty"`
+
 	// run_end
 	Status      string `json:"status,omitempty"`
 	ExitCode    *int   `json:"exit_code,omitempty"`
@@ -86,6 +105,10 @@ type Writer struct {
 	clock  Clock
 	redact func(string) string
 	path   string
+	// mcpErrors counts MCP-attributable failures over the whole run; it is
+	// reported once, on run_end, so an operator grepping a single line can see
+	// that a degraded MCP server was in play. SetMCPErrors is the only writer.
+	mcpErrors int
 }
 
 // Options configures New.
@@ -251,11 +274,15 @@ type ToolOutcome string
 
 // The tool_result outcome values.
 //
-// Seven of the eight are the enum as specified; `aborted` is the addition,
+// Seven of the first eight are the enum as specified; `aborted` is the
+// addition,
 // and it is here because the runner can genuinely end a tool call that way
 // (the RUN was cancelled or hit its overall timeout under a still-running
 // command) and folding it into `timeout` would blame the tool's own budget for
 // a Ctrl-C, which is exactly the confusion this field exists to remove.
+// `tool_error` and `indeterminate` were added in v1.2 for MCP tool calls
+// (docs/contracts/jsonl-events.md): a tool that answered "I failed", and a
+// call whose answer never came back.
 const (
 	// OutcomeOK means the tool did its job.
 	OutcomeOK ToolOutcome = "ok"
@@ -280,6 +307,14 @@ const (
 	// unknown tool, unusable arguments, a failed approval check. This is the
 	// situation is_error marks.
 	OutcomeError ToolOutcome = "error"
+	// OutcomeToolError means an MCP tool ran and reported its own failure
+	// (`isError` in the MCP tool result). Not a harness error: the failure is
+	// the tool's answer, and the model reads it as content.
+	OutcomeToolError ToolOutcome = "tool_error"
+	// OutcomeIndeterminate means the response was lost after the request was
+	// sent - the side effect may or may not have happened. amele never
+	// retries such a call; that decision belongs to a human reading the log.
+	OutcomeIndeterminate ToolOutcome = "indeterminate"
 )
 
 // ToolResult is one completed tool call as the log records it.
@@ -321,6 +356,122 @@ func (w *Writer) ToolResult(r ToolResult) {
 	})
 }
 
+// MCPToolListed is one tool an MCP server advertised, as the log records it.
+//
+// The SHA-256 and byte size exist so an operator can prove after the fact
+// WHICH definition the model was shown - an MCP server can change a tool's
+// description between runs, and the harness token budget is spent on those
+// bytes.
+type MCPToolListed struct {
+	// Name is the tool name as amele exposed it to the model (server-prefixed
+	// and, when needed, normalized to the provider's allowed character set).
+	Name string `json:"name"`
+	// OriginalName is the server's own name, present only when Name differs
+	// from it because normalization rewrote it.
+	OriginalName string `json:"original_name,omitempty"`
+	// SHA256 is the hex digest of the tool definition amele sent to the model.
+	SHA256 string `json:"sha256"`
+	// Bytes is the size of that definition.
+	Bytes int `json:"bytes"`
+	// Annotations carries the MCP tool hints amele understood
+	// (readOnly, destructive, openWorld, idempotent); only present keys are
+	// written, so an absent key means "the server said nothing", not "false".
+	Annotations map[string]bool `json:"annotations,omitempty"`
+}
+
+// MCPSkippedTool is one advertised tool amele did not expose to the model.
+type MCPSkippedTool struct {
+	// Name is the server's name for the tool.
+	Name string `json:"name"`
+	// Reason is why it was dropped (e.g. `excluded`, `name_conflict`).
+	Reason string `json:"reason"`
+}
+
+// MCPConnect is one connection attempt to one MCP server, successful or not.
+type MCPConnect struct {
+	// Server is the server's name from the config.
+	Server string
+	// Transport is how it was reached (`stdio`, `http`).
+	Transport string
+	// OK reports whether the handshake completed.
+	OK bool
+	// ErrorClass groups the failure for aggregation (e.g. `transport`,
+	// `auth`, `protocol`); empty on success.
+	ErrorClass string
+	// Error is the human-readable failure text; clipped and redacted before
+	// it is written.
+	Error string
+	// DurationMS is how long the attempt took.
+	DurationMS int64
+	// ProtocolVersion is the MCP protocol version agreed on.
+	ProtocolVersion string
+	// ServerName and ServerVersion are the server's self-reported identity.
+	ServerName    string
+	ServerVersion string
+	// SessionFP is a short fingerprint of the session id. SECURITY: the raw
+	// id is a bearer credential for the session and is never logged.
+	SessionFP string
+	// ToolCount is how many tools the server advertised.
+	ToolCount int
+}
+
+// MCPToolsListed is the tool inventory amele took from one MCP server.
+type MCPToolsListed struct {
+	// Server is the server's name from the config.
+	Server string
+	// Tools are the definitions actually exposed to the model.
+	Tools []MCPToolListed
+	// TotalBytes is the summed size of those definitions - the token budget
+	// this server cost.
+	TotalBytes int
+	// Skipped lists advertised tools that were not exposed, with the reason.
+	Skipped []MCPSkippedTool
+}
+
+// MCPDisconnect records a server connection ending.
+type MCPDisconnect struct {
+	// Server is the server's name from the config.
+	Server string
+	// Reason is `run_end`, `reconnect` or `error`.
+	Reason string
+}
+
+// MCPConnect records one connection attempt to an MCP server. A nil *Writer
+// discards it, like every other method here.
+func (w *Writer) MCPConnect(e MCPConnect) {
+	ok := e.OK
+	w.emit(Event{
+		Type: "mcp_connect", Server: e.Server, Transport: e.Transport, OK: &ok,
+		ErrorClass: e.ErrorClass, Error: w.clip(e.Error), DurationMS: e.DurationMS,
+		ProtocolVersion: e.ProtocolVersion, ServerName: e.ServerName,
+		ServerVersion: e.ServerVersion, SessionFP: e.SessionFP, ToolCount: e.ToolCount,
+	})
+}
+
+// MCPToolsListed records the tool inventory taken from one MCP server.
+func (w *Writer) MCPToolsListed(e MCPToolsListed) {
+	w.emit(Event{
+		Type: "mcp_tools_listed", Server: e.Server, Tools: e.Tools,
+		TotalBytes: e.TotalBytes, Skipped: e.Skipped,
+	})
+}
+
+// MCPDisconnect records an MCP server connection ending.
+func (w *Writer) MCPDisconnect(e MCPDisconnect) {
+	w.emit(Event{Type: "mcp_disconnect", Server: e.Server, Reason: w.clip(e.Reason)})
+}
+
+// SetMCPErrors records how many MCP-attributable failures the run saw. The
+// count is written once, as run_end.mcp_errors, and only when it is non-zero:
+// an absent field means 0. Callers set the running total; a nil *Writer
+// ignores it.
+func (w *Writer) SetMCPErrors(n int) {
+	if w == nil {
+		return
+	}
+	w.mcpErrors = n
+}
+
 // RunEnd records the final status and totals, then closes the file.
 func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalTokens int, duration time.Duration) {
 	if w == nil {
@@ -329,7 +480,7 @@ func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalToke
 	w.emit(Event{
 		Type: "run_end", Status: status, ExitCode: &exitCode,
 		Turns: turns, ToolCalls: toolCalls, TotalTokens: totalTokens,
-		DurationMS: duration.Milliseconds(),
+		DurationMS: duration.Milliseconds(), MCPErrors: w.mcpErrors,
 	})
 	_ = w.w.Close()
 }

@@ -223,6 +223,10 @@ func TestNilWriterIsSafe(t *testing.T) {
 	w.LLMResponse(1, "c", []string{"id"}, 1, 1, "stop")
 	w.ToolCall("id", "t", "{}")
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: "r", Outcome: OutcomeOK})
+	w.MCPConnect(MCPConnect{Server: "s", Transport: "stdio", OK: true})
+	w.MCPToolsListed(MCPToolsListed{Server: "s", Tools: []MCPToolListed{{Name: "s__t"}}})
+	w.MCPDisconnect(MCPDisconnect{Server: "s", Reason: "run_end"})
+	w.SetMCPErrors(2)
 	w.RunEnd("success", 0, 1, 1, 1, time.Second)
 	if w.Path() != "" {
 		t.Error("nil writer path should be empty")
@@ -465,5 +469,74 @@ func TestRedactorOverlappingSecrets(t *testing.T) {
 				t.Errorf("got %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestGoldenMCP pins the v1.2 MCP additions (mcp_connect, mcp_tools_listed,
+// mcp_disconnect, the tool_error/indeterminate outcomes and
+// run_end.mcp_errors) to a golden file, so a change to the wire shape of any
+// of them shows up as a diff in a `contract:`-sized review rather than as a
+// silent break of a log consumer.
+func TestGoldenMCP(t *testing.T) {
+	dir := t.TempDir()
+	// SECURITY: the header value is a configured secret, so it must be
+	// redacted where it lands - here inside a connect error message.
+	w, err := New(dir, Options{Clock: fixedClock(), Secrets: []string{"Bearer sekrit"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.RunStart("test-model", "list issues")
+	w.MCPConnect(MCPConnect{
+		Server: "github", Transport: "http", OK: true, DurationMS: 12,
+		ProtocolVersion: "2025-06-18", ServerName: "gh", ServerVersion: "1.0",
+		SessionFP: "ab12cd34", ToolCount: 2,
+	})
+	w.MCPConnect(MCPConnect{
+		Server: "flaky", Transport: "stdio", OK: false,
+		ErrorClass: "transport", Error: `handshake failed with header "Bearer sekrit"`,
+		DurationMS: 3,
+	})
+	w.MCPToolsListed(MCPToolsListed{
+		Server: "github",
+		Tools: []MCPToolListed{{
+			Name: "github__x", SHA256: "9f2c" + strings.Repeat("0", 60),
+			Bytes: 120, Annotations: map[string]bool{"readOnly": true},
+		}},
+		TotalBytes: 120,
+		Skipped:    []MCPSkippedTool{{Name: "a.b", Reason: "excluded"}},
+	})
+	w.ToolResult(ToolResult{CallID: "call_1", Tool: "github__x", Result: "not found", Outcome: OutcomeToolError})
+	w.ToolResult(ToolResult{CallID: "call_2", Tool: "github__x", Result: "no response", Outcome: OutcomeIndeterminate})
+	w.MCPDisconnect(MCPDisconnect{Server: "github", Reason: "run_end"})
+	w.SetMCPErrors(1)
+	w.RunEnd("success", 0, 2, 2, 300, 1500*time.Millisecond)
+
+	got, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "sekrit") {
+		t.Errorf("secret survived into the log:\n%s", got)
+	}
+	if !strings.Contains(string(got), "[REDACTED]") {
+		t.Errorf("mcp_connect error was not redacted:\n%s", got)
+	}
+
+	goldenPath := filepath.Join("testdata", "golden", "session-mcp.jsonl")
+	if *update {
+		if err := os.MkdirAll(filepath.Dir(goldenPath), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(goldenPath, got, 0o600); err != nil { //nolint:gosec // G703: goldenPath is a fixed testdata constant, not tainted input.
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(goldenPath) //nolint:gosec // G304: fixed testdata path.
+	if err != nil {
+		t.Fatalf("reading golden (run with -update to create): %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("session log differs from golden.\ngot:\n%s\nwant:\n%s", got, want)
 	}
 }

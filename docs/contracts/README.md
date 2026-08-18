@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.2). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -61,6 +61,13 @@ Within a frozen version, changes must be additive and backwards-compatible:
   know 8 sees a non-zero exit exactly as before. Migration: none required;
   callers that already special-case 5 as "retry" may want to route 8 to a
   human instead.
+- **2026-08-19 - JSONL v1.2, MCP observability.** The session log gains three
+  event types (`mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`), the
+  optional `run_end.mcp_errors` field, and two `tool_result.outcome` values
+  (`tool_error`, `indeterminate`) - jsonl-events.md v1.2. Additive: the wire
+  `v` stays `1`, nothing was removed, renamed or re-typed. Migration: none
+  required; absent `mcp_errors` means 0, and an unknown `outcome` stays
+  "something else happened".
 
 ## Schema versioning note (`$id`)
 
