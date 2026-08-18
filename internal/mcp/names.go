@@ -26,11 +26,16 @@ const (
 	hashLen = 8
 	// maxCleanedLen is the preferred cap on the tool half of a rewritten name.
 	// It is a readability limit, not a correctness one - the real bound is the
-	// remaining budget computed in EffectiveName.
+	// remaining budget computed in EffectiveName, which always wins.
 	maxCleanedLen = 48
-	// minCleanedLen keeps a rewritten name from losing the tool half entirely
-	// if a server name ever grows past what config allows (32 characters).
-	minCleanedLen = 8
+	// suffixLen is the cost of the disambiguating tail: '_' plus hashLen hex
+	// characters.
+	suffixLen = 1 + hashLen
+	// maxServerLen is the longest server half that still leaves room for the
+	// separator and the suffix inside MaxToolNameLen. A server name longer than
+	// this (config forbids it: mcpServerNameRe caps it at 32) is truncated so
+	// the hard ceiling is never breached.
+	maxServerLen = MaxToolNameLen - len(NameSeparator) - suffixLen
 )
 
 // toolNameRe is the provider-side rule a model-facing tool name must satisfy.
@@ -62,11 +67,16 @@ type NamedTool struct {
 // are appended. Hashing the original (not the cleaned form) is what stops
 // "a.b" and "a-b" from collapsing onto one name.
 //
-// The cut is sized so the whole result stays within MaxToolNameLen:
-// 64 - len(server) - len(NameSeparator) - 1 - 8, capped at 48 for readability
-// and floored at 8. Since config limits a server name to 32 characters the
-// floor is unreachable in practice; it exists so a hand-built call still
-// returns a usable name rather than an empty tool half.
+// CONTRACT: the result is at most MaxToolNameLen bytes and always satisfies
+// the provider-side rule, for ANY input. The tool half is cut to whatever the
+// hard ceiling leaves - 64 - len(server) - len(NameSeparator) - 1 - 8 - capped
+// at 48 for readability. The ceiling always wins over readability, never the
+// other way round. Config limits a server name to 32 characters, which leaves
+// 21 characters of tool name; if a caller ever passes a server name longer
+// than maxServerLen (53) the server half itself is truncated and the tool half
+// becomes empty, so the name degrades to <cut server>___<hash>. That case
+// cannot distinguish two such servers - it is a deterministic last resort that
+// keeps the contract, not a supported configuration.
 //
 // An empty tool name is always rewritten, so a nameless tool cannot silently
 // present itself to the model as the bare server prefix.
@@ -78,29 +88,48 @@ func EffectiveName(server, tool string) NamedTool {
 		return NamedTool{Effective: joined, Original: tool}
 	}
 
-	cleaned := strings.Map(func(r rune) rune {
-		if validRune(r) {
-			return r
-		}
-		return '_'
-	}, tool)
+	// The server half is cleaned too. Config already guarantees it is valid,
+	// but this package must be able to keep its own contract without trusting
+	// its caller.
+	cleanedServer := cut(clean(server), maxServerLen)
 
-	budget := MaxToolNameLen - len(server) - len(NameSeparator) - 1 - hashLen
-	budget = min(budget, maxCleanedLen)
-	budget = max(budget, minCleanedLen)
-	// Cutting by runes (not bytes) cannot split a character: strings.Map has
-	// already replaced every non-ASCII rune with '_', so runes are bytes here,
-	// but the rune form survives a future widening of validRune.
-	if r := []rune(cleaned); len(r) > budget {
-		cleaned = string(r[:budget])
+	// budget is what the hard ceiling leaves for the tool half after the server,
+	// the separator and the suffix. It is derived from MaxToolNameLen on every
+	// call - never floored at a constant - so the ceiling cannot be breached by
+	// an unusually long server name.
+	budget := min(MaxToolNameLen-len(cleanedServer)-len(NameSeparator)-suffixLen, maxCleanedLen)
+	cleanedTool := ""
+	if budget > 0 {
+		cleanedTool = cut(clean(tool), budget)
 	}
 
 	sum := sha256.Sum256([]byte(tool))
 	return NamedTool{
-		Effective:  server + NameSeparator + cleaned + "_" + hex.EncodeToString(sum[:hashLen/2]),
+		Effective:  cleanedServer + NameSeparator + cleanedTool + "_" + hex.EncodeToString(sum[:hashLen/2]),
 		Original:   tool,
 		Normalized: true,
 	}
+}
+
+// clean replaces every rune that may not appear in a tool name with '_'.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if validRune(r) {
+			return r
+		}
+		return '_'
+	}, s)
+}
+
+// cut shortens s to at most n runes. Cutting by runes (not bytes) cannot split
+// a character: clean has already replaced every non-ASCII rune with '_', so
+// runes are bytes here, but the rune form survives a future widening of
+// validRune.
+func cut(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 // validRune reports whether r may appear in a model-facing tool name. It is a

@@ -59,6 +59,45 @@ func TestEffectiveName(t *testing.T) {
 	}
 }
 
+// TestEffectiveNameRespectsTheCeiling is the contract test for the hard
+// MaxToolNameLen bound: it must hold for every server length, including ones
+// config would never allow, not just for the 32-character maximum.
+func TestEffectiveNameRespectsTheCeiling(t *testing.T) {
+	tools := []string{"", "x", "a.b", "create_issue", strings.Repeat("x", 70), strings.Repeat("ü", 90)}
+	for length := 1; length <= 64; length++ {
+		server := strings.Repeat("s", length)
+		for _, tool := range tools {
+			got := EffectiveName(server, tool)
+			if len(got.Effective) > MaxToolNameLen {
+				t.Errorf("server len %d, tool %q: Effective is %d bytes (%q), want <= %d",
+					length, tool, len(got.Effective), got.Effective, MaxToolNameLen)
+			}
+			if !toolNameRe.MatchString(got.Effective) {
+				t.Errorf("server len %d, tool %q: %q does not satisfy the provider-side rule",
+					length, tool, got.Effective)
+			}
+		}
+	}
+}
+
+// TestEffectiveNameWithAnOverlongServer pins the deterministic last resort: a
+// server name longer than the name budget itself is truncated and the tool
+// half disappears, rather than the ceiling being breached.
+func TestEffectiveNameWithAnOverlongServer(t *testing.T) {
+	server := strings.Repeat("s", 60)
+	got := EffectiveName(server, "create_issue")
+	want := strings.Repeat("s", 53) + "___" + hex8("create_issue")
+	if got.Effective != want {
+		t.Errorf("Effective = %q, want %q", got.Effective, want)
+	}
+	if len(got.Effective) != MaxToolNameLen {
+		t.Errorf("Effective is %d bytes, want exactly %d", len(got.Effective), MaxToolNameLen)
+	}
+	if !got.Normalized {
+		t.Error("Normalized = false, want true")
+	}
+}
+
 func TestEffectiveNameDisambiguates(t *testing.T) {
 	a := EffectiveName("s", "a.b")
 	b := EffectiveName("s", "a-b")

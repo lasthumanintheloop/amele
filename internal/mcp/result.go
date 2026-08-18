@@ -71,6 +71,9 @@ func RenderResult(res *sdk.CallToolResult, validator *schema.Validator) (text st
 		return capText(body), tools.Outcome{Kind: tools.OutcomeToolError}
 	}
 	if res.IsError {
+		// The prefix applies to structured content too: an error result is for
+		// the model to read, not for a caller to parse, so the failure must be
+		// visible even when the body happens to be JSON.
 		return capText(errorPrefix + body), tools.Outcome{Kind: tools.OutcomeToolError}
 	}
 	return capText(body), tools.Outcome{}

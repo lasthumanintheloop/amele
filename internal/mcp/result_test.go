@@ -140,6 +140,15 @@ func TestRenderResult(t *testing.T) {
 			wantKind:  tools.OutcomeToolError,
 		},
 		{
+			name: "is error with structured content",
+			res: &sdk.CallToolResult{
+				IsError:           true,
+				StructuredContent: map[string]any{"a": 1},
+			},
+			want:     `error: {"a":1}`,
+			wantKind: tools.OutcomeToolError,
+		},
+		{
 			name:     "needs input",
 			res:      inputRequiredResult(t),
 			want:     "error: server requested interactive input; not supported in headless mode",
