@@ -50,7 +50,7 @@ jobs:
       - name: Coverage budget (>= 80%)
         run: make cover
 
-      - name: Binary size budget (<= 10 MB)
+      - name: Binary size budget (<= 14 MB)
         run: make budget
 
   # The composite action at the repository root is shipped code that no other

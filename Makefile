@@ -2,7 +2,7 @@
 # never diverge.
 
 # Budgets enforced by `make budget` (docs/engineering.md §8).
-SIZE_BUDGET_BYTES := 10485760  # 10 MB hard ceiling
+SIZE_BUDGET_BYTES := 14680064  # 14 MB hard ceiling (raised from 10 MB for the MCP SDK, 2026-08-19)
 COVER_BUDGET      := 80        # minimum % statement coverage over internal/
 
 GOFLAGS := -trimpath

@@ -118,8 +118,9 @@ primary unit; USD is informational only.
 
 ## 8. CI budgets
 
-Measured on every PR; exceeding one fails the build. Binary size <= 10 MB
-(target 8 MB, `-ldflags="-s -w" -trimpath`). Harness token load (system
+Measured on every PR; exceeding one fails the build. Binary size <= 14 MB
+(target 12 MB, `-ldflags="-s -w" -trimpath`; raised from 10 MB on 2026-08-19
+for the MCP go-sdk, measured at roughly +4.6 MB). Harness token load (system
 prompt + builtin tool definitions) <= 1500 tokens. Coverage >= 80% across
 `internal/`. Builds are reproducible: `-trimpath`, pinned Go version,
 verified `go.sum`.
