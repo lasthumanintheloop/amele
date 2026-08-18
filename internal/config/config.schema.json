@@ -198,7 +198,7 @@
         "tools": {
           "type": "object",
           "additionalProperties": { "$ref": "#/$defs/policy" },
-          "description": "Maps a tool name to its policy, overriding default. Entries for tools that do not exist in this config are inert, so profiles can be shared across configs."
+          "description": "Maps a tool name to its policy, overriding default. A key may contain * and then matches by pattern (e.g. github__*); an exact key wins over any pattern, and among matching patterns the most restrictive policy wins (deny > ask > allow). Entries for tools that do not exist in this config are inert, so profiles can be shared across configs."
         }
       }
     },

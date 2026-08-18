@@ -1697,7 +1697,7 @@ func TestNewPrompter(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var errBuf bytes.Buffer
 			prompt := newPrompter(newLineReader(strings.NewReader(tt.input)), &errBuf)
-			got, err := prompt("fs_write", `{"path":"a.txt"}`)
+			got, err := prompt("fs_write", `{"path":"a.txt"}`, "")
 			if err != nil {
 				t.Fatalf("prompt: %v", err)
 			}
@@ -1717,8 +1717,8 @@ func TestNewPrompter(t *testing.T) {
 	t.Run("consecutive prompts share the reader", func(t *testing.T) {
 		var errBuf bytes.Buffer
 		prompt := newPrompter(newLineReader(strings.NewReader("y\nn\n")), &errBuf)
-		first, _ := prompt("a", "{}")
-		second, _ := prompt("b", "{}")
+		first, _ := prompt("a", "{}", "")
+		second, _ := prompt("b", "{}", "")
 		if !first || second {
 			t.Errorf("answers = %v, %v; want true, false", first, second)
 		}
@@ -1727,7 +1727,7 @@ func TestNewPrompter(t *testing.T) {
 	t.Run("long arguments are clipped", func(t *testing.T) {
 		var errBuf bytes.Buffer
 		prompt := newPrompter(newLineReader(strings.NewReader("n\n")), &errBuf)
-		if _, err := prompt("fs_write", strings.Repeat("z", 5000)); err != nil {
+		if _, err := prompt("fs_write", strings.Repeat("z", 5000), ""); err != nil {
 			t.Fatal(err)
 		}
 		if errBuf.Len() > 512 {
@@ -1817,7 +1817,7 @@ func TestSafeForTerminalStripsC1AndBidi(t *testing.T) {
 func TestPrompterSanitizesUntrustedText(t *testing.T) {
 	var errBuf bytes.Buffer
 	prompt := newPrompter(newLineReader(strings.NewReader("n\n")), &errBuf)
-	if _, err := prompt(evilToolName, "{\"path\":\"a.txt\x1b[2K\r\"}"); err != nil {
+	if _, err := prompt(evilToolName, "{\"path\":\"a.txt\x1b[2K\r\"}", ""); err != nil {
 		t.Fatal(err)
 	}
 	if hasControlBytes(errBuf.String()) {
@@ -2290,7 +2290,7 @@ func TestLineReaderSharedWithPrompter(t *testing.T) {
 	lines := newLineReader(strings.NewReader("y\nnext chat line\n"))
 	prompt := newPrompter(lines, &errBuf)
 
-	ok, err := prompt("fs_write", "{}")
+	ok, err := prompt("fs_write", "{}", "")
 	if err != nil || !ok {
 		t.Fatalf("approval = %v, %v", ok, err)
 	}
@@ -4032,4 +4032,49 @@ func TestUsageListsExitCode8(t *testing.T) {
 	if !strings.Contains(stdout, "8") || !strings.Contains(stdout, "required MCP server unavailable") {
 		t.Fatalf("usage does not document exit code 8:\n%s", stdout)
 	}
+}
+
+// TestPrompterHint: an MCP annotation ("this tool is destructive") is the only
+// extra fact available when the human is asked, so it must appear in the
+// question - and must not leave an empty pair of parentheses when absent.
+func TestPrompterHint(t *testing.T) {
+	t.Run("hint rendered", func(t *testing.T) {
+		var errBuf bytes.Buffer
+		prompt := newPrompter(newLineReader(strings.NewReader("n\n")), &errBuf)
+		if _, err := prompt("github__delete_repo", "{}", "server marks this destructive"); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(errBuf.String(), "(server marks this destructive)") {
+			t.Errorf("question missing the hint: %q", errBuf.String())
+		}
+	})
+
+	t.Run("no hint, no parentheses", func(t *testing.T) {
+		var errBuf bytes.Buffer
+		prompt := newPrompter(newLineReader(strings.NewReader("n\n")), &errBuf)
+		if _, err := prompt("fs_write", "{}", ""); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(errBuf.String(), "(") {
+			t.Errorf("empty hint must not render parentheses: %q", errBuf.String())
+		}
+	})
+
+	t.Run("hint is sanitized", func(t *testing.T) {
+		var errBuf bytes.Buffer
+		prompt := newPrompter(newLineReader(strings.NewReader("n\n")), &errBuf)
+		// SECURITY: the hint comes from a remote MCP server's tool
+		// description, so it is untrusted text on the same terminal line.
+		if _, err := prompt("x", "{}", "drop\x1b[2K\rall? [y/N] "); err != nil {
+			t.Fatal(err)
+		}
+		if hasControlBytes(errBuf.String()) {
+			t.Errorf("hint leaked control bytes: %q", errBuf.String())
+		}
+		// Without control bytes a hint can only ever add visible text, so the
+		// real question still owns the end of the line the human answers.
+		if !strings.HasSuffix(errBuf.String(), "[y/N] ") {
+			t.Errorf("hint displaced the real question: %q", errBuf.String())
+		}
+	})
 }

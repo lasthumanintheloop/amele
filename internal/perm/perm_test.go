@@ -26,8 +26,8 @@ func (r *recorder) log(toolName, decision string) {
 
 func tty(v bool) func() bool { return func() bool { return v } }
 
-func answer(yes bool) func(string, string) (bool, error) {
-	return func(string, string) (bool, error) { return yes, nil }
+func answer(yes bool) func(string, string, string) (bool, error) {
+	return func(string, string, string) (bool, error) { return yes, nil }
 }
 
 func TestApproverDecisions(t *testing.T) {
@@ -41,7 +41,7 @@ func TestApproverDecisions(t *testing.T) {
 		isTTY bool
 		// prompt is the injected answer for the ask policy; nil means the
 		// prompt must never be called.
-		prompt func(string, string) (bool, error)
+		prompt func(string, string, string) (bool, error)
 		want   loop.Ruling
 		// wantLogged is the number of Log calls expected.
 		wantLogged int
@@ -127,7 +127,7 @@ func TestApproverDecisions(t *testing.T) {
 			rec := &recorder{}
 			prompt := tt.prompt
 			if prompt == nil {
-				prompt = func(string, string) (bool, error) {
+				prompt = func(string, string, string) (bool, error) {
 					t.Error("Prompt must not be called")
 					return false, nil
 				}
@@ -186,7 +186,7 @@ func TestAskPromptArgumentsForwarded(t *testing.T) {
 		config.Permissions{Default: config.PolicyAsk},
 		Options{
 			IsTTY: tty(true),
-			Prompt: func(name, args string) (bool, error) {
+			Prompt: func(name, args, _ string) (bool, error) {
 				gotName, gotArgs = name, args
 				return true, nil
 			},
@@ -211,7 +211,7 @@ func TestPromptErrorAborts(t *testing.T) {
 		config.Permissions{Default: config.PolicyAsk},
 		Options{
 			IsTTY:  tty(true),
-			Prompt: func(string, string) (bool, error) { return true, sentinel },
+			Prompt: func(string, string, string) (bool, error) { return true, sentinel },
 		},
 	)
 	if err != nil {
@@ -316,5 +316,155 @@ func TestApproverSnapshotsConfig(t *testing.T) {
 	}
 	if got.Decision != loop.DenyContinue {
 		t.Errorf("decision = %v, want DenyContinue (config must be snapshotted)", got)
+	}
+}
+
+// TestPolicyFor pins the rule precedence for permissions.tools keys. Glob keys
+// exist because MCP tools arrive as `<server>__<tool>` and an operator governs
+// a whole server with one line; the precedence must not depend on YAML map
+// order, so it is exact-first and then most-restrictive.
+func TestPolicyFor(t *testing.T) {
+	tests := []struct {
+		name  string
+		def   config.Policy
+		rules map[string]config.Policy
+		tool  string
+		want  config.Policy
+	}{
+		{
+			name:  "glob matches",
+			def:   config.PolicyAllow,
+			rules: map[string]config.Policy{"github__*": config.PolicyAsk},
+			tool:  "github__list",
+			want:  config.PolicyAsk,
+		},
+		{
+			name:  "exact wins over glob",
+			def:   config.PolicyAllow,
+			rules: map[string]config.Policy{"github__*": config.PolicyAsk, "github__list": config.PolicyAllow},
+			tool:  "github__list",
+			want:  config.PolicyAllow,
+		},
+		{
+			name:  "most restrictive glob wins",
+			def:   config.PolicyAllow,
+			rules: map[string]config.Policy{"github__*": config.PolicyAsk, "*_delete*": config.PolicyDeny},
+			tool:  "github__repo_delete",
+			want:  config.PolicyDeny,
+		},
+		{
+			name:  "no rules falls back to default",
+			def:   config.PolicyDeny,
+			rules: map[string]config.Policy{},
+			tool:  "anything",
+			want:  config.PolicyDeny,
+		},
+		{
+			name:  "non-matching glob leaves the default",
+			def:   config.PolicyAllow,
+			rules: map[string]config.Policy{"github__*": config.PolicyAllow},
+			tool:  "jira__x",
+			want:  config.PolicyAllow,
+		},
+		{
+			name:  "ask beats allow among globs",
+			def:   config.PolicyAllow,
+			rules: map[string]config.Policy{"github__*": config.PolicyAllow, "*__repo_*": config.PolicyAsk},
+			tool:  "github__repo_list",
+			want:  config.PolicyAsk,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Repeated because map iteration order is random: a precedence
+			// rule that only holds on some orderings is not a rule.
+			for i := 0; i < 20; i++ {
+				if got := policyFor(tt.tool, tt.def, tt.rules); got != tt.want {
+					t.Fatalf("policyFor(%q) = %q, want %q", tt.tool, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+// TestGlobRuleReachesApprover checks the wiring, not just the helper: a glob
+// key in the config must actually govern the ruling the loop receives.
+func TestGlobRuleReachesApprover(t *testing.T) {
+	approve, err := NewApprover(
+		config.Permissions{
+			Default: config.PolicyAllow,
+			Tools:   map[string]config.Policy{"github__*": config.PolicyDeny},
+		},
+		Options{IsTTY: tty(false)},
+	)
+	if err != nil {
+		t.Fatalf("NewApprover: %v", err)
+	}
+	got, err := approve(context.Background(), llm.ToolCall{Name: "github__create_issue"})
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if got.Decision != loop.DenyContinue {
+		t.Errorf("decision = %v, want DenyContinue", got)
+	}
+}
+
+// TestAskPromptReceivesHint: an MCP server may annotate a tool as destructive;
+// that annotation must reach the human being asked, since it is the only extra
+// information available at the moment of the decision.
+func TestAskPromptReceivesHint(t *testing.T) {
+	const want = "server marks this destructive"
+	var gotHint string
+	var hintedFor string
+	approve, err := NewApprover(
+		config.Permissions{Default: config.PolicyAsk},
+		Options{
+			IsTTY: tty(true),
+			Prompt: func(_, _, hint string) (bool, error) {
+				gotHint = hint
+				return true, nil
+			},
+			Hint: func(name string) string {
+				hintedFor = name
+				return want
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewApprover: %v", err)
+	}
+	if _, err := approve(context.Background(), llm.ToolCall{Name: "github__delete_repo"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if gotHint != want {
+		t.Errorf("hint = %q, want %q", gotHint, want)
+	}
+	if hintedFor != "github__delete_repo" {
+		t.Errorf("Hint asked about %q, want the called tool", hintedFor)
+	}
+}
+
+// TestAskPromptWithoutHintProvider: Hint is optional, and a nil one must not
+// panic - it simply yields an empty hint.
+func TestAskPromptWithoutHintProvider(t *testing.T) {
+	var gotHint = "unset"
+	approve, err := NewApprover(
+		config.Permissions{Default: config.PolicyAsk},
+		Options{
+			IsTTY: tty(true),
+			Prompt: func(_, _, hint string) (bool, error) {
+				gotHint = hint
+				return true, nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("NewApprover: %v", err)
+	}
+	if _, err := approve(context.Background(), llm.ToolCall{Name: "fs_write"}); err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	if gotHint != "" {
+		t.Errorf("hint = %q, want empty", gotHint)
 	}
 }

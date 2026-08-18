@@ -2271,6 +2271,11 @@ const maxPromptArgs = 200
 // reaches the terminal.
 const maxToolName = 64
 
+// maxPromptHint caps the annotation shown next to the approval question. It is
+// server-controlled prose, so it must never be long enough to push the "[y/N]"
+// off the line the human is reading.
+const maxPromptHint = 120
+
 // clipMarker marks text that safeForTerminal shortened.
 const clipMarker = "... (clipped)"
 
@@ -2306,10 +2311,19 @@ func buildApprover(cfg *config.Config, lines *lineReader, stderr io.Writer) (loo
 // SECURITY: only an explicit "y"/"yes" approves. Everything else - a blank
 // line, an unrecognized word, or EOF (Ctrl-D, or a closed stdin) - is a
 // refusal, so an accidental Enter never grants a tool.
-func newPrompter(lines *lineReader, stderr io.Writer) func(toolName, args string) (bool, error) {
-	return func(toolName, args string) (bool, error) {
-		_, _ = fmt.Fprintf(stderr, "amele: allow tool %s with %s? [y/N] ",
-			safeForTerminal(toolName, maxToolName), safeForTerminal(args, maxPromptArgs))
+func newPrompter(lines *lineReader, stderr io.Writer) func(toolName, args, hint string) (bool, error) {
+	return func(toolName, args, hint string) (bool, error) {
+		// SECURITY: the hint is remote text (an MCP server's annotation), so
+		// it goes through the same sanitizer as the name and the arguments -
+		// otherwise it would be the easiest place to forge a second question.
+		if hint != "" {
+			_, _ = fmt.Fprintf(stderr, "amele: allow tool %s with %s? (%s) [y/N] ",
+				safeForTerminal(toolName, maxToolName), safeForTerminal(args, maxPromptArgs),
+				safeForTerminal(hint, maxPromptHint))
+		} else {
+			_, _ = fmt.Fprintf(stderr, "amele: allow tool %s with %s? [y/N] ",
+				safeForTerminal(toolName, maxToolName), safeForTerminal(args, maxPromptArgs))
+		}
 		line, err := lines.ReadLine()
 		// EOF is an answer ("no human left to ask"), not a failure; any other
 		// read error means we never got one, and perm turns that into an abort.

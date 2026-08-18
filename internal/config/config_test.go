@@ -822,6 +822,52 @@ permissions:
 	}
 }
 
+// TestPermissionsGlobKeyAccepted pins that a glob key validates like any
+// other: `permissions.tools` keys are patterns (perm.policyFor), and MCP
+// configs govern a whole server with one `<server>__*` line.
+func TestPermissionsGlobKeyAccepted(t *testing.T) {
+	yaml := minimalYAML + `
+permissions:
+  default: allow
+  tools:
+    "github__*": ask
+    "*_delete*": deny
+`
+	path := writeConfig(t, t.TempDir(), yaml)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("a glob key must validate: %v", err)
+	}
+	if got := cfg.Permissions.Tools["github__*"]; got != PolicyAsk {
+		t.Errorf("tools[github__*] = %q, want ask", got)
+	}
+	if got := cfg.Permissions.Tools["*_delete*"]; got != PolicyDeny {
+		t.Errorf("tools[*_delete*] = %q, want deny", got)
+	}
+}
+
+// TestPermissionsGlobKeyInvalidPolicy: a glob key buys no leniency on the
+// policy value itself.
+func TestPermissionsGlobKeyInvalidPolicy(t *testing.T) {
+	yaml := minimalYAML + `
+permissions:
+  tools:
+    "github__*": maybe
+`
+	path := writeConfig(t, t.TempDir(), yaml)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	err = cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "permissions.tools.github__*") {
+		t.Errorf("want an error naming the glob key, got %v", err)
+	}
+}
+
 func TestValidateErrors(t *testing.T) {
 	dir := t.TempDir()
 

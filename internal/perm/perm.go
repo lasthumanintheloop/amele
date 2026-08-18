@@ -17,10 +17,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/loop"
+	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
 // Policy is the permission ruling for a tool: "allow", "ask" or "deny".
@@ -41,14 +43,24 @@ type Options struct {
 	// either direction is a security or usability bug.
 	IsTTY func() bool
 	// Prompt asks the human about one call and reports whether it may run.
-	// It receives the tool name and the raw JSON arguments so the human can
-	// judge the call, not just the tool. Required only when some policy is
-	// "ask"; a returned error aborts the run (fail closed).
-	Prompt func(toolName, args string) (bool, error)
+	// It receives the tool name, the raw JSON arguments so the human can judge
+	// the call rather than just the tool, and a short hint (possibly "") that
+	// says something the config does not - see Hint. Required only when some
+	// policy is "ask"; a returned error aborts the run (fail closed).
+	Prompt func(toolName, args, hint string) (bool, error)
 	// Log records permission events for the operator: the tool name and a
 	// short reason. It is the audit half of the §5.5 fail-safe rule. Optional
 	// (nil is a no-op).
 	Log func(toolName, decision string)
+	// Hint returns a short operator-facing note about a tool, shown in the
+	// approval question - typically a remote MCP server's annotation that the
+	// tool is destructive or writes to the outside world. It is the only fact
+	// available at the moment of decision that the config does not already
+	// state. Optional: nil (or "") means the question is asked without one.
+	//
+	// SECURITY: the text is remote-controlled, so the caller rendering it must
+	// sanitize it exactly like the tool name and the arguments.
+	Hint func(toolName string) string
 }
 
 // Reasons passed to Options.Log. They are operator-facing English text, not a
@@ -72,7 +84,8 @@ const (
 //	                   loop.DeniedAskRefused
 //	ask + no TTY     → DenyContinue + loop.DeniedNoTTY, and Options.Log is
 //	                   called with the reason
-//	unlisted tool    → the default policy (allow when the block is absent)
+//	unlisted tool    → the matching rule, else the default policy (allow when
+//	                   the block is absent); see policyFor for the precedence
 //
 // Every denial carries its reason because the three are different incidents
 // with different fixes, and the loop serializes them into the session log's
@@ -105,13 +118,13 @@ func NewApprover(perms config.Permissions, opts Options) (loop.Approver, error) 
 	// SECURITY: the map is copied so the approver's rules cannot change under
 	// the loop after construction (aliasing the caller's map would let a later
 	// mutation flip a deny to an allow mid-run).
-	tools := make(map[string]Policy, len(perms.Tools))
+	rules := make(map[string]Policy, len(perms.Tools))
 	needsPrompt := def == config.PolicyAsk
 	for name, policy := range perms.Tools {
 		if !policy.Valid() {
 			return nil, fmt.Errorf("perm: invalid policy %q for tool %q", policy, name)
 		}
-		tools[name] = policy
+		rules[name] = policy
 		if policy == config.PolicyAsk {
 			needsPrompt = true
 		}
@@ -129,10 +142,7 @@ func NewApprover(perms config.Permissions, opts Options) (loop.Approver, error) 
 	}
 
 	return func(_ context.Context, call llm.ToolCall) (loop.Ruling, error) {
-		policy := def
-		if p, ok := tools[call.Name]; ok {
-			policy = p
-		}
+		policy := policyFor(call.Name, def, rules)
 
 		switch policy {
 		case config.PolicyAllow:
@@ -168,7 +178,14 @@ func ask(call llm.ToolCall, opts Options, logf func(string, string)) (loop.Rulin
 		return loop.Ruling{Decision: loop.DenyAbort}, fmt.Errorf("perm: no Prompt configured for the ask policy on tool %q", call.Name)
 	}
 
-	allowed, err := opts.Prompt(call.Name, call.Arguments)
+	// The hint is computed only on the ask path: it may cost a lookup, and an
+	// allow/deny ruling never shows it to anyone.
+	hint := ""
+	if opts.Hint != nil {
+		hint = opts.Hint(call.Name)
+	}
+
+	allowed, err := opts.Prompt(call.Name, call.Arguments, hint)
 	if err != nil {
 		// A broken prompt is not a "no": the human never got to answer, so
 		// the run aborts instead of silently continuing under a guess.
@@ -180,4 +197,51 @@ func ask(call llm.ToolCall, opts Options, logf func(string, string)) (loop.Rulin
 	}
 	logf(call.Name, reasonDeniedByUser)
 	return loop.Ruling{Decision: loop.DenyContinue, Reason: loop.DeniedAskRefused}, nil
+}
+
+// policyFor resolves the ruling for one tool name. Exact entries win; among
+// glob entries (tools.GlobMatch syntax, '*' = any substring) the most
+// restrictive match wins, so that a broad `github__*: allow` can never
+// silently override a narrower `*_delete*: deny` - and neither can the order
+// the operator happened to type them in.
+//
+// Glob keys exist for MCP: a server contributes tools named `<server>__<tool>`,
+// and governing a whole server tool by tool would be both tedious and unsafe
+// (the server can add tools between runs, and an unlisted one would fall back
+// to the default).
+//
+// SECURITY: precedence is deterministic and independent of YAML/map ordering.
+// Only keys containing '*' are treated as patterns, so a literal name is
+// always matched literally.
+func policyFor(name string, def Policy, rules map[string]Policy) Policy {
+	if p, ok := rules[name]; ok {
+		return p
+	}
+	best, found := Policy(""), false
+	for pat, p := range rules {
+		if !strings.Contains(pat, "*") || !tools.GlobMatch(pat, name) {
+			continue
+		}
+		if !found || restrictiveness(p) > restrictiveness(best) {
+			best, found = p, true
+		}
+	}
+	if found {
+		return best
+	}
+	return def
+}
+
+// restrictiveness ranks policies so the strictest matching glob wins:
+// deny > ask > allow. An unknown value ranks lowest because it can only reach
+// here after validation rejected it, i.e. never.
+func restrictiveness(p Policy) int {
+	switch p {
+	case config.PolicyDeny:
+		return 2
+	case config.PolicyAsk:
+		return 1
+	default:
+		return 0
+	}
 }

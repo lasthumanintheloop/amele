@@ -93,6 +93,21 @@ permissions:
   result and keeps going with the tools it still has, so a denial does not kill
   the run.
 
+A key may contain `*` and then matches tool names by pattern - useful when one
+server contributes many tools (`github__*`). Precedence is fixed and does not
+depend on the order you write the entries: an exact key wins over any pattern,
+and among matching patterns the most restrictive policy wins (`deny` > `ask` >
+`allow`), so a narrow `"*_delete*": deny` is never overridden by a broad
+`"github__*": allow`.
+
+```yaml
+permissions:
+  default: allow
+  tools:
+    "github__*": ask      # every tool of the github server
+    "*_delete*": deny     # ...except deleting anything, ever
+```
+
 **TTY fail-safe (headless-first):** when stdin is not a terminal - cron, CI, a
 pipe - `ask` degrades to `deny` automatically and the reason is logged to
 stderr. A headless agent can never block waiting for a human that is not there,

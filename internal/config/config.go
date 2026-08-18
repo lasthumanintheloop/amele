@@ -916,6 +916,11 @@ func baseURLProblem(raw string) string {
 
 // validatePermissions checks the permission profile's policy values.
 //
+// Keys are patterns, not just names: a key containing '*' matches by glob
+// (internal/perm applies the precedence), which is how one line governs every
+// tool of an MCP server. Nothing here rejects or interprets the pattern - a
+// key is only ever read as text at this layer.
+//
 // It deliberately does NOT check that a named tool exists: a profile may be
 // written before the tool it governs (or shared across configs that declare
 // different subprocess tools), and an entry for an absent tool is inert
