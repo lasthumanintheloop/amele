@@ -180,7 +180,7 @@ func (s *Shell) reject(command string) (string, bool) {
 
 	for _, line := range lines {
 		for _, pattern := range s.deny {
-			if globMatch(pattern, line) {
+			if GlobMatch(pattern, line) {
 				return fmt.Sprintf("%s: the line %q matches the deny pattern %q. Try a different command.",
 					rejectionPrefix, line, pattern), true
 			}
@@ -219,7 +219,7 @@ func policyLines(command string) []string {
 // matchesAny reports whether s matches at least one of the patterns.
 func matchesAny(patterns []string, s string) bool {
 	for _, pattern := range patterns {
-		if globMatch(pattern, s) {
+		if GlobMatch(pattern, s) {
 			return true
 		}
 	}
@@ -236,7 +236,7 @@ func quoteAll(patterns []string) []string {
 	return out
 }
 
-// globMatch reports whether the whole string s matches pattern.
+// GlobMatch reports whether the whole string s matches pattern.
 //
 // The grammar is deliberately one rule wide: `*` matches any substring
 // (including the empty one) and every other byte matches itself. Matching is
@@ -244,7 +244,11 @@ func quoteAll(patterns []string) []string {
 // purpose - its `*` stops at a separator and it gives `?`, `[...]` and `\`
 // meanings, which turns "rm *" into a rule an operator cannot predict when the
 // subject is a command line rather than a path.
-func globMatch(pattern, s string) bool {
+//
+// It is exported because the same rule is shared by the shell allow/deny lists
+// and the MCP include/exclude filters (and, later, the permission globs), so an
+// operator learns one syntax and it behaves identically everywhere.
+func GlobMatch(pattern, s string) bool {
 	parts := strings.Split(pattern, "*")
 	if len(parts) == 1 {
 		return s == pattern // no wildcard: exact match

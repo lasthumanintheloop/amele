@@ -512,10 +512,19 @@ func TestGlobMatch(t *testing.T) {
 		// overlapping literal runs must not be double-counted
 		{"a*a", "a", false},
 		{"a*a", "aa", true},
+		// Tool-name filtering (MCP include/exclude) reuses the same rule.
+		{"issue_*", "issue_list", true},
+		{"issue_*", "list_issue", false},
+		{"*_delete*", "repo_delete_branch", true},
+		{"exact", "exact", true},
+		{"exact", "Exact", false},
+		{"a*b*c", "aXXbYYc", true},
+		{"", "", true},
+		{"", "x", false},
 	}
 	for _, tt := range tests {
-		if got := globMatch(tt.pattern, tt.command); got != tt.want {
-			t.Errorf("globMatch(%q, %q) = %v want %v", tt.pattern, tt.command, got, tt.want)
+		if got := GlobMatch(tt.pattern, tt.command); got != tt.want {
+			t.Errorf("GlobMatch(%q, %q) = %v want %v", tt.pattern, tt.command, got, tt.want)
 		}
 	}
 }
@@ -984,6 +993,8 @@ func TestOutcomeString(t *testing.T) {
 		{Outcome{Kind: OutcomeTimedOut}, "timed out"},
 		{Outcome{Kind: OutcomeAborted}, "aborted"},
 		{Outcome{Kind: OutcomeExit, ExitCode: 3}, "exit 3"},
+		{Outcome{Kind: OutcomeToolError}, "tool error"},
+		{Outcome{Kind: OutcomeIndeterminate}, "indeterminate"},
 		// An unknown kind must not masquerade as success.
 		{Outcome{Kind: OutcomeKind(99)}, "outcome 99"},
 	}

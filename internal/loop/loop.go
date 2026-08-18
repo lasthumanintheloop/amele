@@ -593,6 +593,10 @@ func toolOutcome(o tools.Outcome) (session.ToolOutcome, *int) {
 		// alias a caller's Outcome.
 		code := o.ExitCode
 		return session.OutcomeNonzeroExit, &code
+	case tools.OutcomeToolError:
+		return session.OutcomeToolError, nil
+	case tools.OutcomeIndeterminate:
+		return session.OutcomeIndeterminate, nil
 	default:
 		// Unreachable unless a kind is added without a case here. Reporting
 		// `error` beats a confident `ok`: an unknown state is not a success,

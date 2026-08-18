@@ -81,12 +81,29 @@ const (
 	// OutcomeExit means the command ran to completion and failed; ExitCode
 	// carries its status.
 	OutcomeExit
+	// OutcomeToolError means the tool ran and reported its own failure (an MCP
+	// result with isError set). Distinct from a Go error return, which says the
+	// harness could not dispatch the call at all.
+	//
+	// CONTRACT: maps to session.OutcomeToolError ("tool_error") in the
+	// published event enum (docs/contracts/jsonl-events.md).
+	OutcomeToolError
+	// OutcomeIndeterminate means the request left the harness but the response
+	// was lost (the transport died, the call timed out after it was sent), so
+	// whether the tool did its work is unknown. It is deliberately NOT reported
+	// as a failure: an operator re-running a side-effecting call needs to know
+	// the difference.
+	//
+	// CONTRACT: maps to session.OutcomeIndeterminate ("indeterminate") in the
+	// published event enum (docs/contracts/jsonl-events.md).
+	OutcomeIndeterminate
 )
 
 // String renders the outcome as the short operator-facing phrase progress
 // consumers embed verbatim ("ok", "rejected", "timed out", "aborted",
-// "exit 3"). It lives here, next to the code that knows WHY a call ended, so
-// there is one wording rather than one per consumer. The phrasing is
+// "exit 3", "tool error", "indeterminate"). It lives here, next to the code
+// that knows WHY a call ended, so there is one wording rather than one per
+// consumer. The phrasing is
 // human-facing text, not a parsing contract.
 func (o Outcome) String() string {
 	switch o.Kind {
@@ -98,6 +115,10 @@ func (o Outcome) String() string {
 		return "aborted"
 	case OutcomeExit:
 		return fmt.Sprintf("exit %d", o.ExitCode)
+	case OutcomeToolError:
+		return "tool error"
+	case OutcomeIndeterminate:
+		return "indeterminate"
 	case OutcomeOK:
 		return "ok"
 	default:

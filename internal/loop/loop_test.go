@@ -1382,3 +1382,44 @@ func TestProgressUsesSessionTurnNumbers(t *testing.T) {
 		t.Errorf("progress events:\n got %q\nwant %q", *events, want)
 	}
 }
+
+// TestToolOutcomeMapping pins the translation from the runner's internal
+// vocabulary (tools.OutcomeKind) to the frozen enum the JSONL event publishes
+// (session.ToolOutcome, docs/contracts/jsonl-events.md). It is a table rather
+// than a golden run because the mapping is a contract in its own right: a new
+// kind must be given a published outcome deliberately, and an unmapped one must
+// report `error` instead of a confident `ok`.
+func TestToolOutcomeMapping(t *testing.T) {
+	three := 3
+	tests := []struct {
+		name     string
+		in       tools.Outcome
+		want     session.ToolOutcome
+		wantCode *int
+	}{
+		{"ok", tools.Outcome{}, session.OutcomeOK, nil},
+		{"rejected", tools.Outcome{Kind: tools.OutcomeRejected}, session.OutcomeDeniedPolicy, nil},
+		{"timed out", tools.Outcome{Kind: tools.OutcomeTimedOut}, session.OutcomeTimeout, nil},
+		{"aborted", tools.Outcome{Kind: tools.OutcomeAborted}, session.OutcomeAborted, nil},
+		{"exit", tools.Outcome{Kind: tools.OutcomeExit, ExitCode: 3}, session.OutcomeNonzeroExit, &three},
+		{"tool error", tools.Outcome{Kind: tools.OutcomeToolError}, session.OutcomeToolError, nil},
+		{"indeterminate", tools.Outcome{Kind: tools.OutcomeIndeterminate}, session.OutcomeIndeterminate, nil},
+		{"unknown", tools.Outcome{Kind: tools.OutcomeKind(99)}, session.OutcomeError, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, code := toolOutcome(tt.in)
+			if got != tt.want {
+				t.Errorf("toolOutcome(%+v) = %q, want %q", tt.in, got, tt.want)
+			}
+			switch {
+			case tt.wantCode == nil && code != nil:
+				t.Errorf("exit code = %d, want nil", *code)
+			case tt.wantCode != nil && code == nil:
+				t.Errorf("exit code = nil, want %d", *tt.wantCode)
+			case tt.wantCode != nil && *code != *tt.wantCode:
+				t.Errorf("exit code = %d, want %d", *code, *tt.wantCode)
+			}
+		})
+	}
+}
