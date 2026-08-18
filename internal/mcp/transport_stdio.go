@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
+	"sync"
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -27,21 +29,44 @@ const (
 	// maxStderrBytes bounds what a server's stderr can cost. Diagnostics are
 	// worth keeping; a server that loops printing is not.
 	maxStderrBytes = 16 << 10
+	// msgTooLargeText is the exact wording every size-cap failure carries. It is
+	// a constant because it is load-bearing: IsMessageTooLarge matches on it
+	// when the error chain has been severed (see that function).
+	msgTooLargeText = "message exceeds the size cap"
 )
 
 // errMessageTooLarge is returned by both transports when a peer's message
-// exceeds MaxMessageBytes. It is a sentinel so Task 9's classifier and tests
-// can match on it instead of on wording.
-var errMessageTooLarge = errors.New("message exceeds the size cap")
+// exceeds MaxMessageBytes. It is a sentinel so callers can match on it instead
+// of on wording - but see IsMessageTooLarge for the case where the chain does
+// not survive.
+var errMessageTooLarge = errors.New(msgTooLargeText)
+
+// IsMessageTooLarge reports whether err was caused by a peer exceeding
+// MaxMessageBytes on either transport.
+//
+// It falls back to a substring match on purpose: on the Streamable HTTP path
+// the SDK formats read failures with %v (mcp/streamable.go), which severs the
+// %w chain, so errors.Is alone would miss every HTTP cap failure. The wording
+// is pinned by msgTooLargeText, which both the stdio reader and the HTTP body
+// wrapper embed.
+func IsMessageTooLarge(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, errMessageTooLarge) || strings.Contains(err.Error(), msgTooLargeText)
+}
 
 // newStdioTransport starts argv in dir as its own process group with a minimal
 // environment and returns an SDK transport over the child's stdio plus a kill
 // function that terminates the whole group.
 //
-// The returned kill function is idempotent-safe to call once per transport; it
-// closes the child's stdin, signals the group and reaps the process, so no
-// goroutine and no grandchild outlives the run. Callers must call it even when
-// the session closed cleanly.
+// The returned kill function closes the child's stdin, signals the whole
+// process group and reaps the process, so no goroutine and no grandchild
+// outlives the run. Callers must call it even when the session closed cleanly.
+// It is idempotent and safe to call concurrently (guarded by a sync.Once), and
+// it blocks until the child is reaped: worst case about stdioGrace for the
+// explicit SIGTERM-then-SIGKILL sequence plus cmd.WaitDelay for a
+// cancellation-driven kill already in flight, so roughly 10s.
 //
 // SECURITY: the child never inherits amele's environment (see childEnv) and
 // never shares amele's process group (see setupProcessGroup).
@@ -72,11 +97,16 @@ func newStdioTransport(ctx context.Context, argv []string, dir string, allow []s
 		return nil, nil, fmt.Errorf("starting %q: %w", argv[0], err)
 	}
 
+	var killOnce sync.Once
+	// sync.Once, not a bare closure: Connect's error path and the run's shutdown
+	// may both call kill, and two concurrent cmd.Wait calls are a data race.
 	kill := func() {
-		// Closing stdin is the polite shutdown an MCP server expects; the
-		// signals below are the guarantee that it happens anyway.
-		_ = stdin.Close()
-		killGroup(cmd)
+		killOnce.Do(func() {
+			// Closing stdin is the polite shutdown an MCP server expects; the
+			// signals below are the guarantee that it happens anyway.
+			_ = stdin.Close()
+			killGroup(cmd)
+		})
 	}
 	return &sdk.IOTransport{
 		Reader: &lineCappedReader{r: stdout, max: MaxMessageBytes},
@@ -114,7 +144,9 @@ func childEnv(allow []string, env func(string) (string, bool)) []string {
 //
 // The SDK frames stdio messages by newline, so "bytes since the last \n" is
 // exactly one message; failing the reader fails the connection, which is the
-// outcome we want (the peer is either broken or hostile).
+// outcome we want (the peer is either broken or hostile). The terminating
+// newline counts toward the cap, so the payload budget is max-1 bytes - an
+// off-by-one nobody can notice at 8 MiB.
 type lineCappedReader struct {
 	r     io.ReadCloser
 	max   int
@@ -157,6 +189,11 @@ func (r *lineCappedReader) Close() error { return r.r.Close() }
 
 // cappedWriter forwards at most max bytes to w and silently drops the rest. It
 // wraps the operator's stderr sink, which is responsible for redaction.
+//
+// cappedWriter itself is not safe for concurrent use, and it does not
+// serialize writes to w: when one sink is shared by several servers, that sink
+// must be safe for concurrent use (os/exec writes each child's stderr from its
+// own goroutine).
 type cappedWriter struct {
 	w       io.Writer
 	max     int

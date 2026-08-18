@@ -29,7 +29,16 @@ func newHTTPTransport(rawURL string, headers map[string]string) (*sdk.Streamable
 		return nil, fmt.Errorf("url %q: want an absolute http(s) url", rawURL)
 	}
 
-	base := http.DefaultTransport.(*http.Transport).Clone()
+	// Comma-ok, never a bare assertion: a library must not panic because some
+	// other package replaced http.DefaultTransport (CLAUDE.md 5.3). The
+	// fallback keeps proxy support, which is the setting operators actually
+	// depend on behind a corporate egress.
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	} else {
+		base = base.Clone()
+	}
 	client := &http.Client{
 		// No client-level timeout: an MCP call's deadline is the run's ctx,
 		// and a streaming response may legitimately outlive any fixed bound.
@@ -88,6 +97,11 @@ func (h *headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 // max bytes.
 // SECURITY: the cap is applied before any decoding, so a server cannot spend
 // amele's memory by answering a small request with an endless body.
+//
+// The cap is per response, not per JSON-RPC message: a text/event-stream POST
+// response is billed cumulatively across its events. That is accepted - the
+// standalone SSE stream is disabled and a POST response carries the answer to
+// one call, for which 8 MiB is generous.
 type cappedBodyRoundTripper struct {
 	next http.RoundTripper
 	max  int64

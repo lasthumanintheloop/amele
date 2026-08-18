@@ -150,6 +150,9 @@ func TestStdioMessageCap(t *testing.T) {
 	if err == nil {
 		t.Fatal("CallTool(big) succeeded, want the message cap to break the connection")
 	}
+	if !IsMessageTooLarge(err) {
+		t.Fatalf("error = %v, want the size cap", err)
+	}
 }
 
 // recordingHandler counts GET requests and remembers the last Authorization
@@ -217,14 +220,33 @@ func TestHTTPHeadersAndNoSSE(t *testing.T) {
 }
 
 func TestHTTPBodyCap(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	// The handler streams forever: if the cap did not exist, the client would
+	// read until it ran out of memory. Flushing keeps bytes moving so the
+	// failure is the cap and not a stalled connection.
+	served := make(chan struct{})
+	var servedOnce sync.Once
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Once, not a bare close: the SDK may retry the POST, and closing a
+		// closed channel panics inside the test server's goroutine.
+		defer servedOnce.Do(func() { close(served) })
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Error("ResponseWriter does not flush")
+			return
+		}
 		chunk := bytes.Repeat([]byte("x"), 64<<10)
-		for written := 0; written <= MaxMessageBytes; written += len(chunk) {
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			default:
+			}
 			if _, err := w.Write(chunk); err != nil {
 				return
 			}
+			flusher.Flush()
 		}
 	}))
 	defer ts.Close()
@@ -235,10 +257,43 @@ func TestHTTPBodyCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
+
+	start := time.Now()
 	sess, err := sdk.NewClient(&sdk.Implementation{Name: "amele-test", Version: "0"}, nil).Connect(ctx, tr, nil)
+	elapsed := time.Since(start)
 	if err == nil {
 		_ = sess.Close()
-		t.Fatal("connect succeeded against an oversized body, want the cap to fail it")
+		t.Fatal("connect succeeded against an endless body, want the cap to fail it")
+	}
+	// The cap, not a decode error further down: without this assertion the test
+	// would pass even with no cap at all.
+	if !IsMessageTooLarge(err) {
+		t.Fatalf("error = %v, want the size cap", err)
+	}
+	// Bounded: reading 8 MiB and giving up, not chasing an endless stream.
+	if elapsed > 10*time.Second {
+		t.Errorf("connect took %v, want the cap to end it quickly", elapsed)
+	}
+	select {
+	case <-served:
+	case <-time.After(10 * time.Second):
+		t.Error("handler still streaming after the client gave up")
+	}
+}
+
+func TestIsMessageTooLarge(t *testing.T) {
+	if IsMessageTooLarge(nil) {
+		t.Error("IsMessageTooLarge(nil) = true")
+	}
+	if IsMessageTooLarge(errors.New("something else")) {
+		t.Error("IsMessageTooLarge matched an unrelated error")
+	}
+	if !IsMessageTooLarge(fmt.Errorf("wrapped: %w", errMessageTooLarge)) {
+		t.Error("IsMessageTooLarge missed a wrapped sentinel")
+	}
+	// The SDK severs the chain with %v; the text must still be recognised.
+	if !IsMessageTooLarge(errors.New("read: " + msgTooLargeText + " (cap 8388608 bytes)")) {
+		t.Error("IsMessageTooLarge missed a flattened error")
 	}
 }
 
