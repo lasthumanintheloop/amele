@@ -201,6 +201,88 @@
           "description": "Maps a tool name to its policy, overriding default. Entries for tools that do not exist in this config are inert, so profiles can be shared across configs."
         }
       }
+    },
+    "mcp": {
+      "type": "object",
+      "description": "MCP servers whose tools are offered to the model as <server>__<tool>. The block is top level rather than under tools because one connection may later also carry resources and prompts.",
+      "additionalProperties": false,
+      "properties": {
+        "servers": {
+          "type": "array",
+          "description": "Declared MCP connections, in file order. Server names must be unique and must not collide with a builtin or subprocess tool name.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "transport"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9_-]{1,32}$",
+                "description": "Prefix of every tool this server contributes (\"<name>__<tool>\"). Lowercase letters, digits, `_` and `-`, max 32 chars - stricter than a subprocess tool name because the model must type the full prefixed name back verbatim."
+              },
+              "transport": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type"],
+                "description": "How to reach the server. Which other fields are legal depends on type; mixing them is a config error rather than a silently ignored key.",
+                "properties": {
+                  "type": {
+                    "enum": ["stdio", "http"],
+                    "description": "\"stdio\" runs the server as a child process and speaks JSON-RPC over its stdin/stdout; \"http\" talks to a remote server over streamable HTTP. Required - there is no default."
+                  },
+                  "url": {
+                    "type": "string",
+                    "description": "Endpoint for type http. Must use https unless the host is loopback (localhost, 127.0.0.1, ::1): on the open network plain http is a plaintext credential and an unauthenticated instruction channel."
+                  },
+                  "headers": {
+                    "type": "object",
+                    "additionalProperties": { "type": "string" },
+                    "description": "Extra HTTP headers for type http. Credential-shaped names (authorization, cookie, or any name containing key/token/secret/passw/cred) must be built from ${ENV_VAR} references and are redacted from logs; headers amele manages itself (Host, Content-Length, Content-Type, Accept, Mcp-Session-Id, MCP-Protocol-Version, Last-Event-ID) are rejected."
+                  },
+                  "command": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string", "minLength": 1 }],
+                    "items": { "type": "string" },
+                    "minItems": 1,
+                    "description": "Argv vector for type stdio; the first element is the executable and must be non-empty. Path-like relative commands (containing a path separator, e.g. ./tools/srv) resolve against the config file's directory; bare names resolve from PATH."
+                  },
+                  "env": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1, "pattern": "^[^=]+$" },
+                    "uniqueItems": true,
+                    "description": "Environment allowlist for a stdio server's child process, with the same semantics as a subprocess tool's env: names, never assignments. Empty or omitted means the child inherits amele's entire environment."
+                  }
+                }
+              },
+              "tools": {
+                "type": "object",
+                "additionalProperties": false,
+                "description": "Narrows the tool set this server contributes. Patterns match the server-side tool name, before the \"<server>__\" prefix is added.",
+                "properties": {
+                  "include": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "description": "Glob patterns a tool must match to be exposed. Empty or omitted means every tool."
+                  },
+                  "exclude": {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "description": "Glob patterns that remove a tool include let through. Applied after include."
+                  }
+                }
+              },
+              "call_timeout": {
+                "$ref": "#/$defs/duration",
+                "description": "Upper bound for a single MCP tool call, e.g. \"60s\". Empty or omitted means the default (60s)."
+              },
+              "required": {
+                "type": "boolean",
+                "description": "Whether a failure to connect aborts the run. Omitted means true: fail-fast is the default, because a headless run that silently loses half its tools produces a plausible wrong answer. Set false to let the run continue without this server."
+              }
+            }
+          }
+        }
+      }
     }
   },
   "$defs": {

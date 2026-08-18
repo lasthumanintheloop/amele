@@ -14,8 +14,10 @@ import (
 // override, sorted so error messages and documentation are deterministic.
 //
 // SECURITY: the fields that grant capability are deliberately absent -
-// tools.* (which tools exist at all), permissions.* (who may run them) and
-// provider.* (where the run's credentials go). docs/threat-model.md §2 puts
+// tools.* (which tools exist at all), mcp.* (which external servers the run
+// connects to, and therefore which tools and credentials it carries),
+// permissions.* (who may run them) and provider.* (where the run's credentials
+// go). docs/threat-model.md §2 puts
 // the YAML file on the trusted side of the boundary precisely because it is
 // the operator's reviewable, diffable declaration of authority: `amele explain
 // agent.yaml` tells you what agent.yaml grants, and that answer must not be

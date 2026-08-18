@@ -81,8 +81,10 @@ on `run`, `chat`, `validate` and `explain`.
   `limits.timeout`, `output.max_schema_retries`. Any other key - including a
   typo - is exit 2 with
   `cannot override "X" from the command line; settable keys: ...`.
-- **What is deliberately NOT settable**, and why: `tools.*`, `permissions.*`
-  and `provider.*` grant capability, and `lock` guards single-flight. The YAML
+- **What is deliberately NOT settable**, and why: `tools.*`, `mcp.*`,
+  `permissions.*` and `provider.*` grant capability - connecting an MCP server
+  hands the run a new set of tools and the credential they travel with - and
+  `lock` guards single-flight. The YAML
   file is the operator's audited grant of authority
   ([threat model §2](../threat-model.md)), so what
   `amele explain agent.yaml` reports about a config cannot be widened - or, for

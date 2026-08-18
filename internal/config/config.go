@@ -32,6 +32,13 @@ var ErrInvalid = errors.New("invalid config")
 // policyValues lists the accepted policy spellings for error messages.
 const policyValues = "allow, ask, deny"
 
+// builtinToolNames are the tool names amele owns. They are reserved against
+// every other name source (subprocess tools, MCP servers) so a name means one
+// thing across every config - which is what makes a permissions.tools entry
+// govern what the operator thinks it governs. "shell" is included even when
+// the builtin is disabled.
+var builtinToolNames = []string{"fs_read", "fs_write", "fs_list", "shell"}
+
 // toolNameRe restricts tool names to a conservative charset so that names are
 // safe to embed in provider tool definitions and log lines.
 var toolNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
@@ -339,6 +346,9 @@ type Config struct {
 	// Permissions is the tool approval profile. An absent block allows every
 	// tool (Phase 1 parity).
 	Permissions Permissions `yaml:"permissions"`
+	// MCP declares MCP servers whose tools are offered to the model as
+	// "<server>__<tool>". An absent block means no MCP connection is made.
+	MCP MCPConfig `yaml:"mcp"`
 
 	// promptConflict records that the file set both SystemPrompt and
 	// SystemPromptFile. It is derived at load time because applyDefaults
@@ -489,6 +499,13 @@ func load(path string, env LookupEnv, tolerant bool) (*Config, error) {
 		return nil, fmt.Errorf("%w: parsing %s: file contains multiple YAML documents (separated by ---); an agent config must be a single document, so merge them into one", ErrInvalid, path)
 	}
 
+	// SECURITY: same rule as provider.api_key, enforced on the parsed but
+	// still un-interpolated tree: after substitution a literal token and a
+	// ${VAR} reference are the same string.
+	if err := rejectLiteralMCPHeaders(&doc); err != nil {
+		return nil, fmt.Errorf("%w: %s: %v", ErrInvalid, path, err)
+	}
+
 	bindings, err := interpolateNode(&doc, env, tolerant)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s: %v", ErrInvalid, path, err)
@@ -552,9 +569,10 @@ func rejectLiteralAPIKey(raw []byte) error {
 	return nil
 }
 
-// apiKeyPath is the dotted field path of provider.api_key, the one field whose
-// references are marked as credentials regardless of the variable's name (see
-// EnvBinding.APIKey).
+// apiKeyPath is the dotted field path of provider.api_key, whose references
+// are marked as credentials regardless of the variable's name (see
+// EnvBinding.APIKey and credentialPath, which also covers sensitive MCP
+// headers).
 const apiKeyPath = "provider.api_key"
 
 // interpolateNode substitutes ${VAR} references inside every scalar VALUE of
@@ -598,7 +616,7 @@ func interpolateNode(root *yaml.Node, env LookupEnv, tolerant bool) ([]EnvBindin
 		if n.Kind == yaml.ScalarNode {
 			replaced, refs := interpolateString(n.Value, env, tolerant)
 			for _, r := range refs {
-				record(r.name, r.value, r.missing, path == apiKeyPath)
+				record(r.name, r.value, r.missing, credentialPath(path))
 			}
 			if replaced != n.Value {
 				n.Value = replaced
@@ -713,17 +731,28 @@ func (c *Config) applyDefaults(baseDir string, tolerant bool) error {
 	// where the workspace points or what the caller's cwd is. filepath.Separator
 	// is checked alongside '/' so pack YAML written with portable forward
 	// slashes is recognized on every platform.
+	// The same rule governs an MCP stdio server's executable: a pack that
+	// ships its own server must keep working wherever the folder is copied.
 	for i := range c.Tools.Subprocess {
-		cmd := c.Tools.Subprocess[i].Command
-		if len(cmd) == 0 || cmd[0] == "" || filepath.IsAbs(cmd[0]) {
-			continue
-		}
-		if strings.ContainsRune(cmd[0], '/') || strings.ContainsRune(cmd[0], filepath.Separator) {
-			cmd[0] = filepath.Join(baseDir, cmd[0])
-		}
+		resolveCommandBase(c.Tools.Subprocess[i].Command, baseDir)
+	}
+	for i := range c.MCP.Servers {
+		resolveCommandBase(c.MCP.Servers[i].Transport.Command, baseDir)
 	}
 
 	return c.resolveSystemPrompt(baseDir, tolerant)
+}
+
+// resolveCommandBase rewrites a path-like relative command[0] in place so it
+// resolves against baseDir (the config file's directory). Absolute paths, bare
+// names (resolved from PATH at exec time) and empty vectors are left alone.
+func resolveCommandBase(cmd []string, baseDir string) {
+	if len(cmd) == 0 || cmd[0] == "" || filepath.IsAbs(cmd[0]) {
+		return
+	}
+	if strings.ContainsRune(cmd[0], '/') || strings.ContainsRune(cmd[0], filepath.Separator) {
+		cmd[0] = filepath.Join(baseDir, cmd[0])
+	}
 }
 
 // resolveSystemPrompt loads system_prompt_file into SystemPrompt, resolving
@@ -818,6 +847,7 @@ func (c *Config) Violations() []string {
 	c.validateSubprocessTools(add)
 	c.validateShell(add)
 	c.validatePermissions(add)
+	c.validateMCP(add)
 
 	return msgs
 }
@@ -992,7 +1022,7 @@ func (c *Config) validateSubprocessTools(add func(format string, args ...any)) {
 	// builtin is disabled: the name means one thing across every config, so a
 	// permission profile entry (permissions.tools.shell) always governs what
 	// the operator thinks it governs.
-	for _, reserved := range []string{"fs_read", "fs_write", "fs_list", "shell"} {
+	for _, reserved := range builtinToolNames {
 		if seen[reserved] {
 			add("tools.subprocess: name %q is reserved for a builtin tool", reserved)
 		}

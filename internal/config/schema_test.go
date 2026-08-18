@@ -330,3 +330,89 @@ tools:
 		})
 	}
 }
+
+// TestSchemaMCPAgreesWithRuntime pins runtime/schema agreement for the mcp
+// block: what Validate rejects (an unknown transport type, an out-of-charset
+// server name, an env assignment) the published schema must reject too, and
+// the canonical shape must validate cleanly.
+func TestSchemaMCPAgreesWithRuntime(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const head = `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+mcp:
+  servers:
+`
+	rejected := map[string]string{
+		"bad transport type": `
+    - name: github
+      transport:
+        type: sse
+        url: https://mcp.example.com/mcp
+`,
+		"bad server name": `
+    - name: GitHub
+      transport:
+        type: stdio
+        command: ["srv"]
+`,
+		"empty executable": `
+    - name: github
+      transport:
+        type: stdio
+        command: [""]
+`,
+		"env assignment": `
+    - name: github
+      transport:
+        type: stdio
+        command: ["srv"]
+        env: ["KEY=val"]
+`,
+		"missing transport": `
+    - name: github
+`,
+		"unknown key": `
+    - name: github
+      transports:
+        type: stdio
+        command: ["srv"]
+`,
+	}
+	for name, tail := range rejected {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := validator.Validate(yamlToJSON(t, []byte(head+tail))); ok {
+				t.Error("schema accepts a config the runtime rejects")
+			}
+		})
+	}
+
+	t.Run("canonical example", func(t *testing.T) {
+		const doc = head + `
+    - name: github
+      transport:
+        type: http
+        url: https://mcp.example.com/mcp
+        headers:
+          Authorization: "Bearer ${GITHUB_TOKEN}"
+      tools:
+        include: ["issue_*"]
+        exclude: ["issue_delete"]
+      call_timeout: 90s
+      required: false
+    - name: local-fs
+      transport:
+        type: stdio
+        command: ["./tools/fs-server", "--root", "."]
+        env: ["HOME"]
+`
+		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+			t.Errorf("canonical mcp config does not validate:\n%s", feedback)
+		}
+	})
+}
