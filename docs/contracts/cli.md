@@ -424,6 +424,10 @@ advertised at login, then deletes it locally.
 - The revocation is **best effort**: if it fails, the local delete still
   happens and the line says so. An operator who asked to be rid of a
   credential must not keep it because a server is down.
+- Revocation invalidates the **whole grant**, not this machine's copy of it:
+  any other machine holding a copy of that credential is logged out too. Do
+  not use `logout` to clean up after copying a credential elsewhere - move or
+  `rm` the file instead.
 - **stdout**: nothing.
 - **stderr**: one `mcp logout: <server> (<label>)` line per server, where the
   label is `revoked` (the server confirmed), `local only` (no revocation

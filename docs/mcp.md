@@ -316,8 +316,11 @@ unexpected.
   weak to absent, and two hosts refreshing one credential is how a rotating
   server revokes it.
 - **Move it, do not copy it.** Two machines sharing one credential race each
-  other's rotations. If you must transplant one, copy it and then run `amele
-  mcp logout` on the **source** so only one copy survives.
+  other's rotations. To transplant one, `mv` the credential file (and its
+  `.lock` sibling) to the destination, or copy it and then delete the source
+  file by hand (`rm`). **Never use `amele mcp logout` to tidy up the source:**
+  logout revokes the refresh token at the authorization server (RFC 7009),
+  which invalidates the whole grant - including the copy you just moved.
 - **`amele explain` connects for real**, which means it uses - and may refresh
   and rotate - a stored credential. That is deliberate (a pre-flight that did
   not authenticate would not be a pre-flight), but it is not a read-only
