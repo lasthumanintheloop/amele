@@ -1737,12 +1737,22 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 
-	// The lock is taken before ANYTHING else a run does - before stdin is
-	// read, before the session file is created, before the first token is
-	// bought - so a blocked run costs nothing and leaves no trace.
-	release, lockCode := acquireRunLock(cfg, parsed.configPath, stderr)
-	if lockCode != ExitOK {
-		return lockCode
+	// ONE registry for this run, built before the first sink exists so every
+	// sink below shares it (see runSecrets).
+	secrets := runSecrets(cfg)
+
+	// One reader for the whole run: the OAuth question in startRun and the
+	// permission prompter consume the SAME stdin, so they must share one
+	// buffer - two independent bufio readers would let one swallow bytes the
+	// other needed. It is created here rather than at buildAgent because the
+	// gate asks first; wrapping reads nothing by itself, so buildTask's stdin
+	// contract is untouched (and the two never both read: the gate only asks
+	// on a terminal, and readPipedInput never reads a terminal).
+	lines := newLineReader(stdin)
+
+	release, startCode := startRun(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet)
+	if startCode != ExitOK {
+		return startCode
 	}
 	defer release()
 
@@ -1769,11 +1779,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 
-	// ONE registry for this run, built before the first sink exists so every
-	// sink below shares it (see runSecrets).
-	secrets := runSecrets(cfg)
-
-	agent, answer, hints, err := buildAgent(cfg, validator, newLineReader(stdin), stderr, secrets)
+	agent, answer, hints, err := buildAgent(cfg, validator, lines, stderr, secrets)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
@@ -1924,6 +1930,37 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 	}
 }
 
+// startRun is everything a run does before it may cost anything: the run lock,
+// then the pre-connect OAuth phase.
+//
+// CONTRACT (spec §3.1, docs/contracts/cli.md): the order is lock -> login
+// phase -> (caller) deadline -> run_start -> connect. The lock is taken before
+// ANYTHING else - before stdin is read, before the session file is created,
+// before the first token is bought - so a blocked run costs nothing and leaves
+// no trace. The OAuth phase follows it, so a browser flow cannot race a second
+// run of the same config, and precedes the `limits.timeout` deadline the
+// caller arms next, because the minutes a human spends at an authorization
+// server are not the agent's budget.
+//
+// It returns the lock's release function and ExitOK, or nil and the exit code
+// to return - having already released the lock and reported the reason.
+func startRun(ctx context.Context, cfg *config.Config, cfgPath string, lines *lineReader,
+	stderr io.Writer, env config.LookupEnv, secrets *session.SecretSet, quiet bool) (func(), int) {
+	release, code := acquireRunLock(cfg, cfgPath, stderr)
+	if code != ExitOK {
+		return nil, code
+	}
+	if err := mcpCredentialGate(ctx, cfg, cfgPath, lines, stderr, env, secrets, quiet); err != nil {
+		// The lock is dropped here rather than by the caller: the run never
+		// started, and a config whose credential is missing must not keep the
+		// next attempt out while the operator logs in.
+		release()
+		_, _ = fmt.Fprintln(stderr, secrets.Redact(err.Error()))
+		return nil, exitCodeFor(err)
+	}
+	return release, ExitOK
+}
+
 // acquireRunLock enforces the single-flight contract of `lock: true`. It
 // returns the release function and ExitOK when the run may proceed, or a
 // no-op release and the exit code to return when it may not.
@@ -2034,6 +2071,15 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 
 	// ONE registry for the whole conversation (see runSecrets).
 	secrets := runSecrets(cfg)
+
+	// The same pre-connect OAuth phase `run` applies, for the same reason: a
+	// conversation whose tools never came up would mislead the human at the
+	// keyboard for its whole length, and the question belongs before the REPL
+	// rather than in the middle of it.
+	if err := mcpCredentialGate(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet); err != nil {
+		_, _ = fmt.Fprintln(stderr, secrets.Redact(err.Error()))
+		return exitCodeFor(err)
+	}
 
 	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr, secrets)
 	if err != nil {
@@ -2325,7 +2371,9 @@ func newLineReader(r io.Reader) *lineReader {
 }
 
 // IsTerminal reports whether the underlying stream is an interactive terminal.
-func (l *lineReader) IsTerminal() bool { return isTerminal(l.src) }
+// It goes through the stdinIsTerminal seam so the interactive paths can be
+// exercised without a pty; the production value is isTerminal itself.
+func (l *lineReader) IsTerminal() bool { return stdinIsTerminal(l.src) }
 
 // ReadLine returns the next line without its trailing newline (CRLF tolerated).
 // A final line with no newline is returned together with io.EOF, so callers

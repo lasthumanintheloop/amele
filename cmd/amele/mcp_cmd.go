@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -215,15 +214,9 @@ func mcpLogin(ctx context.Context, cfg *config.Config, servers []config.MCPServe
 	secrets := runSecrets(cfg)
 	out := &redactingWriter{w: stderr, redact: secrets.Redact}
 	lines := newLineReader(stdin)
-	deps := mcp.Deps{
-		// cmd is the composition root: the one place allowed to name the real
-		// clock and the real random source (docs/engineering.md §5.4).
-		Clock:          time.Now,
-		Rand:           rand.Float64,
-		Env:            env,
-		TokenStore:     store,
-		RegisterSecret: secrets.Add,
-	}
+	// The same composition the pre-connect phase of `run`/`chat` logs in with
+	// (see loginDeps): one flow, whichever command entered it.
+	deps := loginDeps(env, store, secrets)
 	for _, s := range servers {
 		opts := mcp.LoginOptions{
 			Stderr:  out,
@@ -252,18 +245,30 @@ func mcpConfirm(server string, lines *lineReader, stderr io.Writer) func(issuer,
 			safeForTerminal(server, maxToolName),
 			safeForTerminal(issuer, maxMCPReportField),
 			safeForTerminal(resource, maxMCPReportField))
-		line, err := lines.ReadLine()
-		if err != nil && !errors.Is(err, io.EOF) {
-			_, _ = fmt.Fprintf(stderr, "\namele: reading the answer: %v\n", err)
-			return false
-		}
-		_, _ = fmt.Fprintln(stderr)
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "y", "yes":
-			return true
-		default:
-			return false
-		}
+		return readConfirmation(lines, stderr)
+	}
+}
+
+// readConfirmation reads the answer to a y/N question already printed on
+// stderr. It is shared by every credential question - the pre-connect one in
+// `run`/`chat` and the pre-browser one here - so a "yes" means the same thing
+// in all of them.
+//
+// SECURITY: only an explicit y/yes proceeds. A blank line, an unrecognized
+// word, a read error or EOF (Ctrl-D, /dev/null, a closed pipe) declines, the
+// same rule the tool approval prompt follows.
+func readConfirmation(lines *lineReader, stderr io.Writer) bool {
+	line, err := lines.ReadLine()
+	if err != nil && !errors.Is(err, io.EOF) {
+		_, _ = fmt.Fprintf(stderr, "\namele: reading the answer: %v\n", err)
+		return false
+	}
+	_, _ = fmt.Fprintln(stderr)
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
 	}
 }
 

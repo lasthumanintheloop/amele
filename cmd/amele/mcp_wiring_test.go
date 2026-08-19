@@ -16,10 +16,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
+	"github.com/lasthumanintheloop/amele/internal/oauthtoken"
 	"github.com/lasthumanintheloop/amele/internal/session"
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // The compiled MCP test server is shared by every test in this file: `go build`
@@ -737,5 +740,266 @@ func TestDedupRegistrarPassesEachValueOnce(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("registered %v, want %v", got, want)
 		}
+	}
+}
+
+// --- OAuth pre-connect phase (slice 2) -------------------------------------
+
+// oauthServerYAML renders one OAuth-enabled http server block for a test
+// config. required is written verbatim ("true"/"false") because the field's
+// absence means required, and these tests need both spellings said out loud.
+func oauthServerYAML(name, url, required string) string {
+	return fmt.Sprintf(`mcp:
+  servers:
+    - name: %s
+      required: %s
+      transport: {type: http, url: %s}
+      auth: {type: oauth}
+`, name, required, url)
+}
+
+// bearerMCPServer runs an in-process MCP server over Streamable HTTP that
+// refuses every request without the exact bearer token.
+//
+// It is the cmd-level twin of internal/mcp's startHTTPServer: the run path can
+// only be proven end to end against a server that actually checks the
+// Authorization header, since a server that ignores it would pass whether or
+// not the stored credential was ever loaded.
+func bearerMCPServer(t *testing.T, token string) *httptest.Server {
+	t.Helper()
+	srv := sdk.NewServer(&sdk.Implementation{Name: "amele-oauth-test", Version: "0"}, nil)
+	sdk.AddTool(srv, &sdk.Tool{Name: "echo", Description: "echo"},
+		func(_ context.Context, _ *sdk.CallToolRequest, in struct {
+			Text string `json:"text"`
+		}) (*sdk.CallToolResult, any, error) {
+			return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: in.Text}}}, nil, nil
+		})
+	handler := sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return srv }, nil)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+token {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		handler.ServeHTTP(w, r)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+// seedOAuthRecord files one credential for serverURL under stateDir, letting
+// the caller age it or strip its refresh token.
+func seedOAuthRecord(t *testing.T, stateDir, serverURL string, mutate func(*oauthtoken.Record)) {
+	t.Helper()
+	resource, err := oauthtoken.CanonicalResource(serverURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // G101: the fixture credential IS the test input.
+	rec := &oauthtoken.Record{
+		Version:       oauthtoken.Version,
+		Issuer:        "https://as.example",
+		Resource:      resource,
+		ClientID:      "client-a",
+		TokenEndpoint: "https://as.example/token",
+		AccessToken:   "seeded-access-1",
+		RefreshToken:  "seeded-refresh-1",
+		ExpiresAt:     time.Now().Add(time.Hour),
+	}
+	if mutate != nil {
+		mutate(rec)
+	}
+	store := oauthtoken.NewStore(filepath.Join(stateDir, "amele", "mcp"), time.Now)
+	key := oauthtoken.Key{Issuer: rec.Issuer, Resource: rec.Resource, ClientID: rec.ClientID}
+	if err := store.Save(key, rec); err != nil {
+		t.Fatalf("seeding the store: %v", err)
+	}
+}
+
+// TestRunOAuthNoTokenHeadlessExit8 pins the headless gate: a required OAuth
+// server with nothing in the store ends the run BEFORE anything is spent, and
+// the line names the command that fixes it.
+func TestRunOAuthNoTokenHeadlessExit8(t *testing.T) {
+	srv := scriptedServer(t) // no provider call may happen
+	cfgPath, dir := writeTestConfig(t, srv.URL,
+		"session_dir: sessions\n"+oauthServerYAML("github", "https://mcp.example/mcp", "true"))
+
+	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"run", cfgPath, "task"}, "")
+	if code != ExitMCPUnavailable {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitMCPUnavailable, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "amele mcp login "+cfgPath+" github") {
+		t.Errorf("stderr does not name the login command: %q", stderr)
+	}
+	// The gate runs before run_start by contract, so a run that never started
+	// leaves no session behind.
+	files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+	if len(files) != 0 {
+		t.Errorf("session written for a run that never started: %v", files)
+	}
+}
+
+// TestRunOAuthNoTokenOptionalContinues: an optional server without a
+// credential only warns; the connect that follows is what counts the loss, so
+// run_end.mcp_errors stays 1 rather than 2.
+func TestRunOAuthNoTokenOptionalContinues(t *testing.T) {
+	srv := scriptedServer(t, textBody("answered without the server"))
+	cfgPath, dir := writeTestConfig(t, srv.URL,
+		"session_dir: sessions\n"+oauthServerYAML("github", "https://mcp.example/mcp", "false"))
+
+	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"run", cfgPath, "task"}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "answered without the server\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "amele mcp login "+cfgPath+" github") {
+		t.Errorf("stderr does not name the login command: %q", stderr)
+	}
+	events := readSessionEvents(t, dir)
+	last := events[len(events)-1]
+	if last.Type != "run_end" || last.MCPErrors != 1 {
+		t.Fatalf("run_end: %+v", last)
+	}
+}
+
+// TestRunOAuthQuietOptionalStaysSilent: -q drops the gate's informational
+// warning like every other degradation notice.
+func TestRunOAuthQuietOptionalStaysSilent(t *testing.T) {
+	srv := scriptedServer(t, textBody("ok"))
+	cfgPath, _ := writeTestConfig(t, srv.URL,
+		oauthServerYAML("github", "https://mcp.example/mcp", "false"))
+
+	code, _, stderr := mcpCLI(t, t.TempDir(), []string{"run", cfgPath, "-q", "task"}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stderr != "" {
+		t.Errorf("quiet run wrote to stderr: %q", stderr)
+	}
+}
+
+// TestRunOAuthFreshTokenSkipsQuestion: a usable credential means the run
+// connects with it and never asks anything - even on a terminal.
+func TestRunOAuthFreshTokenSkipsQuestion(t *testing.T) {
+	fakeTTY(t, true)
+	mcpSrv := bearerMCPServer(t, "seeded-access-1")
+	llm := scriptedServer(t, textBody("done"))
+	stateDir := t.TempDir()
+	seedOAuthRecord(t, stateDir, mcpSrv.URL, nil)
+	cfgPath, dir := writeTestConfig(t, llm.URL,
+		"session_dir: sessions\n"+oauthServerYAML("github", mcpSrv.URL, "true"))
+
+	code, stdout, stderr := mcpCLI(t, stateDir, []string{"run", cfgPath, "task"}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "done\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if strings.Contains(stderr, "needs a login") {
+		t.Errorf("asked for a login it already had: %q", stderr)
+	}
+	assertListedTool(t, readSessionEvents(t, dir), "github__echo")
+}
+
+// TestRunOAuthStaleWithRefreshSkipsQuestion: an EXPIRED credential that still
+// carries a refresh token is usable - the run refreshes it silently and must
+// not stop to ask for a browser. The refresh itself fails here (the token
+// endpoint is a closed port), which is exactly what proves the gate let the
+// record through instead of treating it as missing.
+func TestRunOAuthStaleWithRefreshSkipsQuestion(t *testing.T) {
+	fakeTTY(t, true)
+	mcpSrv := bearerMCPServer(t, "seeded-access-1")
+	llm := scriptedServer(t, textBody("ok"))
+	stateDir := t.TempDir()
+	seedOAuthRecord(t, stateDir, mcpSrv.URL, func(r *oauthtoken.Record) {
+		r.ExpiresAt = time.Now().Add(-time.Hour)
+		r.TokenEndpoint = "https://127.0.0.1:1/token"
+	})
+	cfgPath, _ := writeTestConfig(t, llm.URL,
+		oauthServerYAML("github", mcpSrv.URL, "false"))
+
+	code, _, stderr := mcpCLI(t, stateDir, []string{"run", cfgPath, "task"}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if strings.Contains(stderr, "needs a login") {
+		t.Errorf("a refreshable credential must not trigger the question: %q", stderr)
+	}
+	if !strings.Contains(stderr, "warning: mcp server") {
+		t.Errorf("the failed refresh was not reported: %q", stderr)
+	}
+}
+
+// TestRunOAuthDeclineExit8: the question is asked on a real terminal, and only
+// an explicit yes proceeds. A required server the operator declined is the
+// same missing dependency as one with no credential at all.
+func TestRunOAuthDeclineExit8(t *testing.T) {
+	fakeTTY(t, true)
+	srv := scriptedServer(t)
+	cfgPath, _ := writeTestConfig(t, srv.URL,
+		oauthServerYAML("github", "https://mcp.example/mcp", "true"))
+
+	code, _, stderr := mcpCLI(t, t.TempDir(), []string{"run", cfgPath, "task"}, "n\n")
+	if code != ExitMCPUnavailable {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitMCPUnavailable, stderr)
+	}
+	if !strings.Contains(stderr, "needs a login") {
+		t.Errorf("the question was not asked: %q", stderr)
+	}
+}
+
+// TestRunOAuthPromptAcceptsAndLogsIn: a yes runs the login inline, and the run
+// then connects with the credential it just obtained.
+func TestRunOAuthPromptAcceptsAndLogsIn(t *testing.T) {
+	fakeTTY(t, true)
+	mcpSrv := bearerMCPServer(t, "seeded-access-1")
+	llm := scriptedServer(t, textBody("done"))
+	stateDir := t.TempDir()
+	cfgPath, _ := writeTestConfig(t, llm.URL,
+		oauthServerYAML("github", mcpSrv.URL, "true"))
+
+	prev := loginToServer
+	var calls int
+	loginToServer = func(_ context.Context, s config.MCPServer, _ mcp.Deps, _ mcp.LoginOptions) (*oauthtoken.Record, error) {
+		calls++
+		seedOAuthRecord(t, stateDir, s.Transport.URL, nil)
+		return &oauthtoken.Record{ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	t.Cleanup(func() { loginToServer = prev })
+
+	code, stdout, stderr := mcpCLI(t, stateDir, []string{"run", cfgPath, "task"}, "y\n")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if calls != 1 {
+		t.Errorf("login calls = %d, want 1", calls)
+	}
+	if stdout != "done\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+}
+
+// TestChatOAuthSameGate: `chat` gates exactly like `run` - the conversation
+// never opens when a required server has no credential.
+func TestChatOAuthSameGate(t *testing.T) {
+	srv := scriptedServer(t)
+	cfgPath, _ := writeTestConfig(t, srv.URL,
+		oauthServerYAML("github", "https://mcp.example/mcp", "true"))
+
+	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"chat", cfgPath}, "hello\n")
+	if code != ExitMCPUnavailable {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitMCPUnavailable, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("the REPL started anyway: %q", stdout)
+	}
+	if !strings.Contains(stderr, "amele mcp login "+cfgPath+" github") {
+		t.Errorf("stderr does not name the login command: %q", stderr)
 	}
 }

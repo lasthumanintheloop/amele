@@ -142,7 +142,7 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 	// one store for the whole invocation, over the XDG state directory the
 	// `amele mcp login` commands write. internal/mcp never learns where
 	// credentials live; it is handed a store or nothing.
-	store := oauthtoken.NewStore(oauthtoken.DefaultDir(env), time.Now)
+	store := newTokenStore(env)
 	// SecretSet has no de-duplication, and every connect attempt (and every
 	// mid-run reconnect) builds a fresh OAuth handler that reads the same
 	// stored tokens. Without this guard a flapping server would grow the
@@ -663,4 +663,161 @@ func existingToolNames(reg *tools.Registry) map[string]bool {
 		existing[name] = true
 	}
 	return existing
+}
+
+// newTokenStore builds the OAuth credential store over the XDG state
+// directory. cmd is the composition root, so this is the ONE place that knows
+// where credentials live; internal/mcp is handed a store or nothing.
+func newTokenStore(env config.LookupEnv) *oauthtoken.Store {
+	return oauthtoken.NewStore(oauthtoken.DefaultDir(env), time.Now)
+}
+
+// loginDeps composes the dependencies an interactive login runs with. It is
+// shared by `amele mcp login` and the pre-connect phase of `run`/`chat` so the
+// two flows cannot drift into logging in under different clocks, different
+// randomness or - worst - a different secret registry.
+func loginDeps(env config.LookupEnv, store *oauthtoken.Store, secrets *session.SecretSet) mcp.Deps {
+	return mcp.Deps{
+		// cmd is the composition root: the one place allowed to name the real
+		// clock and the real random source (docs/engineering.md §5.4).
+		Clock:          time.Now,
+		Rand:           rand.Float64,
+		Env:            env,
+		TokenStore:     store,
+		RegisterSecret: secrets.Add,
+	}
+}
+
+// hasOAuthServer reports whether this config declares any server the OAuth
+// phase would have to consider. It exists so a config without one pays
+// nothing: no store is opened and no state directory is touched.
+func hasOAuthServer(cfg *config.Config) bool {
+	for _, s := range cfg.MCP.Servers {
+		if s.Auth != nil && s.Auth.Type == config.MCPAuthOAuth {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpCredentialGate is the pre-connect OAuth phase of `run` and `chat`.
+//
+// CONTRACT (docs/contracts/cli.md, spec §3.1): the phase sits between the run
+// lock and the `limits.timeout` deadline - a human walking to a browser must
+// not spend the run's budget - and it precedes run_start, so a run that never
+// obtained a credential writes no session at all.
+//
+// It opens the store only when a server actually declares oauth.
+func mcpCredentialGate(ctx context.Context, cfg *config.Config, cfgPath string, lines *lineReader,
+	stderr io.Writer, env config.LookupEnv, secrets *session.SecretSet, quiet bool) error {
+	if !hasOAuthServer(cfg) {
+		return nil
+	}
+	return ensureMCPCredentials(ctx, cfg, cfgPath, lines, stderr, env, newTokenStore(env), secrets, quiet)
+}
+
+// ensureMCPCredentials runs BEFORE the parallel connect: for every OAuth
+// server without a usable credential it either logs in interactively (real
+// TTY + the operator said yes) or applies the required/optional policy.
+//
+// It runs SEQUENTIALLY on purpose - three servers must not open three browser
+// windows at once, and the operator must be able to answer one question at a
+// time on the terminal the run shares with the permission prompt.
+//
+// Returns an error wrapping mcp.ErrUnavailable (exit 8) for a REQUIRED server
+// the operator declined, or that has no terminal to ask on; the text names the
+// runnable `amele mcp login <config> <server>`. An optional server only gets a
+// warning here and is NOT counted: the count belongs to connectFailed, which
+// is where the connection actually fails, and counting it twice would report
+// two losses for one missing credential.
+//
+// A credential is "usable" when it is unexpired OR carries a refresh token: a
+// stale-but-refreshable record is refreshed silently at connect time, and
+// stopping to ask for a browser because an access token aged out would make
+// every long-lived cron agent interactive.
+func ensureMCPCredentials(ctx context.Context, cfg *config.Config, cfgPath string, lines *lineReader,
+	stderr io.Writer, env config.LookupEnv, store *oauthtoken.Store, secrets *session.SecretSet, quiet bool) error {
+	// SECURITY: the login flow mints tokens and quotes what it wrote, so every
+	// line internal/mcp emits here goes through the run's live redactor - the
+	// same one the session log and the progress feed use.
+	out := &redactingWriter{w: stderr, redact: secrets.Redact}
+	deps := loginDeps(env, store, secrets)
+	for _, s := range cfg.MCP.Servers {
+		if s.Auth == nil || s.Auth.Type != config.MCPAuthOAuth {
+			continue
+		}
+		if hasUsableCredential(store, s) {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			// A SIGTERM between two servers is an interrupted run (exit 1),
+			// not a missing dependency: nobody may be paged about a server
+			// that was never asked.
+			return interruptedError(err)
+		}
+		// The question is asked on a REAL terminal only. The permission
+		// system's "EOF is a refusal" tolerance is deliberately not reused:
+		// a cron job with /dev/null on stdin must hear that a login needs a
+		// human rather than wait for a browser nobody will see.
+		if lines.IsTerminal() && askMCPLogin(s, lines, stderr) {
+			// Confirm asks a SECOND time, with the discovered issuer: the
+			// question above can only name the resource (the issuer is
+			// unknown until discovery), and consenting to a browser is not
+			// the same as consenting to hand this identity to that issuer.
+			rec, err := loginToServer(ctx, s, deps, mcp.LoginOptions{
+				Stderr:  out,
+				Confirm: mcpConfirm(s.Name, lines, stderr),
+			})
+			if err == nil {
+				_, _ = fmt.Fprintf(stderr, "mcp login ok: %s (expires %s)\n", s.Name, rec.ExpiresAt.UTC().Format(mcpTimeFormat))
+				continue
+			}
+			if ctx.Err() != nil {
+				return interruptedError(ctx.Err())
+			}
+			// Reported, then judged by the same policy as "no credential at
+			// all": a login that did not complete leaves the run exactly as
+			// unequipped as one that was never attempted.
+			_, _ = fmt.Fprintf(stderr, "amele: %s\n", secrets.Redact(err.Error()))
+		}
+		if s.IsRequired() {
+			return fmt.Errorf("mcp server %q: no oauth credential: %w (run 'amele mcp login %s %s' first)",
+				s.Name, mcp.ErrUnavailable, cfgPath, s.Name)
+		}
+		if !quiet {
+			_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q has no oauth credential; run 'amele mcp login %s %s' (continuing without it)\n",
+				s.Name, cfgPath, s.Name)
+		}
+	}
+	return nil
+}
+
+// hasUsableCredential reports whether the store already holds something this
+// run can connect with. Unreadable files in the token directory are ignored
+// here: they are reported by the connect that follows, and a stray file must
+// not turn a healthy credential into a browser prompt.
+func hasUsableCredential(store *oauthtoken.Store, s config.MCPServer) bool {
+	matches, _ := serverCredentials(store, s)
+	now := store.Now()
+	for _, m := range matches {
+		// No refresh margin: the margin decides WHEN a run refreshes, not
+		// whether the credential is worth having. A record that is merely
+		// close to expiry is refreshed silently at connect time.
+		if m.Record.Fresh(now, 0) || m.Record.RefreshToken != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// askMCPLogin is the pre-discovery question. It names the resource, which is
+// all the config knows - the issuer only becomes visible after discovery, and
+// mcpConfirm shows it before the browser opens.
+//
+// SECURITY: only an explicit y/yes proceeds; a blank line, an unrecognized
+// word or EOF declines, the same rule the tool approval prompt follows.
+func askMCPLogin(s config.MCPServer, lines *lineReader, stderr io.Writer) bool {
+	_, _ = fmt.Fprintf(stderr, "amele: mcp server %q needs a login (issuer unknown until discovery; resource %s). Open a browser now? [y/N] ",
+		safeForTerminal(s.Name, maxToolName), safeForTerminal(s.Transport.URL, maxMCPReportField))
+	return readConfirmation(lines, stderr)
 }
