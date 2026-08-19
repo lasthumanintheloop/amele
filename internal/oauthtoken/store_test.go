@@ -472,3 +472,35 @@ func TestSaveTightensPreExistingDir(t *testing.T) {
 		t.Fatalf("dir mode after Save = %o, want 700", got)
 	}
 }
+
+// TestWithLockPersistsInPlaceScopeMutation pins the deep half of the snapshot
+// contract: fn is invited to mutate the record it was handed, and a slice
+// element changed in place must still be recognised as a change.
+func TestWithLockPersistsInPlaceScopeMutation(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, fixedClock(time.Unix(1000, 0).UTC()))
+	k := testKey()
+	r := testRecord(k)
+	r.Scopes = []string{"repo", "issues"}
+	if err := s.Save(k, r); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.WithLock(t.Context(), k, func(cur *Record) (*Record, error) {
+		cur.Scopes[0] = "admin" // in place: the snapshot must not alias this array
+		return cur, nil
+	})
+	if err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	if got.Scopes[0] != "admin" {
+		t.Fatalf("returned scopes = %v", got.Scopes)
+	}
+	reloaded, err := s.Load(k)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if reloaded.Scopes[0] != "admin" {
+		t.Errorf("stored scopes = %v, want the mutation persisted", reloaded.Scopes)
+	}
+}

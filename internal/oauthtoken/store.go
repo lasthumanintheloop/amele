@@ -325,9 +325,15 @@ func (s *Store) WithLock(ctx context.Context, k Key, fn func(current *Record) (*
 	// (already mutated) pointer would report "no change" and silently drop a
 	// rotated refresh token. Comparing against the snapshot makes both idioms —
 	// mutate-in-place and return-a-copy — persist identically.
+	// The copy is DEEP for every slice field: a shallow one shares Scopes'
+	// backing array with the record fn is about to edit, so a scope changed in
+	// place would compare equal to itself and the write would be dropped -
+	// exactly the silent-loss failure this snapshot exists to prevent.
+	// NOTE: a new slice or map field on Record must be cloned here too.
 	var before *Record
 	if current != nil {
 		snapshot := *current
+		snapshot.Scopes = slices.Clone(current.Scopes)
 		before = &snapshot
 	}
 	next, err := fn(current)

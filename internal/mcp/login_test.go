@@ -755,18 +755,37 @@ func TestCheckBrowserURL(t *testing.T) {
 	for _, tc := range []struct {
 		in string
 		ok bool
+		// relaxed is the answer with the test seam open; production is `ok`.
+		relaxed bool
 	}{
-		{"https://as.example/authorize?x=1", true},
-		{"http://127.0.0.1:9/authorize", true},
-		{"javascript:alert(1)", false},
-		{"file:///etc/passwd", false},
-		{"-flag-shaped", false},
-		{"/relative", false},
+		{in: "https://as.example/authorize?x=1", ok: true, relaxed: true},
+		// Plaintext is refused in production, even on loopback: the browser
+		// carries this run's identity to it, and the code comes back over it.
+		{in: "http://127.0.0.1:9/authorize", ok: false, relaxed: true},
+		{in: "javascript:alert(1)"},
+		{in: "file:///etc/passwd"},
+		{in: "-flag-shaped"},
+		{in: "/relative"},
 	} {
-		if err := checkBrowserURL(tc.in); (err == nil) != tc.ok {
-			t.Errorf("checkBrowserURL(%q) error = %v, want ok=%v", tc.in, err, tc.ok)
-		}
+		t.Run(tc.in, func(t *testing.T) {
+			if err := checkBrowserURL(tc.in); (err == nil) != tc.ok {
+				t.Errorf("checkBrowserURL(%q) error = %v, want ok=%v", tc.in, err, tc.ok)
+			}
+			allowPlainHTTP(t)
+			if err := checkBrowserURL(tc.in); (err == nil) != tc.relaxed {
+				t.Errorf("checkBrowserURL(%q) with the seam open error = %v, want ok=%v", tc.in, err, tc.relaxed)
+			}
+		})
 	}
+}
+
+// allowPlainHTTP opens the plaintext seam for the rest of one test. Only a
+// test may: production refuses an http authorization endpoint outright.
+func allowPlainHTTP(t *testing.T) {
+	t.Helper()
+	prev := allowPlainHTTPAuthURL
+	allowPlainHTTPAuthURL = true
+	t.Cleanup(func() { allowPlainHTTPAuthURL = prev })
 }
 
 func TestSafeParam(t *testing.T) {

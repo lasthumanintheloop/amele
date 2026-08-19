@@ -550,19 +550,32 @@ func withExtraScopes(rawURL string, extra []string) (string, []string, error) {
 	return u.String(), scopes, nil
 }
 
+// allowPlainHTTPAuthURL relaxes checkBrowserURL to accept an http
+// authorization endpoint. It is a package variable ONLY so a test can drive a
+// plaintext fixture (the same seam pattern as newOAuthClient); production has
+// exactly one value, false, and no configuration reaches it.
+var allowPlainHTTPAuthURL = false
+
 // checkBrowserURL refuses an authorization URL amele will not hand to a
 // browser command.
 //
 // SECURITY: the URL comes from server-supplied metadata. Requiring an absolute
-// http(s) URL stops a `javascript:` or `file:` scheme from being launched, and
-// stops a value beginning with `-` from being read as a flag by the opener.
+// URL stops a `javascript:` or `file:` scheme from being launched, and stops a
+// value beginning with `-` from being read as a flag by the opener. https is
+// required for the same reason every other authorization-server surface
+// requires it (pickAuthServer, checkTokenEndpoint, the revocation endpoint):
+// the browser is about to carry this run's identity - and, on the way back, an
+// authorization code - to whatever that URL names, and a plaintext hop hands
+// both to anyone on the path. One rule for all four surfaces also means a
+// downgraded metadata document cannot find a softer one.
 func checkBrowserURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("parsing the authorization url: %w", err)
 	}
-	if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-		return fmt.Errorf("the authorization endpoint %s is not an absolute http(s) url", safeParam(raw))
+	allowed := u.Scheme == "https" || (allowPlainHTTPAuthURL && u.Scheme == "http")
+	if u.Host == "" || !allowed {
+		return fmt.Errorf("the authorization endpoint %s is not an absolute https url", safeParam(raw))
 	}
 	return nil
 }

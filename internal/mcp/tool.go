@@ -27,6 +27,16 @@ const (
 	// that keeps hammering a dead credential is exactly the browser-less
 	// retry storm the cached verdict exists to prevent.
 	authDeadText = errorPrefix + "authorization dead for this run; re-run 'amele mcp login'"
+	// authTransientText is shown when the credential needed refreshing during
+	// the call and the AUTHORIZATION server could not be reached (down, 5xx,
+	// 429, a body that is not a token response).
+	//
+	// CONTRACT: this is a plain tool error, never indeterminate. The request
+	// never left amele - it was never authorized - so nothing may have
+	// happened server-side, the verdict is not cached, and the next call
+	// tries again.
+	authTransientText = errorPrefix + "could not refresh this server's authorization (the authorization server was unreachable); " +
+		"the call was NOT sent, so nothing happened - it may work on a later turn: "
 	// abortedText is shown when the RUN ended under the call.
 	abortedText = errorPrefix + "run aborted"
 	// lostText is what the model is told when a request left amele but the
@@ -153,6 +163,22 @@ func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools
 		return abortedText, tools.Outcome{Kind: tools.OutcomeAborted}, nil
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
 		return timeoutText(timeout), tools.Outcome{Kind: tools.OutcomeTimedOut}, nil
+	case errors.Is(err, errTransientAuth):
+		// Asked BEFORE isConnectionLoss on purpose: a refresh that failed
+		// because the AUTHORIZATION server was unreachable carries a
+		// *url.Error, which the connection-loss test would otherwise read as
+		// "the request may have reached the MCP server". It did not: the call
+		// was never authorized, so it was never sent. Not counted and not
+		// cached either - the token endpoint being down says nothing about
+		// this server's health or about the credential.
+		return authTransientText + err.Error(), tools.Outcome{Kind: tools.OutcomeToolError}, nil
+	case errors.Is(err, errAuthDenied):
+		// Defensive: the credential was refused DURING this call, so the
+		// handler has already condemned it (markAuthDead counted it once) and
+		// every later call short-circuits at the top of this function. Same
+		// wording as that short circuit, for the same reason: the request
+		// never left amele.
+		return authDeadText, tools.Outcome{Kind: tools.OutcomeToolError}, nil
 	case isConnectionLoss(err):
 		// The request may have reached the server. Mark the session dead so the
 		// NEXT call reconnects; do not reconnect-and-retry here, because that

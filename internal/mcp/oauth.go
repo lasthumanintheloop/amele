@@ -158,6 +158,12 @@ type runOAuthHandler struct {
 	// lastForced is the access token the previous FORCED refresh produced. It
 	// damps the 403 loop: see token.
 	lastForced string
+	// lifetime is the full validity of the last token this handler saw ISSUED
+	// (expiry minus the clock at the moment of the token response), zero until
+	// one has been. It bounds the refresh margin - see clampMargin - and is
+	// only ever set from a response amele received itself, because a record
+	// read from disk tells how much time is LEFT, not how much there was.
+	lifetime time.Duration
 }
 
 // Compile-time proof that the handler is what the SDK transport accepts. The
@@ -359,7 +365,7 @@ func (h *runOAuthHandler) token(ctx context.Context, force bool, rejected string
 		h.die(err)
 		return nil, err
 	}
-	if !force && h.rec != nil && h.rec.Fresh(h.store.Now(), h.margin) {
+	if !force && h.rec != nil && h.rec.Fresh(h.store.Now(), h.freshMargin()) {
 		return bearer(h.rec), nil
 	}
 
@@ -400,11 +406,15 @@ func (h *runOAuthHandler) refreshLocked(ctx context.Context, cur *oauthtoken.Rec
 		if rejected != "" && cur.AccessToken != rejected {
 			return cur, nil
 		}
-	} else if cur.Fresh(h.store.Now(), h.margin) {
+	} else if cur.Fresh(h.store.Now(), h.freshMargin()) {
 		return cur, nil
 	}
-	updated, err := refreshGrant(ctx, h.client, cur, h.key.Resource, h.store.Now())
+	now := h.store.Now()
+	updated, err := refreshGrant(ctx, h.client, cur, h.key.Resource, now)
 	if err == nil {
+		// The one moment the true lifetime is observable. Safe without extra
+		// locking: token holds h.mu across the whole WithLock call.
+		h.lifetime = updated.ExpiresAt.Sub(now)
 		return updated, nil
 	}
 	if errors.Is(err, errInvalidGrant) {
@@ -429,6 +439,31 @@ func rotated(cur, next *oauthtoken.Record) bool {
 	return next.AccessToken != cur.AccessToken ||
 		next.RefreshToken != cur.RefreshToken ||
 		!next.ExpiresAt.Equal(cur.ExpiresAt)
+}
+
+// freshMargin is how early this handler treats its token as expired.
+func (h *runOAuthHandler) freshMargin() time.Duration {
+	return clampMargin(h.margin, h.lifetime)
+}
+
+// clampMargin caps a refresh margin at a quarter of the token's observed
+// lifetime.
+//
+// Without the cap, a server issuing 90-second tokens would have every single
+// call declare its token stale (the margin alone is 60-120s), turning one
+// refresh per hour into one refresh per tool call - a self-inflicted rate
+// limit, and a rotated refresh token each time. A quarter leaves plenty of
+// room for the round trip while keeping the margin's purpose: never present a
+// token that dies in flight. A lifetime of zero means "not observed yet"
+// (nothing has been issued to this handler), where the full margin is right.
+func clampMargin(margin, lifetime time.Duration) time.Duration {
+	if lifetime <= 0 {
+		return margin
+	}
+	if q := lifetime / 4; q < margin {
+		return q
+	}
+	return margin
 }
 
 // die records the terminal verdict and tells the Server once.

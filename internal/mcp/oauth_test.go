@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -897,5 +899,154 @@ func TestStaleRejectedAdoptsAfterForcedRefresh(t *testing.T) {
 	}
 	if got != "at2" {
 		t.Errorf("access token = %q, want at2", got)
+	}
+}
+
+// closedPortURL returns an https URL nothing listens on, so a request to it
+// fails with a connection-refused *url.Error - the shape a token endpoint
+// takes when the authorization server is unreachable.
+func closedPortURL(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	addr := l.Addr().String()
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	return "https://" + addr + "/token"
+}
+
+// TestTransientRefreshMidRunIsPlainToolError drives a REAL SDK session whose
+// token goes stale mid-run while the authorization server is unreachable.
+//
+// CONTRACT: a refresh that never left amele is a plain tool error. Reading it
+// as a lost response would tell the model an action MAY have happened, tear
+// down a healthy session and count an error per call.
+func TestTransientRefreshMidRunIsPlainToolError(t *testing.T) {
+	ts, _ := startHTTPServer(t)
+	tokenEndpoint := closedPortURL(t)
+
+	base := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	// The clock is read from the SDK's goroutines, so it must be race-free.
+	var offset atomic.Int64
+	now := func() time.Time { return base.Add(time.Duration(offset.Load())) }
+
+	store := oauthtoken.NewStore(t.TempDir(), now)
+	resource, err := oauthtoken.CanonicalResource(ts.URL)
+	if err != nil {
+		t.Fatalf("CanonicalResource: %v", err)
+	}
+	key := oauthtoken.Key{Issuer: "https://as.example", Resource: resource, ClientID: "cid"}
+	if err := store.Save(key, &oauthtoken.Record{
+		Version:       oauthtoken.Version,
+		Issuer:        key.Issuer,
+		Resource:      resource,
+		ClientID:      "cid",
+		TokenEndpoint: tokenEndpoint,
+		AccessToken:   "at1",
+		RefreshToken:  "rt1",
+		ExpiresAt:     base.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	cfg := config.MCPServer{
+		Name:      "s",
+		Transport: config.MCPTransport{Type: config.MCPTransportHTTP, URL: ts.URL},
+		Auth:      &config.MCPAuth{Type: config.MCPAuthOAuth, ClientID: "cid"},
+	}
+	deps := testDeps(nil)
+	deps.TokenStore = store
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	srv, err := Connect(ctx, cfg, deps)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = srv.Close(context.Background()) }()
+
+	tool := toolNamed(t, srv, "s__echo")
+	callOK := func(what, word string) {
+		t.Helper()
+		text, out, err := tool.InvokeOutcome(ctx, fmt.Sprintf(`{"text":%q}`, word))
+		if err != nil || out.Kind != tools.OutcomeOK || text != word {
+			t.Fatalf("%s = (%q, %v, %v), want (%s, ok, nil)", what, text, out.Kind, err, word)
+		}
+	}
+	callOK("first call", "one")
+
+	// The stored token ages out while the authorization server is down.
+	offset.Store(int64(2 * time.Hour))
+	text, out, err := tool.InvokeOutcome(ctx, `{"text":"two"}`)
+	if err != nil {
+		t.Fatalf("call during a transient refresh failure: %v", err)
+	}
+	if out.Kind != tools.OutcomeToolError {
+		t.Errorf("outcome = %v (text %q), want tool_error: the request never left amele", out.Kind, text)
+	}
+	if strings.Contains(text, "response lost") {
+		t.Errorf("text = %q, want no lost-response wording", text)
+	}
+	if srv.authDeadErr() != nil {
+		t.Errorf("a transient refresh failure killed the credential: %v", srv.authDeadErr())
+	}
+	if got := srv.Errors(); got != 0 {
+		t.Errorf("Errors() = %d, want 0: an unreachable token endpoint is not a transport failure", got)
+	}
+	srv.mu.Lock()
+	dead := srv.dead
+	srv.mu.Unlock()
+	if dead {
+		t.Error("a healthy session was marked dead")
+	}
+
+	// The authorization server comes back (here: the token is fresh again) and
+	// the very next call goes through on the same session.
+	offset.Store(0)
+	callOK("retry after the transient failure", "three")
+}
+
+func TestClampMargin(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		margin   time.Duration
+		lifetime time.Duration
+		want     time.Duration
+	}{
+		{name: "lifetime not observed yet", margin: 90 * time.Second, want: 90 * time.Second},
+		{name: "long lived token keeps the margin", margin: 90 * time.Second, lifetime: time.Hour, want: 90 * time.Second},
+		{name: "short lived token is clamped", margin: 90 * time.Second, lifetime: 60 * time.Second, want: 15 * time.Second},
+		{name: "exactly four margins", margin: 60 * time.Second, lifetime: 240 * time.Second, want: 60 * time.Second},
+		{name: "negative lifetime is unknown", margin: 60 * time.Second, lifetime: -time.Hour, want: 60 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clampMargin(tc.margin, tc.lifetime); got != tc.want {
+				t.Errorf("clampMargin(%v, %v) = %v, want %v", tc.margin, tc.lifetime, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShortLivedTokenRefreshedOnce proves the clamp on the live path: a
+// 60-second token must not be refreshed by every call just because the margin
+// is longer than the token's whole life.
+func TestShortLivedTokenRefreshedOnce(t *testing.T) {
+	as := newFakeAS(t, asReply{status: 200, body: okBody("at2", "rt2", 60)})
+	f := newOAuthFixture(t, as, -time.Minute) // stale: the first call must refresh
+	h := f.handler(t)
+
+	for i := range 3 {
+		got, err := tokenOf(t, h)
+		if err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+		if got != "at2" {
+			t.Fatalf("call %d token = %q, want at2", i, got)
+		}
+	}
+	if n := as.count(); n != 1 {
+		t.Errorf("token endpoint hit %d times, want 1: a 60s token must not be refreshed per call", n)
 	}
 }

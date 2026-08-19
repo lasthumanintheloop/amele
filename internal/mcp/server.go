@@ -1011,6 +1011,15 @@ func isConnectionLoss(err error) bool {
 	if err == nil {
 		return false
 	}
+	// An authorization failure is never a lost response, whatever it wraps: a
+	// refresh that could not reach the authorization server carries a
+	// *url.Error, and a refused credential may carry an HTTP error, but in
+	// both cases the request was never authorized and therefore never sent.
+	// Callers branch on these sentinels first; this is the second lock on the
+	// same door, so a future caller cannot reintroduce the misclassification.
+	if errors.Is(err, errTransientAuth) || errors.Is(err, errAuthDenied) {
+		return false
+	}
 	if errors.Is(err, sdk.ErrConnectionClosed) || errors.Is(err, sdk.ErrSessionMissing) {
 		return true
 	}

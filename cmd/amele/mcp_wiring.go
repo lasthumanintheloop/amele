@@ -786,8 +786,13 @@ func hasOAuthServer(cfg *config.Config) bool {
 //
 // CONTRACT (docs/contracts/cli.md, spec §3.1): the phase sits between the run
 // lock and the `limits.timeout` deadline - a human walking to a browser must
-// not spend the run's budget - and it precedes run_start, so a run that never
-// obtained a credential writes no session at all.
+// not spend the run's budget - and it precedes run_start, so the credential
+// question is settled before a turn is ever attempted.
+//
+// A refusal is still audited: the caller (reportGateFailure, and the mirror of
+// it in `chat`) writes run_start plus run_end with exit 8 and mcp_errors 1, so
+// a run that never obtained a credential leaves exactly the evidence a failed
+// connect would have left.
 //
 // It opens the store only when a server actually declares oauth.
 func mcpCredentialGate(ctx context.Context, cfg *config.Config, cfgPath string, lines *lineReader,
