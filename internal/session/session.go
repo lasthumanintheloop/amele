@@ -395,8 +395,8 @@ type MCPConnect struct {
 	Transport string
 	// OK reports whether the handshake completed.
 	OK bool
-	// ErrorClass groups the failure for aggregation (e.g. `transport`,
-	// `auth`, `protocol`); empty on success.
+	// ErrorClass groups the failure for aggregation (one of `spawn`, `network`,
+	// `auth`, `protocol`, `timeout`); empty on success.
 	ErrorClass string
 	// Error is the human-readable failure text; clipped and redacted before
 	// it is written.

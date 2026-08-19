@@ -494,7 +494,7 @@ func TestGoldenMCP(t *testing.T) {
 	})
 	w.MCPConnect(MCPConnect{
 		Server: "flaky", Transport: "stdio", OK: false,
-		ErrorClass: "transport", Error: `handshake failed with header "Bearer sekrit"`,
+		ErrorClass: "network", Error: `handshake failed with header "Bearer sekrit"`,
 		DurationMS: 3,
 	})
 	w.MCPToolsListed(MCPToolsListed{

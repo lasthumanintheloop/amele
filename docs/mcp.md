@@ -136,6 +136,16 @@ wins over any pattern, and among matching patterns **the most restrictive wins**
 semantics, including the TTY fail-safe that turns `ask` into a logged `deny`
 when no human is at the keyboard.
 
+**Caveat: globs see the model-facing name.** A pattern like `"*_delete*"` is
+matched against the effective name amele exposed - after the server's own
+naming and after normalization, which truncates a long name to a cleaned
+prefix plus a hash suffix. A server that renames its tool, or a name long
+enough to be truncated, can therefore produce a name the deny-glob no longer
+matches, and the call falls through to `permissions.default`. For
+security-relevant exclusions do not rely on the glob alone: use `tools.exclude`
+/ `tools.include`, which are matched against the **original** server-side name,
+or set `permissions.default: deny` and allow the tools you want explicitly.
+
 Servers can annotate tools (`readOnlyHint`, `destructiveHint`, `openWorldHint`).
 amele shows those annotations in `explain` and in the interactive approval
 prompt, and they **never** change a ruling: the annotation is written by the

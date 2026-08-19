@@ -125,14 +125,14 @@ happened", never as a failure to parse: new values may be added additively.
 | `server` | string | The server's name from the config. |
 | `transport` | string | How it was reached: `stdio` or `http`. |
 | `ok` | bool | Whether the handshake completed. **Always present**, including `false` (like `run_end.exit_code`, it is exempt from omit-zero). |
-| `error_class` | string | Failure group for aggregation (`transport`, `auth`, `protocol`, ...). Absent on success. |
+| `error_class` | string | Failure group for aggregation; one of `spawn`, `network`, `auth`, `protocol`, `timeout`. Absent on success. |
 | `error` | string | Human-readable failure text (clipped + redacted). Absent on success. |
 | `duration_ms` | int | How long the attempt took, in milliseconds. |
 | `protocol_version` | string | MCP protocol version agreed on. Absent on failure. |
 | `server_name` | string | The server's self-reported name (may differ from `server`, which is the config's name). |
 | `server_version` | string | The server's self-reported version. |
 | `session_fp` | string | Short SHA-256 fingerprint of the MCP session id, for correlating events across a run. The raw session id is a bearer credential and is **never** written to the log. |
-| `tool_count` | int | How many tools the server advertised. |
+| `tool_count` | int | How many tools this server contributes **after** filtering - the count of definitions actually exposed to the model, not the raw advertised count. |
 
 ### `mcp_tools_listed` - the tool inventory taken from one server
 
@@ -140,8 +140,8 @@ happened", never as a failure to parse: new values may be added additively.
 |-------|------|---------|
 | `server` | string | The server's name from the config. |
 | `tools` | object[] | The definitions actually exposed to the model (see below). |
-| `total_bytes` | int | Summed size of those definitions - the harness token budget this server cost. |
-| `skipped` | object[] | Advertised tools that were **not** exposed: `{ "name": <server's name>, "reason": <e.g. "excluded", "name_conflict"> }`. Absent when nothing was skipped. |
+| `total_bytes` | int | Summed size of **every** definition the server sent, skipped and filtered ones included - the bytes that crossed the wire, not the tokens the model is charged for. |
+| `skipped` | object[] | Advertised tools that were **not** exposed: `{ "name": <server's name>, "reason": <one of "not included", "excluded", "definition too large", "invalid output schema"> }`. Absent when nothing was skipped. (A name conflict is never skipped - it is a fatal config error, exit 2.) |
 
 Each `tools` entry:
 
@@ -151,7 +151,16 @@ Each `tools` entry:
 | `original_name` | string | The server's own name, present **only** when normalization rewrote it. |
 | `sha256` | string | Hex SHA-256 of the tool definition amele sent to the model - proof after the fact of *which* definition the model was shown, since a server may change a description between runs. |
 | `bytes` | int | Size of that definition. |
-| `annotations` | object | MCP tool hints amele understood, as `name -> bool`: `readOnly`, `destructive`, `openWorld`, `idempotent`. Only keys the server actually sent are present; an absent key means "the server said nothing", **not** `false`. |
+| `annotations` | object | MCP tool hints amele understood, as `name -> bool`: `readOnly`, `destructive`, `openWorld`, `idempotent`. Absent entirely when the server sent no annotations object at all. |
+
+Presence in `annotations` does not mean the same thing for all four keys,
+because the SDK models two of them as plain booleans:
+
+- `readOnly` and `idempotent` are present whenever the server sent **any**
+  annotations object - their value is the SDK's zero (`false`) when the server
+  said nothing about them, so presence proves only that annotations exist.
+- `destructive` and `openWorld` are present **only** when the server actually
+  stated that hint; an absent key means "the server said nothing", not `false`.
 
 ### `mcp_disconnect` - a server connection ended
 
@@ -181,9 +190,12 @@ truthful partial accounting.
 - Exactly one `run_start` (first line) and at most one `run_end` (last line;
   absent only after a hard kill) per file.
 - All MCP events (`mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`) occur
-  strictly between `run_start` and `run_end`. Connects and tool listings
-  happen before the first `llm_response` of the run; a `mcp_disconnect` for
-  every connected server precedes `run_end`.
+  strictly between `run_start` and `run_end`. The **initial** connects and
+  tool listings happen before the first `llm_response` of the run. After that
+  a lost session may add further `mcp_disconnect` (reason `reconnect`) /
+  `mcp_connect` pairs at any point between `run_start` and `run_end`. The
+  orderly shutdown emits a `mcp_disconnect` (reason `run_end`) for every
+  still-connected server before `run_end`.
 - Within a turn: the `llm_response` comes first, then its tool calls as
   `tool_call` immediately followed by the matching `tool_result`, in dispatch
   order. Correlation is by `tool_call_id`, not by position.

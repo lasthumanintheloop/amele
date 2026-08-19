@@ -343,10 +343,19 @@ own privileges, and keep the operator able to see it:
 
 - **Capability never follows a definition.** Permissions are keyed by tool
   name in the operator's YAML (exact keys and globs, most-restrictive wins),
-  so a server cannot widen its own grant by renaming, redescribing or
-  re-annotating a tool. `readOnlyHint` / `destructiveHint` / `openWorldHint`
-  are displayed in `explain` and in the approval prompt and are **never**
-  inputs to a ruling.
+  so redescribing or re-annotating a tool changes no ruling, and renaming
+  cannot grant a server something the filters and permissions never allowed.
+  `readOnlyHint` / `destructiveHint` / `openWorldHint` are displayed in
+  `explain` and in the approval prompt and are **never** inputs to a ruling.
+- **But a rename can dodge a name-based deny-glob.** `permissions.tools`
+  globs are matched against the **effective, model-facing** name. A server
+  that renames a tool - or a name long enough that normalization truncates it
+  to a cleaned prefix plus a hash suffix - can produce a name that a glob like
+  `"*_delete*": deny` no longer matches, so the call falls through to
+  `permissions.default`. The robust controls are `tools.include` /
+  `tools.exclude`, which match the **original server-side** name, and a
+  restrictive `permissions.default` (`deny` plus explicit allows) so that
+  falling through denies rather than grants.
 - **`instructions` is ignored.** The one field of the protocol whose whole
   purpose is to inject prompt text into the client is dropped unread.
 - **Visibility before the run.** `amele explain` connects for real and prints
