@@ -222,6 +222,9 @@ func policyFor(name string, def Policy, rules map[string]Policy) Policy {
 		if !strings.Contains(pat, "*") || !tools.GlobMatch(pat, name) {
 			continue
 		}
+		// A tie in restrictiveness is deliberately don't-care: two patterns
+		// with the same policy rule the call the same way, so which one is
+		// kept cannot change the outcome.
 		if !found || restrictiveness(p) > restrictiveness(best) {
 			best, found = p, true
 		}

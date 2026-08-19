@@ -266,6 +266,12 @@ func validateMCPURL(add func(format string, args ...any), where, raw string) {
 		add("%s %q is not a valid absolute URL", where, raw)
 		return
 	}
+	// SECURITY: userinfo is a credential written literally in the YAML, which
+	// the header rule exists to forbid - and unlike a header it is also part of
+	// every string the endpoint is printed in (explain output, connect errors).
+	if u.User != nil {
+		add("%s must not contain credentials (use a ${ENV} header instead)", where)
+	}
 	switch u.Scheme {
 	case "https":
 	case "http":
@@ -294,7 +300,11 @@ func isLoopbackHost(host string) bool {
 // hardcoded one are indistinguishable, so it is enforced on the raw YAML at
 // load time (rejectLiteralMCPHeaders).
 func validateMCPHeaders(add func(format string, args ...any), where string, headers map[string]string) {
-	canonical := map[string]string{} // lowercase name -> name as first written
+	// lowercase name -> the spelling the duplicate message points at. Iteration
+	// is over sorted names, so that is the lexicographically first spelling,
+	// not the one written first in the file; the message names a real key
+	// either way and the order must stay deterministic for golden tests.
+	canonical := map[string]string{}
 	for _, name := range sortedHeaderNames(headers) {
 		lower := strings.ToLower(name)
 		if first, dup := canonical[lower]; dup {
@@ -327,13 +337,13 @@ func rejectLiteralMCPHeaders(root *yaml.Node) error {
 		if headers == nil || headers.Kind != yaml.MappingNode {
 			continue
 		}
-		for j := 1; j < len(headers.Content); j += 2 {
-			name := headers.Content[j-1].Value
+		for _, e := range mappingEntries(headers) {
+			name := e.key.Value
 			if !SensitiveHeaderName(name) {
 				continue
 			}
-			if literalHeaderValue(headers.Content[j].Value) {
-				return fmt.Errorf("mcp.servers[%d].transport.headers.%s is sensitive and must reference an environment variable (${VAR})", i, name)
+			if e.value == nil || literalHeaderValue(e.value.Value) {
+				return fmt.Errorf("mcp.servers[%d].transport.headers.%s is sensitive and must be built only from environment references (${VAR})", i, name)
 			}
 		}
 	}
@@ -341,10 +351,11 @@ func rejectLiteralMCPHeaders(root *yaml.Node) error {
 }
 
 // authSchemeRe matches what may legally remain of a sensitive header value
-// after every ${VAR} reference is stripped: nothing, or a bare authentication
-// scheme word ("Bearer ", "Basic "). Anything else - punctuation, digits, a
-// key prefix like "sk-live-" - is secret material.
-var authSchemeRe = regexp.MustCompile(`^[A-Za-z]*\s*$`)
+// after every ${VAR} reference is stripped: nothing, or one of a closed list of
+// authentication scheme words. SECURITY: the list is an allowlist rather than
+// "any word", because a letters-only key prefix ("sklive${TOK}") is secret
+// material that a `[A-Za-z]*` pattern would wave through.
+var authSchemeRe = regexp.MustCompile(`^(?i:Bearer|Basic|Token|DPoP|SSWS)?\s*$`)
 
 // literalHeaderValue reports whether a sensitive header's raw YAML value
 // carries secret material of its own. A value must reference at least one
@@ -364,7 +375,7 @@ func literalHeaderValue(raw string) bool {
 // The tree is user input at this point, so every step is defensive: a
 // malformed document must reach the strict decoder's error, not a panic here.
 func mappingSeq(root *yaml.Node, keys ...string) []*yaml.Node {
-	node := root
+	node := resolveAlias(root)
 	if node != nil && node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
 		node = node.Content[0]
 	}
@@ -374,20 +385,92 @@ func mappingSeq(root *yaml.Node, keys ...string) []*yaml.Node {
 	if node == nil || node.Kind != yaml.SequenceNode {
 		return nil
 	}
-	return node.Content
+	elems := make([]*yaml.Node, 0, len(node.Content))
+	for _, e := range node.Content {
+		elems = append(elems, resolveAlias(e))
+	}
+	return elems
 }
+
+// resolveAlias follows a chain of YAML alias nodes to the node they name, so
+// that the pre-interpolation scans see what the decoder will see.
+//
+// SECURITY: without this, `headers: *anchor` is a mapping only after the
+// decoder resolves it - the scan would find an AliasNode, skip it, and a
+// literal credential defined under the anchor would reach the wire unscanned.
+// The step budget (not a visited set) both terminates on a malformed cyclic
+// alias and keeps the helper allocation-free; a legitimate file never nests
+// aliases anywhere near that deep.
+func resolveAlias(node *yaml.Node) *yaml.Node {
+	for i := 0; node != nil && node.Kind == yaml.AliasNode && i < maxAliasDepth; i++ {
+		node = node.Alias
+	}
+	if node != nil && node.Kind == yaml.AliasNode {
+		return nil // cycle or absurd nesting: let the decoder report it
+	}
+	return node
+}
+
+// maxAliasDepth bounds resolveAlias. yaml.v3 rejects a truly recursive anchor,
+// but this walk runs BEFORE the decoder, so it must terminate on its own.
+const maxAliasDepth = 100
 
 // mappingChild returns the value node stored under key, or nil.
 func mappingChild(node *yaml.Node, key string) *yaml.Node {
-	if node == nil || node.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 1; i < len(node.Content); i += 2 {
-		if node.Content[i-1].Value == key {
-			return node.Content[i]
+	for _, e := range mappingEntries(node) {
+		if e.key.Value == key {
+			return e.value
 		}
 	}
 	return nil
+}
+
+// mappingEntry is one resolved key/value pair of a mapping. value may be nil
+// when an alias could not be resolved; key never is.
+type mappingEntry struct{ key, value *yaml.Node }
+
+// mappingEntries returns a mapping's pairs with aliases resolved and merge keys
+// ("<<") expanded, direct keys first.
+//
+// SECURITY: the pre-interpolation scans must see the mapping the DECODER will
+// build. A merge key is the second way (after a plain alias) to place a value
+// into headers without writing it there, so an unexpanded "<<" would hide a
+// literal credential from rejectLiteralMCPHeaders. Direct entries come first so
+// that "first match wins" in mappingChild matches YAML's rule that an explicit
+// key overrides a merged one.
+func mappingEntries(node *yaml.Node) []mappingEntry {
+	return appendMappingEntries(nil, node, 0)
+}
+
+func appendMappingEntries(dst []mappingEntry, node *yaml.Node, depth int) []mappingEntry {
+	node = resolveAlias(node)
+	if node == nil || node.Kind != yaml.MappingNode || depth > maxAliasDepth {
+		return dst
+	}
+	var merges []*yaml.Node
+	for i := 1; i < len(node.Content); i += 2 {
+		key := resolveAlias(node.Content[i-1])
+		if key == nil {
+			continue
+		}
+		if key.Tag == "!!merge" || key.Value == "<<" {
+			merges = append(merges, node.Content[i])
+			continue
+		}
+		dst = append(dst, mappingEntry{key: key, value: resolveAlias(node.Content[i])})
+	}
+	for _, m := range merges {
+		// A merge value is either one mapping or a sequence of them, in
+		// decreasing precedence - which is also append order here.
+		if seq := resolveAlias(m); seq != nil && seq.Kind == yaml.SequenceNode {
+			for _, e := range seq.Content {
+				dst = appendMappingEntries(dst, e, depth+1)
+			}
+			continue
+		}
+		dst = appendMappingEntries(dst, m, depth+1)
+	}
+	return dst
 }
 
 // mcpHeaderPathRe matches the dotted field path interpolateNode builds for an

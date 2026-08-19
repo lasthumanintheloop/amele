@@ -177,14 +177,11 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 		return set, nil
 	}
 
-	// Snapshot of the names already taken by builtins and subprocess tools.
-	// Collisions BETWEEN servers cannot be caught here (discovery runs in
-	// parallel, so no server knows what its neighbours will publish); they are
-	// caught at Register below, which is why registration is sequential.
-	existing := make(map[string]bool, len(reg.Names()))
-	for _, name := range reg.Names() {
-		existing[name] = true
-	}
+	// Collisions BETWEEN servers cannot be caught from this snapshot (discovery
+	// runs in parallel, so no server knows what its neighbours will publish);
+	// they are caught at Register below, which is why registration is
+	// sequential.
+	existing := existingToolNames(reg)
 
 	// One observer and one stderr mutex for the whole set: session.Writer and
 	// the process's stderr are both single-threaded resources, and every
@@ -462,10 +459,7 @@ func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 	if len(cfg.MCP.Servers) == 0 {
 		return nil, nil, set
 	}
-	existing := make(map[string]bool, len(reg.Names()))
-	for _, name := range reg.Names() {
-		existing[name] = true
-	}
+	existing := existingToolNames(reg)
 	// A nil session.Writer discards every event: explain writes no session
 	// log, and its connects must not land in the one a `run` is keeping.
 	observer := &sessionObserver{w: nil}
@@ -576,4 +570,16 @@ func mcpTarget(s config.MCPServer) string {
 	}
 	u.RawQuery, u.Fragment = "", ""
 	return u.String()
+}
+
+// existingToolNames snapshots the tool names already registered (builtins and
+// subprocess tools), as the set an MCP server's discovered names are made
+// unique against.
+func existingToolNames(reg *tools.Registry) map[string]bool {
+	names := reg.Names()
+	existing := make(map[string]bool, len(names))
+	for _, name := range names {
+		existing[name] = true
+	}
+	return existing
 }

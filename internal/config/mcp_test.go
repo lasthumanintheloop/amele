@@ -398,7 +398,7 @@ mcp:
         url: https://x.example.com/mcp
         headers: {Authorization: "Bearer abc"}
 `,
-			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must reference an environment variable (${VAR})`,
+			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
 		},
 		{
 			name: "api key header literal",
@@ -411,7 +411,7 @@ mcp:
         url: https://x.example.com/mcp
         headers: {X-Api-Key: literal}
 `,
-			want: `mcp.servers[0].transport.headers.X-Api-Key is sensitive and must reference an environment variable (${VAR})`,
+			want: `mcp.servers[0].transport.headers.X-Api-Key is sensitive and must be built only from environment references (${VAR})`,
 		},
 		{
 			name: "partially literal is still literal",
@@ -424,7 +424,85 @@ mcp:
         url: https://x.example.com/mcp
         headers: {Authorization: "Bearer sk-live-${TOK}"}
 `,
-			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must reference an environment variable (${VAR})`,
+			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
+		},
+		{
+			// SECURITY: an anchor defined in a legal, unscanned place and
+			// aliased into a headers block must not skip the scan - the strict
+			// decoder resolves the alias, so the literal would reach the wire.
+			name: "aliased headers mapping is scanned",
+			fragment: `
+permissions:
+  tools: &h
+    Authorization: "Bearer sk-live-literal"
+mcp:
+  servers:
+    - name: s
+      transport:
+        type: http
+        url: https://x.example.com/mcp
+        headers: *h
+`,
+			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
+		},
+		{
+			// An aliased scalar value must be judged by what it resolves to,
+			// not by the (empty) alias node.
+			name: "aliased sensitive value is scanned",
+			fragment: `
+mcp:
+  servers:
+    - name: a
+      transport:
+        type: http
+        url: https://x.example.com/mcp
+        headers: {X-Client-Name: &v "sk-live-literal"}
+    - name: b
+      transport:
+        type: http
+        url: https://y.example.com/mcp
+        headers: {Authorization: *v}
+`,
+			want: `mcp.servers[1].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
+		},
+		{
+			// The mirror image: a legal reference reached through an alias must
+			// still load, so alias resolution cannot be a blanket rejection.
+			name: "aliased reference is accepted",
+			fragment: `
+mcp:
+  servers:
+    - name: a
+      transport:
+        type: http
+        url: https://x.example.com/mcp
+        headers: &ok {Authorization: "Bearer ${TOK}"}
+    - name: b
+      transport:
+        type: http
+        url: https://y.example.com/mcp
+        headers: *ok
+`,
+		},
+		{
+			// A merge key is the other way an anchored mapping reaches a
+			// headers block without appearing there literally.
+			name: "merged headers mapping is scanned",
+			fragment: `
+permissions:
+  tools: &h
+    Authorization: "Bearer sk-live-literal"
+mcp:
+  servers:
+    - name: s
+      transport:
+        type: http
+        url: https://x.example.com/mcp
+        headers:
+          <<: *h
+          X-Client-Name: amele
+`,
+			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
 		},
 		{
 			name:     "reference is accepted",
@@ -616,4 +694,70 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestMCPURLCredentialsRejected pins that userinfo in an endpoint URL is a
+// config error: a password in the URL is a literal credential in the YAML, and
+// it would also be logged wherever the endpoint is printed.
+func TestMCPURLCredentialsRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		//nolint:gosec // G101: a credential in the URL is exactly what this case feeds the validator
+		{
+			name: "user and password",
+			url:  "https://user:pass@mcp.example.com/mcp",
+			want: "mcp.servers[0].transport.url must not contain credentials",
+		},
+		{
+			name: "bare user",
+			url:  "https://user@mcp.example.com/mcp",
+			want: "mcp.servers[0].transport.url must not contain credentials",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadMCP(t, `
+mcp:
+  servers:
+    - name: s
+      transport:
+        type: http
+        url: `+tc.url+`
+`)
+			joined := strings.Join(cfg.Violations(), "\n")
+			if !strings.Contains(joined, tc.want) {
+				t.Errorf("violations missing %q; got:\n%s", tc.want, joined)
+			}
+		})
+	}
+}
+
+// TestLiteralHeaderValueSchemes pins the auth-scheme allowlist: only a known
+// scheme word may precede a ${VAR}, so a letters-only key prefix ("sklive")
+// cannot pass as a scheme.
+func TestLiteralHeaderValueSchemes(t *testing.T) {
+	tests := []struct {
+		raw     string
+		literal bool
+	}{
+		{"${T}", false},
+		{"Bearer ${T}", false},
+		{"bearer ${T}", false},
+		{"Basic ${T}", false},
+		{"Token ${T}", false},
+		{"DPoP ${T}", false},
+		{"SSWS ${T}", false},
+		{"sklive${T}", true},
+		{"Bearer sk-${T}", true},
+		{"Bearer", true},
+		{"", true},
+	}
+	for _, tc := range tests {
+		if got := literalHeaderValue(tc.raw); got != tc.literal {
+			t.Errorf("literalHeaderValue(%q) = %v, want %v", tc.raw, got, tc.literal)
+		}
+	}
 }
