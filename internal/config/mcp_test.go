@@ -505,6 +505,29 @@ mcp:
 			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
 		},
 		{
+			// CONTRACT: the rule forbids literal credentials in the FILE, not
+			// merely in the effective config. An explicit key shadows the
+			// merged one at decode time, but the literal is still on disk and
+			// still leaked, so the scan is deliberately fail-closed and does
+			// not de-dup to the winning entry.
+			name: "shadowed merged literal is still rejected",
+			fragment: `
+permissions:
+  tools: &h
+    Authorization: "Bearer sk-live-literal"
+mcp:
+  servers:
+    - name: s
+      transport:
+        type: http
+        url: https://x.example.com/mcp
+        headers:
+          <<: *h
+          Authorization: "Bearer ${TOK}"
+`,
+			want: `mcp.servers[0].transport.headers.Authorization is sensitive and must be built only from environment references (${VAR})`,
+		},
+		{
 			name:     "reference is accepted",
 			fragment: validMCPYAML,
 		},

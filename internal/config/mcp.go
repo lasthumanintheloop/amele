@@ -330,7 +330,11 @@ func validateMCPHeaders(add func(format string, args ...any), where string, head
 //
 // SECURITY: this is the MCP twin of rejectLiteralAPIKey. It must run before
 // interpolation, because afterwards "Bearer abc" and "Bearer ${TOK}" are the
-// same string - and a token committed to git is already leaked.
+// same string - and a token committed to git is already leaked. Every entry is
+// scanned, including merge-key entries that an explicit key shadows, because
+// the rule is "no literal credentials in the FILE", not "none in the effective
+// config": a shadowed literal is still a credential sitting on disk. Deliberately
+// fail-closed.
 func rejectLiteralMCPHeaders(root *yaml.Node) error {
 	for i, server := range mappingSeq(root, "mcp", "servers") {
 		headers := mappingChild(mappingChild(server, "transport"), "headers")
@@ -402,6 +406,10 @@ func mappingSeq(root *yaml.Node, keys ...string) []*yaml.Node {
 // alias and keeps the helper allocation-free; a legitimate file never nests
 // aliases anywhere near that deep.
 func resolveAlias(node *yaml.Node) *yaml.Node {
+	// Belt and suspenders: legal YAML cannot produce an alias-to-alias chain
+	// (an alias node carries no anchor property, so nothing can name it), but
+	// this runs on unvalidated input from a node tree the decoder has not
+	// blessed yet, so the loop refuses to trust that.
 	for i := 0; node != nil && node.Kind == yaml.AliasNode && i < maxAliasDepth; i++ {
 		node = node.Alias
 	}
@@ -414,6 +422,12 @@ func resolveAlias(node *yaml.Node) *yaml.Node {
 // maxAliasDepth bounds resolveAlias. yaml.v3 rejects a truly recursive anchor,
 // but this walk runs BEFORE the decoder, so it must terminate on its own.
 const maxAliasDepth = 100
+
+// maxMergeDepth bounds appendMappingEntries' recursion through "<<" keys. It is
+// a separate budget from maxAliasDepth because it guards a different shape (a
+// mapping merging a mapping that merges another), and the two limits must be
+// legible - and adjustable - on their own.
+const maxMergeDepth = 100
 
 // mappingChild returns the value node stored under key, or nil.
 func mappingChild(node *yaml.Node, key string) *yaml.Node {
@@ -444,7 +458,7 @@ func mappingEntries(node *yaml.Node) []mappingEntry {
 
 func appendMappingEntries(dst []mappingEntry, node *yaml.Node, depth int) []mappingEntry {
 	node = resolveAlias(node)
-	if node == nil || node.Kind != yaml.MappingNode || depth > maxAliasDepth {
+	if node == nil || node.Kind != yaml.MappingNode || depth > maxMergeDepth {
 		return dst
 	}
 	var merges []*yaml.Node
