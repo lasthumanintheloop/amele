@@ -179,10 +179,15 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 			fatal = err
 		}
 	}
+	// An interruption fails every connect at once. Those failures are the
+	// run ending, not the servers being unhealthy, so they are not counted or
+	// warned about - an operator must not read "3 mcp errors" off a fleet that
+	// was simply told to stop.
+	interrupted := ctx.Err() != nil
 	for i, s := range servers {
 		r := results[i]
 		if r.err != nil {
-			set.connectFailed(s, r.err, quiet, stderr, fail)
+			set.connectFailed(s, r.err, quiet || interrupted, interrupted, stderr, fail)
 			continue
 		}
 		// Appended before registration so a half-registered server is still
@@ -195,7 +200,9 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 }
 
 // connectFailed applies the required/optional policy to one failed connect.
-func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet bool, stderr io.Writer, fail func(error)) {
+// interrupted says the run's context ended, in which case an optional server's
+// failure is not the server's fault and is neither counted nor reported.
+func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet, interrupted bool, stderr io.Writer, fail func(error)) {
 	if errors.Is(err, mcp.ErrToolset) {
 		fail(fmt.Errorf("mcp server %q: %w", s.Name, err))
 		return
@@ -207,6 +214,9 @@ func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet bool, stderr
 			return
 		}
 		fail(fmt.Errorf("mcp server %q: %w", s.Name, err))
+		return
+	}
+	if interrupted {
 		return
 	}
 	// Opted out of fail-fast: the run continues with fewer tools, but the

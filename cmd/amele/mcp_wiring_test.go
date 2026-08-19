@@ -10,10 +10,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
 	"github.com/lasthumanintheloop/amele/internal/session"
 )
@@ -92,6 +94,29 @@ func assertListedTool(t *testing.T, events []session.Event, name string) {
 	t.Errorf("%s not listed: %+v", name, listed[0].Tools)
 }
 
+// assertBefore fails unless every event of type early precedes every event of
+// type late.
+func assertBefore(t *testing.T, events []session.Event, early, late string) {
+	t.Helper()
+	lastEarly, firstLate := -1, -1
+	for i, e := range events {
+		switch e.Type {
+		case early:
+			lastEarly = i
+		case late:
+			if firstLate < 0 {
+				firstLate = i
+			}
+		}
+	}
+	if lastEarly < 0 || firstLate < 0 {
+		t.Fatalf("expected both %s and %s in the log, got %d/%d", early, late, lastEarly, firstLate)
+	}
+	if lastEarly > firstLate {
+		t.Errorf("last %s is at index %d, after the first %s at %d", early, lastEarly, late, firstLate)
+	}
+}
+
 // eventsOfType returns every logged event of one type.
 func eventsOfType(events []session.Event, typ string) []session.Event {
 	var out []session.Event
@@ -132,6 +157,11 @@ func TestRunMCPStdioToolCall(t *testing.T) {
 		t.Fatalf("mcp_connect: %+v", connects)
 	}
 	assertListedTool(t, events, "files__echo")
+	// CONTRACT (docs/contracts/jsonl-events.md, Ordering): the connects and the
+	// tool listings happen before the first llm_response of the run - the model
+	// must never have been asked anything with a half-built toolset.
+	assertBefore(t, events, "mcp_connect", "llm_response")
+	assertBefore(t, events, "mcp_tools_listed", "llm_response")
 	results := eventsOfType(events, "tool_result")
 	if len(results) != 1 || results[0].Outcome != session.OutcomeOK {
 		t.Fatalf("tool_result: %+v", results)
@@ -284,6 +314,9 @@ func TestRunMCPHTTPHeaderRedacted(t *testing.T) {
 	t.Cleanup(mcpSrv.Close)
 
 	srv := scriptedServer(t)
+	// DB_PASSWORD, not TEST_KEY: the API key is redacted by a list that
+	// predates MCP, so a header built from it could not prove anything about
+	// cfg.MCPHeaderSecrets.
 	cfgPath, dir := writeTestConfig(t, srv.URL, fmt.Sprintf(`session_dir: sessions
 mcp:
   servers:
@@ -292,16 +325,20 @@ mcp:
         type: http
         url: %s
         headers:
-          Authorization: "Bearer ${TEST_KEY}"
+          Authorization: "Bearer ${DB_PASSWORD}"
 `, mcpSrv.URL))
 
 	code, _, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
 	if code != ExitMCPUnavailable {
 		t.Fatalf("exit %d, stderr: %s", code, stderr)
 	}
-	const token = "sk-test-secret-key"
-	if strings.Contains(stderr, token) {
-		t.Errorf("stderr leaked the credential: %q", stderr)
+	// Both halves of the promise: the environment value itself, and the
+	// COMPOSED header - the string cfg.MCPHeaderSecrets exists to register.
+	leaks := []string{testInterpolatedValue, "Bearer " + testInterpolatedValue}
+	for _, leak := range leaks {
+		if strings.Contains(stderr, leak) {
+			t.Errorf("stderr leaked %q: %q", leak, stderr)
+		}
 	}
 	files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
 	if err != nil || len(files) != 1 {
@@ -311,8 +348,10 @@ mcp:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), token) {
-		t.Errorf("session log leaked the credential:\n%s", data)
+	for _, leak := range leaks {
+		if strings.Contains(string(data), leak) {
+			t.Errorf("session log leaked %q:\n%s", leak, data)
+		}
 	}
 }
 
@@ -421,5 +460,66 @@ func TestAnnotationMap(t *testing.T) {
 	want := map[string]bool{"readOnly": false, "destructive": true}
 	if !maps.Equal(got, want) {
 		t.Errorf("annotationMap = %v, want %v", got, want)
+	}
+}
+
+// TestAgentSecretsIncludesComposedMCPHeader pins the reason
+// cfg.MCPHeaderSecrets() is part of agentSecrets: the header is a COMPOSED
+// value ("Bearer " + the environment's), and only registering that whole string
+// keeps a redactor honest that does not happen to match on substrings.
+//
+// It is asserted white-box because it cannot be observed from the outside:
+// session.Redactor replaces substrings, so the environment value alone (which
+// InterpolatedSecrets has always carried) already blanks the composed string in
+// every current sink. See the fix report for the mutation experiment.
+func TestAgentSecretsIncludesComposedMCPHeader(t *testing.T) {
+	srv := scriptedServer(t)
+	cfgPath, _ := writeTestConfig(t, srv.URL, `mcp:
+  servers:
+    - name: remote
+      transport:
+        type: http
+        url: https://example.invalid/mcp
+        headers:
+          Authorization: "Bearer ${DB_PASSWORD}"
+`)
+	cfg, err := config.Load(cfgPath, env(t))
+	if err != nil {
+		t.Fatalf("loading config: %v", err)
+	}
+	want := "Bearer " + testInterpolatedValue
+	if !slices.Contains(agentSecrets(cfg), want) {
+		t.Errorf("agentSecrets does not register the composed header %q: %q", want, agentSecrets(cfg))
+	}
+}
+
+// TestRunMCPInterruptedOptionalNotCounted pins the other half of the signal
+// path: an interruption fails every connect at once, and those failures belong
+// to the interruption, not to the servers. An operator reading the log of a
+// SIGTERMed cron job must not find "mcp_errors: N" for a healthy fleet.
+func TestRunMCPInterruptedOptionalNotCounted(t *testing.T) {
+	bin := buildMCPTestServer(t)
+	srv := scriptedServer(t)
+	cfgPath, dir := writeTestConfig(t, srv.URL,
+		"session_dir: sessions\n"+stdioServerYAML("files", bin, "      required: false\n"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, []string{"run", cfgPath, "task"}, strings.NewReader(""), &stdout, &stderr, env(t))
+	if code != ExitTaskFailed {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitTaskFailed, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "warning: mcp server") {
+		t.Errorf("interruption reported as a degraded server: %q", stderr.String())
+	}
+	events := readSessionEvents(t, dir)
+	last := events[len(events)-1]
+	if last.Type != "run_end" {
+		t.Fatalf("last event is %q, want run_end", last.Type)
+	}
+	if last.MCPErrors != 0 {
+		t.Errorf("run_end.mcp_errors = %d, want 0 (the interruption caused the failure)", last.MCPErrors)
 	}
 }
