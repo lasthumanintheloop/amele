@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/tools"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -411,5 +413,76 @@ func TestCappedWriter(t *testing.T) {
 	}
 	if got := buf.String(); got != "abcde" {
 		t.Errorf("captured %q, want abcde", got)
+	}
+}
+
+// sessionDropper wraps an MCP handler and answers the first tools/call POST
+// with 404, the way a server that forgot (or expired) a session does. The SDK
+// turns that into sdk.ErrSessionMissing, which amele must treat as a lost
+// session rather than as a tool failure.
+type sessionDropper struct {
+	next    http.Handler
+	dropped atomic.Bool
+}
+
+func (d *sessionDropper) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if bytes.Contains(body, []byte(`"method":"tools/call"`)) && d.dropped.CompareAndSwap(false, true) {
+			http.Error(w, "session not found", http.StatusNotFound)
+			return
+		}
+	}
+	d.next.ServeHTTP(w, r)
+}
+
+func TestSessionMissingReinitializes(t *testing.T) {
+	srv := sdk.NewServer(&sdk.Implementation{Name: "amele-http-test", Version: "0"}, nil)
+	sdk.AddTool(srv, &sdk.Tool{Name: "echo", Description: "echo"},
+		func(_ context.Context, _ *sdk.CallToolRequest, in struct {
+			Text string `json:"text"`
+		}) (*sdk.CallToolResult, any, error) {
+			return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: in.Text}}}, nil, nil
+		})
+	dropper := &sessionDropper{next: sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return srv }, nil)}
+	ts := httptest.NewServer(dropper)
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cfg := config.MCPServer{
+		Name:      "s",
+		Transport: config.MCPTransport{Type: config.MCPTransportHTTP, URL: ts.URL},
+	}
+	server, err := Connect(ctx, cfg, testDeps(nil))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = server.Close(ctx) }()
+
+	tool := toolNamed(t, server, "s__echo")
+	text, out, err := tool.InvokeOutcome(ctx, `{"text":"one"}`)
+	if err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if out.Kind != tools.OutcomeIndeterminate {
+		t.Fatalf("first call outcome = %v (text %q), want indeterminate", out.Kind, text)
+	}
+
+	// The next call re-initializes: a new session id, the frozen toolset.
+	text, out, err = tool.InvokeOutcome(ctx, `{"text":"two"}`)
+	if err != nil {
+		t.Fatalf("call after re-initialize: %v", err)
+	}
+	if text != "two" || out.Kind != tools.OutcomeOK {
+		t.Fatalf("second call = (%q, %v), want (two, ok)", text, out.Kind)
+	}
+	if server.Errors() != 1 {
+		t.Errorf("Errors() = %d, want 1", server.Errors())
 	}
 }
