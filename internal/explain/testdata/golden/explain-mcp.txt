@@ -1,0 +1,51 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "openai"
+  base_url:        "https://api.example.com/v1"
+  request_timeout: default (120s)
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): disabled
+  shell: disabled
+  subprocess tools: (none)
+
+MCP SERVERS
+  "github"       http  "https://mcp.example.com/v1/mcp": ✓ connected (12 ms, proto "2025-06-18", "gh" "1.0")
+    "github__create_issue"           ✓ kept (destructive)
+    "github__list_issues"            ✓ kept (read-only)
+    "github__a_b_1f2e3d4c"           ✓ kept (was "a.b")
+    "repo_delete"                    - excluded
+    definitions: 3 tools, 1234 bytes ≈ 308 tokens
+  "files"        stdio "/opt/mcp/files-server": ✗ FAILED (auth): 401 Unauthorized (sent Authorization: [REDACTED])
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+    GH_TOKEN        ✓ set
+  executables:
+    "/opt/mcp/files-server"   ✓ found
+  env allowlists (variables the tool's process may read):
+    "mcp:files"     "TZ", "HOME"
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  10
+  max_tokens: 1000
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+
+WARNINGS
+  - session_dir is not set: no session log (audit trail) will be written

@@ -118,6 +118,90 @@ func singleLine(msg string) string {
 	return strings.NewReplacer("\n", `\n`, "\r", `\r`, "\t", `\t`).Replace(msg)
 }
 
+// MCPToolReport is one row of a server's tool list: what the model would see,
+// or what was left out and why.
+type MCPToolReport struct {
+	// Name is the row's subject: the model-facing name ("<server>__<tool>")
+	// for a kept tool, the server-side name for a skipped one.
+	Name string
+	// Original is the server-side name, set only when Normalized.
+	Original string
+	// Normalized reports that Name is a rewrite rather than a plain join, so
+	// the report can show which server-side tool the model-facing name means.
+	Normalized bool
+	// Bytes is the size of the published definition (name, description,
+	// input schema) - the number the token estimate is charged against.
+	Bytes int
+	// Hint is the short annotation phrase ("destructive", "read-only") or "".
+	// SECURITY: annotations are advisory server-supplied claims; this is a
+	// display hint, never a permission decision.
+	Hint string
+	// Kept says the tool was exposed to the model.
+	Kept bool
+	// Reason is why a not-Kept tool was left out ("excluded", "not
+	// included", "definition too large", "invalid output schema").
+	Reason string
+}
+
+// MCPServerReport is one declared MCP server as `explain` found it: whether it
+// answered, what it called itself, and the toolset (and token bill) it would
+// contribute to the run.
+//
+// CONTRACT: explain reports, run gates. A server that could not be reached
+// produces a report with Connected false - never a non-zero exit, even when
+// the server is `required: true` and `amele run` would abort on it.
+type MCPServerReport struct {
+	// Name is the configured server name, the prefix of its tool names.
+	Name string
+	// Transport is "stdio" or "http", as configured.
+	Transport string
+	// Target is what was dialled: the URL WITHOUT its query string for http
+	// (a query can carry a token), command[0] for stdio.
+	Target string
+	// Connected says the handshake succeeded.
+	Connected bool
+	// Error and ErrorClass describe a failed connect (mcp.ErrorClass values:
+	// "spawn", "auth", "timeout", ...). Both are empty when Connected.
+	// SECURITY: Error is remote text; it is flattened onto one line and runs
+	// through the report's redaction like everything else.
+	Error, ErrorClass string
+	// DurationMS is how long the connect took, successful or not.
+	DurationMS int64
+	// ProtocolVersion is the MCP version the two sides agreed on.
+	ProtocolVersion string
+	// ServerName and ServerVersion are what the server called itself -
+	// UNTRUSTED display strings, quoted on output.
+	ServerName, ServerVersion string
+	// Tools lists the kept tools first (in registration order), then the
+	// skipped ones.
+	Tools []MCPToolReport
+	// TotalBytes is the size of the KEPT definitions, and EstTokens the
+	// estimate derived from it (see EstTokens).
+	TotalBytes, EstTokens int
+}
+
+// bytesPerToken is the divisor behind the definition-token estimate. It is the
+// same rough rule the harness budget uses (docs/engineering.md §8): four bytes
+// of English-plus-JSON per token. The number is an ESTIMATE by construction -
+// no tokenizer ships in the binary, and a per-provider one would make the
+// report depend on the model - so it is printed with "≈".
+const bytesPerToken = 4
+
+// EstTokens converts a definition byte count into the token estimate the
+// report prints. Exported so the caller assembling MCPServerReport fills the
+// field with the same arithmetic the warning threshold is judged against.
+func EstTokens(totalBytes int) int { return totalBytes / bytesPerToken }
+
+// mcpTokenWarnThreshold is the estimated definition size, in tokens, above
+// which the report tells the operator to trim the toolset.
+//
+// Tool definitions are re-sent on EVERY request, so an unfiltered server is a
+// permanent per-turn tax the operator pays without ever seeing a line item for
+// it. 4000 is chosen to sit well above a lean toolset (a handful of tools is a
+// few hundred tokens) and below the point where the definitions rival the
+// conversation itself.
+const mcpTokenWarnThreshold = 4000
+
 // ExecProbe checks whether an executable is invocable on this host: nil error
 // means found. A nil ExecProbe passed to Render means
 // the real exec.LookPath (defaultProbe). It is injected so the requirements
@@ -169,7 +253,14 @@ func resolveProbe(probe ExecProbe) ExecProbe {
 //
 // probe checks host executables for the requirements section; nil uses the
 // real exec.LookPath.
-func Render(cfg *config.Config, reg *tools.Registry, overridePairs, problems []string, probe ExecProbe) string {
+//
+// mcpReports are the results of actually contacting the configured MCP servers
+// (nil when there are none, or when the caller chose not to connect): the MCP
+// SERVERS section is skipped entirely when the slice is empty. They are passed
+// in rather than gathered here because dialling a server is I/O, and this
+// package renders.
+func Render(cfg *config.Config, reg *tools.Registry, overridePairs, problems []string, probe ExecProbe,
+	mcpReports []MCPServerReport) string {
 	set := overrides{}
 	for _, pair := range overridePairs {
 		if key, _, ok := config.SplitOverride(pair); ok {
@@ -182,13 +273,14 @@ func Render(cfg *config.Config, reg *tools.Registry, overridePairs, problems []s
 	overridesSection(&b, overridePairs)
 	providerSection(&b, cfg, set)
 	toolsSection(&b, cfg, set)
+	mcpSection(&b, mcpReports)
 	requirementsSection(&b, cfg, probe)
 	permissionsSection(&b, cfg)
 	budgetsSection(&b, cfg, set)
 	concurrencySection(&b, cfg)
 	outputSection(&b, cfg, set)
 	sessionSection(&b, cfg, set)
-	warningsSection(&b, cfg, reg)
+	warningsSection(&b, cfg, reg, mcpReports)
 	// SECURITY: redaction runs over the ASSEMBLED report, not per field, so a
 	// section added later can never forget to redact - the same reasoning that
 	// puts internal/session's redactor at the single write path.
@@ -228,6 +320,106 @@ func problemsSection(b *strings.Builder, problems []string) {
 	b.WriteString("\n")
 }
 
+// mcpSection reports what actually happened when explain dialled the
+// configured MCP servers: whether each answered, what it calls itself, which
+// of its tools the model would receive, and what those definitions cost.
+//
+// It exists because an MCP server is the one part of an amele config whose
+// contents are NOT in the YAML: the operator writes a URL or a command line
+// and the toolset arrives from the other side. A dry run that could not say
+// "these 14 tools, one of them destructive, 3.1k tokens per request" would
+// leave the largest unreviewed surface in the config unreviewed.
+//
+// The section is omitted entirely when there are no reports, so a config
+// without an mcp: block renders exactly as it did before the feature.
+func mcpSection(b *strings.Builder, reports []MCPServerReport) {
+	if len(reports) == 0 {
+		return
+	}
+	b.WriteString("MCP SERVERS\n")
+	for _, r := range reports {
+		// SECURITY: %q throughout. The name and transport come from a config
+		// explain renders even when Validate rejected it, and the target,
+		// server name and version are (or echo) REMOTE strings - a newline in
+		// any of them would forge report rows, which stripTerminalControls
+		// cannot prevent in a line-oriented report.
+		fmt.Fprintf(b, "  %-14q %-5s %s: %s\n", r.Name, r.Transport,
+			field(r.Target, "(unset)"), mcpStatus(r))
+		for _, t := range r.Tools {
+			fmt.Fprintf(b, "    %-32q %s\n", t.Name, mcpToolState(t))
+		}
+		if r.Connected {
+			fmt.Fprintf(b, "    definitions: %d tools, %d bytes ≈ %d tokens\n",
+				mcpKeptCount(r), r.TotalBytes, r.EstTokens)
+		}
+	}
+	b.WriteString("\n")
+}
+
+// mcpStatus renders one server's connect outcome. A failure is upper-case for
+// the same reason MISSING is: explain exits 0 on a dead server, so this mark
+// is the only thing telling the reader the run would lose these tools.
+func mcpStatus(r MCPServerReport) string {
+	if !r.Connected {
+		if r.ErrorClass != "" {
+			return fmt.Sprintf("✗ FAILED (%s): %s", r.ErrorClass, singleLine(r.Error))
+		}
+		return fmt.Sprintf("✗ FAILED: %s", singleLine(r.Error))
+	}
+	return fmt.Sprintf("✓ connected (%d ms, proto %s, %s %s)", r.DurationMS,
+		field(r.ProtocolVersion, "(unstated)"),
+		field(r.ServerName, "(unnamed)"), field(r.ServerVersion, "(no version)"))
+}
+
+// mcpToolState renders one tool row's verdict: kept (with the server's
+// advisory annotation and, for a rewritten name, the original) or the reason
+// it was left out.
+func mcpToolState(t MCPToolReport) string {
+	if !t.Kept {
+		// The reason is one of amele's own closed-set phrases ("excluded",
+		// "definition too large"), not server text, so it reads as a word
+		// rather than a quoted value - but it is still flattened, since a
+		// caller could pass anything.
+		if t.Reason == "" {
+			return "- skipped (no reason given)"
+		}
+		return "- " + singleLine(t.Reason)
+	}
+	state := "✓ kept"
+	if t.Hint != "" {
+		state += fmt.Sprintf(" (%s)", t.Hint)
+	}
+	if t.Normalized {
+		// The model-facing name is a rewrite (illegal characters replaced, a
+		// hash suffix appended); an operator matching the report against the
+		// server's own documentation needs the name it was made from.
+		state += fmt.Sprintf(" (was %q)", t.Original)
+	}
+	return state
+}
+
+// mcpKeptCount counts the tools the model would actually receive - the same
+// set TotalBytes is charged for.
+func mcpKeptCount(r MCPServerReport) int {
+	n := 0
+	for _, t := range r.Tools {
+		if t.Kept {
+			n++
+		}
+	}
+	return n
+}
+
+// mcpEstTokens totals the definition-token estimate across every connected
+// server, the figure mcpTokenWarnThreshold is judged against.
+func mcpEstTokens(reports []MCPServerReport) int {
+	total := 0
+	for _, r := range reports {
+		total += r.EstTokens
+	}
+	return total
+}
+
 // requirementsSection reports what the host needs to provide: the
 // environment variables the YAML references (by name only - a value may be a
 // credential, and the section is a checklist, not a dump), the executables its
@@ -241,9 +433,9 @@ func problemsSection(b *strings.Builder, problems []string) {
 // follows (see warningsSection, overridesSection).
 func requirementsSection(b *strings.Builder, cfg *config.Config, probe ExecProbe) {
 	envNames := cfg.EnvReferenced()
-	subs := cfg.Tools.Subprocess
+	exes := requiredExecutables(cfg)
 	allowlists := envAllowlists(cfg)
-	if len(envNames) == 0 && len(subs) == 0 && len(allowlists) == 0 {
+	if len(envNames) == 0 && len(exes) == 0 && len(allowlists) == 0 {
 		return
 	}
 	missing := make(map[string]bool, len(cfg.EnvMissing()))
@@ -270,25 +462,48 @@ func requirementsSection(b *strings.Builder, cfg *config.Config, probe ExecProbe
 			fmt.Fprintf(b, "    %-15s %s %s\n", name, mark, state)
 		}
 	}
-	executablesSubsection(b, subs, resolveProbe(probe))
+	executablesSubsection(b, exes, resolveProbe(probe))
 	envAllowlistSubsection(b, allowlists)
 	b.WriteString("\n")
 }
 
-// executablesSubsection lists each subprocess tool's command[0] with a
-// found/MISSING mark.
-func executablesSubsection(b *strings.Builder, subs []config.SubprocessTool, probe ExecProbe) {
-	if len(subs) == 0 {
+// requiredExecutables lists every program this config would have to find on
+// the host: each subprocess tool's command[0], then each stdio MCP server's.
+//
+// The MCP servers belong here for the reason the whole subsection exists: an
+// `npx`-style server command missing from a cron PATH is the single most
+// common way a config that works in a terminal fails unattended, and before
+// this the checklist stopped at subprocess tools and said nothing about it.
+// Duplicates are kept rather than collapsed: the rows are a checklist, and
+// two tools sharing an interpreter is not a fact worth hiding.
+func requiredExecutables(cfg *config.Config) []string {
+	var exes []string
+	// Validate rejects an empty Command, but explain reports on configs
+	// Validate rejected too, so both loops guard for it.
+	for _, t := range cfg.Tools.Subprocess {
+		if len(t.Command) > 0 && t.Command[0] != "" {
+			exes = append(exes, t.Command[0])
+		}
+	}
+	for _, s := range cfg.MCP.Servers {
+		if s.Transport.Type != config.MCPTransportStdio {
+			continue
+		}
+		if cmd := s.Transport.Command; len(cmd) > 0 && cmd[0] != "" {
+			exes = append(exes, cmd[0])
+		}
+	}
+	return exes
+}
+
+// executablesSubsection lists each required executable with a found/MISSING
+// mark.
+func executablesSubsection(b *strings.Builder, exes []string, probe ExecProbe) {
+	if len(exes) == 0 {
 		return
 	}
 	b.WriteString("  executables:\n")
-	for _, t := range subs {
-		if len(t.Command) == 0 || t.Command[0] == "" {
-			// Validate rejects an empty Command, but explain reports on
-			// configs Validate rejected too, so the guard has to be here.
-			continue
-		}
-		exe := t.Command[0]
+	for _, exe := range exes {
 		mark, state := "✓", "found"
 		if probe(exe) != nil {
 			mark, state = "✗", "MISSING"
@@ -319,6 +534,15 @@ func envAllowlists(cfg *config.Config) []envAllowlist {
 	for _, t := range cfg.Tools.Subprocess {
 		if len(t.Env) > 0 {
 			out = append(out, envAllowlist{tool: t.Name, vars: t.Env})
+		}
+	}
+	// A stdio MCP server is a child process with an env allowlist exactly like
+	// a subprocess tool's, and it is a longer-lived one - it holds the
+	// credentials for a whole remote API. The rows are labelled "mcp:<name>"
+	// so a reader cannot mistake a server for a tool of the same name.
+	for _, s := range cfg.MCP.Servers {
+		if s.Transport.Type == config.MCPTransportStdio && len(s.Transport.Env) > 0 {
+			out = append(out, envAllowlist{tool: "mcp:" + s.Name, vars: s.Transport.Env})
 		}
 	}
 	return out
@@ -368,7 +592,16 @@ func envAllowlistSubsection(b *strings.Builder, lists []envAllowlist) {
 // docs/packs.md says so - and internal/session's JSONL redaction, which is not
 // a display surface, stays unconditional regardless.
 func secretValues(cfg *config.Config) []string {
-	var values []string
+	// SECURITY: an MCP header value is a COMPOSED string ("Bearer <token>"),
+	// so registering the interpolated ${VAR} alone would leave the assembled
+	// header readable wherever the report echoes one - today in a server's
+	// error text, which is remote input and routinely quotes back the request.
+	// config.SensitiveHeaderName decides which headers those are; explain's
+	// own secretVarNameRe is deliberately NOT widened to "authorization" and
+	// "cookie", because it classifies ENVIRONMENT VARIABLE names, where those
+	// two words carry no credential meaning, and a looser rule there would
+	// redact ordinary values out of a report whose job is to show them.
+	values := cfg.MCPHeaderSecrets()
 	for _, b := range cfg.EnvBindings() {
 		if b.Value == "" {
 			continue // nothing to leak, and an empty replacer pattern corrupts the text
@@ -704,9 +937,9 @@ func sessionSection(b *strings.Builder, cfg *config.Config, set overrides) {
 // entries); explain is where they get said out loud instead of failing a cron
 // run. The order is fixed - sorted permission entries, then shell, tokens,
 // session - so the section is golden-testable.
-func warningsSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry) {
+func warningsSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry, mcpReports []MCPServerReport) {
 	b.WriteString("WARNINGS\n")
-	ws := collectWarnings(cfg, reg)
+	ws := collectWarnings(cfg, reg, mcpReports)
 	if len(ws) == 0 {
 		b.WriteString("  (none)\n")
 		return
@@ -717,7 +950,7 @@ func warningsSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 }
 
 // collectWarnings computes the warning list in its fixed order.
-func collectWarnings(cfg *config.Config, reg *tools.Registry) []string {
+func collectWarnings(cfg *config.Config, reg *tools.Registry, mcpReports []MCPServerReport) []string {
 	var ws []string
 	// Without a registry (it could not be built - that is one of the problems
 	// reported at the top) there is nothing to check permission entries
@@ -738,6 +971,14 @@ func collectWarnings(cfg *config.Config, reg *tools.Registry) []string {
 	}
 	if cfg.SessionDir == "" {
 		ws = append(ws, "session_dir is not set: no session log (audit trail) will be written")
+	}
+	// Tool definitions ride along on every request, so an unfiltered server is
+	// a recurring cost the operator never sees itemised. The threshold is
+	// judged on the TOTAL across servers: three servers of 1500 tokens each
+	// bill the same as one of 4500.
+	if est := mcpEstTokens(mcpReports); est > mcpTokenWarnThreshold {
+		ws = append(ws, fmt.Sprintf(
+			"mcp definitions ≈ %d tokens; consider tools.include to trim", est))
 	}
 	return ws
 }

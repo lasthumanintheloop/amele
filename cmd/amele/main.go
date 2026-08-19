@@ -928,7 +928,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "validate":
 		return cmdValidate(args[1:], stdout, stderr, env)
 	case "explain":
-		return cmdExplain(args[1:], stdout, stderr, env)
+		return cmdExplain(ctx, args[1:], stdout, stderr, env)
 	case "schema":
 		return cmdSchema(args[1:], stdout, stderr)
 	case "init":
@@ -1006,7 +1006,14 @@ func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) 
 //
 // It performs everything a run would do up to - but not including - provider
 // construction: load, validate, compile output.schema, build the tool
-// registry. No network, no tokens, no session file.
+// registry. No provider call, no tokens, no session file.
+//
+// It does contact the configured MCP servers, which is the one network the
+// report needs and the one an operator expects it to make: a server's toolset
+// is not in the YAML, so a dry run that did not ask for it would be silent
+// about the largest unreviewed surface in the config. A server that cannot be
+// reached is REPORTED, never fatal - even a `required: true` one, whose
+// failure would abort `amele run` with exit 8.
 //
 // CONTRACT: explain REPORTS, run GATES. Every config problem it finds after
 // the file LOADS - unset ${VAR}s, validation violations, an uncompilable
@@ -1023,7 +1030,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) 
 // the reader who has unset variables and no workspace yet, and `run` still
 // refuses to touch such a config (exit 2), which is where that judgement
 // belongs.
-func cmdExplain(args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
+func cmdExplain(ctx context.Context, args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
 	parsed, ok := parseInspectArgs("explain", usageExplain, args, stderr)
 	if !ok {
 		return ExitConfigError
@@ -1045,7 +1052,20 @@ func cmdExplain(args []string, stdout, stderr io.Writer, env config.LookupEnv) i
 		return ExitConfigError
 	}
 	problems, registry := explainProblems(cfg)
-	_, _ = fmt.Fprint(stdout, explain.Render(cfg, registry, parsed.overrides, problems, nil))
+	// The servers are dialled for real, and closed before the report is
+	// printed: a stdio server is a child process, and `explain` must not leave
+	// one behind. WithoutCancel for the close so a Ctrl-C that ended the dial
+	// still gets an orderly shutdown. A registry that could not be built is
+	// already a problem line; without one there is nothing to register into,
+	// so the servers are not contacted at all.
+	var mcpReports []explain.MCPServerReport
+	if registry != nil {
+		reports, mcpProblems, set := explainMCP(ctx, cfg, registry, env, version)
+		set.close(context.WithoutCancel(ctx))
+		mcpReports = reports
+		problems = append(problems, mcpProblems...)
+	}
+	_, _ = fmt.Fprint(stdout, explain.Render(cfg, registry, parsed.overrides, problems, nil, mcpReports))
 	return ExitOK
 }
 

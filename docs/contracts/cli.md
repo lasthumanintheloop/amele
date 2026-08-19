@@ -270,7 +270,10 @@ that validates cannot fail configuration under `run`.
 Dry-run report: what the agent may touch, spend and emit, plus warnings for
 valid-but-suspicious settings. It performs everything a run would do up to,
 but not including, provider construction - load, validate, compile
-`output.schema`, build the real tool registry.
+`output.schema`, build the real tool registry. It also **connects to the
+configured MCP servers** (see the `MCP SERVERS` section below): a server's
+toolset lives on the far side of the connection, not in the YAML, so a report
+that skipped it would be silent about the config's largest unreviewed surface.
 
 **explain reports; run gates** (changed 2026-08-12). Every config problem
 found after the file **loads** - undefined `${VAR}`s, validation violations, an
@@ -312,12 +315,30 @@ up yet.
 - **stdout**: the report, including any `PROBLEMS`.
 - **stderr**: errors only; empty whenever the report was printed.
 - **Exit**: 0 whenever a report was printed; 2 for a usage error or a config
-  the loader rejected (the list above). No network, no tokens, no session file.
+  the loader rejected (the list above). No provider call, no tokens, no session
+  file. The only network `explain` makes is to the declared MCP servers.
+- **MCP servers section** (additive, 2026-08-19): when the config declares
+  `mcp.servers`, the report carries an `MCP SERVERS` block - one row per
+  server with its transport and target (the URL **without its query string**,
+  or `command[0]` for stdio), then either `✓ connected (<ms> ms, proto <v>,
+  <server name> <version>)` or `✗ FAILED (<class>): <error>`, then one line
+  per tool (`✓ kept`, with `(destructive)` / `(read-only)` when the server
+  annotates it and `(was "<original>")` when the name had to be rewritten, or
+  `- <reason>` for a tool a `tools.include`/`exclude` filter or a size cap
+  left out), and a `definitions: N tools, B bytes ≈ T tokens` summary.
+  A connect failure is **reported, never fatal**: `explain` still exits 0 even
+  for a `required: true` server whose failure would abort `amele run` with
+  exit 8. A tool-name collision is different - it is a mistake in the config,
+  so it appears in `PROBLEMS`. Definitions are re-sent on every request, so a
+  toolset estimated above 4000 tokens earns a `WARNINGS` line suggesting
+  `tools.include`. Servers are disconnected (and stdio child processes
+  reaped) before the report is printed.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
-  ✗ MISSING), every subprocess tool's executable (✓ found / ✗ MISSING on
-  `PATH`), and each subprocess/shell tool's `env:` allowlist (variable names
-  only, never values) - the answer to "what does this config need from the
+  ✗ MISSING), every executable the config needs on `PATH` (✓ found /
+  ✗ MISSING): each subprocess tool's `command[0]` and each stdio MCP server's,
+  and each subprocess/shell tool's `env:` allowlist plus each stdio MCP
+  server's (rows labelled `mcp:<name>`; variable names only, never values) - the answer to "what does this config need from the
   host, and what will it read from my environment?".
 - **Interpolated values** (changed 2026-08-12): the report shows the values
   `${VAR}` interpolation substituted, so a parametrized pack can be

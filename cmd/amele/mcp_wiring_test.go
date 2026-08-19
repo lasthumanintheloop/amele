@@ -523,3 +523,78 @@ func TestRunMCPInterruptedOptionalNotCounted(t *testing.T) {
 		t.Errorf("run_end.mcp_errors = %d, want 0 (the interruption caused the failure)", last.MCPErrors)
 	}
 }
+
+// TestExplainMCPReportsAndExitsZero is the CONTRACT test for the report: an
+// `explain` whose config names a live server and a REQUIRED one that cannot be
+// started still exits 0, describes both, and lists the live server's tools -
+// the same failure that aborts `amele run` with exit 8.
+func TestExplainMCPReportsAndExitsZero(t *testing.T) {
+	bin := buildMCPTestServer(t)
+	cfgPath, dir := writeTestConfig(t, "https://api.example.com", fmt.Sprintf(`session_dir: sessions
+mcp:
+  servers:
+    - name: files
+      transport:
+        type: stdio
+        command: [%q]
+    - name: dead
+      transport:
+        type: stdio
+        command: ["/nonexistent/amele-mcp-server"]
+`, bin))
+
+	code, stdout, stderr := execCLI(t, []string{"explain", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	// CONTRACT (docs/contracts/cli.md): stderr stays empty whenever the report
+	// was printed - a server's stderr must not leak into it.
+	if stderr != "" {
+		t.Errorf("stderr: %q", stderr)
+	}
+	for _, want := range []string{
+		"MCP SERVERS",
+		`"files"        stdio`,
+		"✓ connected",
+		`"files__echo"`,
+		"definitions:",
+		`"dead"         stdio`,
+		"✗ FAILED (spawn)",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("report missing %q:\n%s", want, stdout)
+		}
+	}
+	// explain writes no audit trail: session_dir is set, and dialling servers
+	// must not have turned the report into a logged run.
+	if _, err := os.Stat(filepath.Join(dir, "sessions")); !os.IsNotExist(err) {
+		t.Errorf("explain created a session directory (err=%v)", err)
+	}
+}
+
+// TestExplainMCPRequirements pins the checklist half of the feature: a stdio
+// server's command[0] is an executable the host must provide, and its env
+// allowlist is a capability grant - both belong in REQUIREMENTS, where the
+// operator reads what to provision before the first cron run.
+func TestExplainMCPRequirements(t *testing.T) {
+	cfgPath, _ := writeTestConfig(t, "https://api.example.com", `mcp:
+  servers:
+    - name: files
+      transport:
+        type: stdio
+        command: ["/nonexistent/amele-mcp-server"]
+        env: ["TZ"]
+`)
+	code, stdout, stderr := execCLI(t, []string{"explain", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	for _, want := range []string{
+		`"/nonexistent/amele-mcp-server" ✗ MISSING`,
+		`"mcp:files"     "TZ"`,
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("report missing %q:\n%s", want, stdout)
+		}
+	}
+}

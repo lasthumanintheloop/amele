@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/explain"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
 	"github.com/lasthumanintheloop/amele/internal/session"
 	"github.com/lasthumanintheloop/amele/internal/tools"
@@ -103,6 +105,54 @@ func mcpCause(ce *mcp.ConnectError) string {
 // Unwrap exposes the ConnectError (and through it mcp.ErrUnavailable).
 func (e *mcpUnavailableError) Unwrap() error { return e.err }
 
+// dialResult is one server's connect outcome: exactly one of the fields is
+// set.
+type dialResult struct {
+	srv *mcp.Server
+	err error
+}
+
+// dialMCP connects every declared server IN PARALLEL and returns the outcomes
+// in config order, appending one stderr relay per server to set.
+//
+// It is the phase connectMCP and explainMCP share: both must dial the same
+// way (same deps, same parallelism, same stderr relays), and only what they do
+// with a failure differs - a run applies the required/optional policy, a report
+// prints it. Keeping the dial in one function is what makes "explain sees what
+// run would see" a property of the code rather than of two copies staying in
+// step.
+func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.Observer,
+	redact func(string) string, stderrMu *sync.Mutex, stderr io.Writer,
+	env config.LookupEnv, existing map[string]bool, version string) []dialResult {
+	servers := cfg.MCP.Servers
+	results := make([]dialResult, len(servers))
+	var wg sync.WaitGroup
+	for i, s := range servers {
+		relay := &mcpStderr{mu: stderrMu, w: stderr, redact: redact,
+			prefix: fmt.Sprintf("amele: mcp %s: ", s.Name), budget: maxMCPStderrBytes}
+		set.relays = append(set.relays, relay)
+		wg.Add(1)
+		go func(i int, s config.MCPServer) {
+			defer wg.Done()
+			// cmd is the composition root: it is the one place allowed to
+			// name the real clock and the real random source, which every
+			// package below takes injected (docs/engineering.md §5.4).
+			results[i].srv, results[i].err = mcp.Connect(ctx, s, mcp.Deps{
+				Clock:         time.Now,
+				Rand:          rand.Float64,
+				Env:           env,
+				Observer:      observer,
+				Stderr:        relay,
+				Workspace:     cfg.Workspace,
+				ExistingNames: existing,
+				Version:       version,
+			})
+		}(i, s)
+	}
+	wg.Wait()
+	return results
+}
+
 // connectMCP brings up every declared MCP server and registers its tools.
 //
 // Connecting is done in PARALLEL - a run with three servers must not pay three
@@ -143,35 +193,7 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 	redact := session.Redactor(agentSecrets(cfg))
 	var stderrMu sync.Mutex
 
-	type result struct {
-		srv *mcp.Server
-		err error
-	}
-	results := make([]result, len(servers))
-	var wg sync.WaitGroup
-	for i, s := range servers {
-		relay := &mcpStderr{mu: &stderrMu, w: stderr, redact: redact,
-			prefix: fmt.Sprintf("amele: mcp %s: ", s.Name), budget: maxMCPStderrBytes}
-		set.relays = append(set.relays, relay)
-		wg.Add(1)
-		go func(i int, s config.MCPServer) {
-			defer wg.Done()
-			// cmd is the composition root: it is the one place allowed to
-			// name the real clock and the real random source, which every
-			// package below takes injected (docs/engineering.md §5.4).
-			results[i].srv, results[i].err = mcp.Connect(ctx, s, mcp.Deps{
-				Clock:         time.Now,
-				Rand:          rand.Float64,
-				Env:           env,
-				Observer:      observer,
-				Stderr:        relay,
-				Workspace:     cfg.Workspace,
-				ExistingNames: existing,
-				Version:       version,
-			})
-		}(i, s)
-	}
-	wg.Wait()
+	results := dialMCP(ctx, cfg, set, observer, redact, &stderrMu, stderr, env, existing, version)
 
 	var fatal error
 	fail := func(err error) {
@@ -410,4 +432,148 @@ func (s *mcpStderr) emit(line string) {
 	}
 	s.budget -= len(line)
 	_, _ = fmt.Fprintf(s.w, "%s%s\n", s.prefix, safeForTerminal(s.redact(line), maxProgressLine))
+}
+
+// explainMCP dials every declared MCP server for `amele explain` and turns the
+// outcomes into report rows.
+//
+// CONTRACT (docs/contracts/cli.md): explain reports, run gates. It connects for
+// real - the toolset is the one part of an amele config that lives on the far
+// side of a connection, so a dry run that did not ask for it would leave the
+// largest surface unreviewed - but NO connect failure changes the exit code,
+// not even for a `required: true` server that would abort `amele run` with
+// exit 8. Failures become rows with Connected false.
+//
+// The tools of the servers that did answer ARE registered, so the WARNINGS
+// section can tell a `permissions.tools` entry naming an MCP tool from a typo.
+// A registration collision is the one MCP outcome that is a CONFIG error
+// rather than an environmental one, so it is returned as a problem line for
+// the PROBLEMS block instead of being buried in the server's row.
+//
+// The caller must call close on the returned set (with a context that is not
+// the report's, so an orderly shutdown still gets its grace period): the stdio
+// servers are live child processes.
+//
+// Nothing here writes to stderr: the command's contract is a report on stdout
+// and an empty stderr.
+func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
+	env config.LookupEnv, version string) ([]explain.MCPServerReport, []string, *mcpSet) {
+	set := &mcpSet{hints: map[string]string{}}
+	if len(cfg.MCP.Servers) == 0 {
+		return nil, nil, set
+	}
+	existing := make(map[string]bool, len(reg.Names()))
+	for _, name := range reg.Names() {
+		existing[name] = true
+	}
+	// A nil session.Writer discards every event: explain writes no session
+	// log, and its connects must not land in the one a `run` is keeping.
+	observer := &sessionObserver{w: nil}
+	redact := session.Redactor(agentSecrets(cfg))
+	var stderrMu sync.Mutex
+	// CONTRACT (docs/contracts/cli.md): `explain` writes the report to stdout
+	// and NOTHING to stderr when it printed one. A stdio server's startup
+	// banner is therefore discarded rather than relayed - what matters about a
+	// server that failed to start is already in its connect error, which the
+	// report prints.
+	results := dialMCP(ctx, cfg, set, observer, redact, &stderrMu, io.Discard, env, existing, version)
+
+	var problems []string
+	reports := make([]explain.MCPServerReport, 0, len(results))
+	for i, s := range cfg.MCP.Servers {
+		r := results[i]
+		if r.err != nil {
+			reports = append(reports, failedServerReport(s, r.err))
+			continue
+		}
+		// Appended before registration so a half-registered server is still
+		// closed by the caller: an abandoned child process outliving the
+		// report is exactly what the process-group kill exists to prevent.
+		set.servers = append(set.servers, r.srv)
+		set.register(s.Name, r.srv, reg, func(err error) {
+			problems = append(problems, err.Error())
+		})
+		reports = append(reports, serverReport(s, r.srv))
+	}
+	return reports, problems, set
+}
+
+// failedServerReport renders a connect failure as a report row. The class and
+// the cause are read off a *mcp.ConnectError when there is one, so the row
+// says "auth: 401 Unauthorized" rather than repeating the "mcp server %q
+// unavailable" preamble the row's own name column already carries.
+func failedServerReport(s config.MCPServer, err error) explain.MCPServerReport {
+	r := explain.MCPServerReport{
+		Name: s.Name, Transport: s.Transport.Type, Target: mcpTarget(s),
+		Error: err.Error(),
+	}
+	var ce *mcp.ConnectError
+	if errors.As(err, &ce) {
+		r.ErrorClass = string(ce.Class)
+		r.Error = mcpCause(ce)
+	}
+	return r
+}
+
+// serverReport renders a live server as a report row: the handshake facts, the
+// tools the model would receive, then the ones that were left out.
+func serverReport(s config.MCPServer, srv *mcp.Server) explain.MCPServerReport {
+	info := srv.Info()
+	r := explain.MCPServerReport{
+		Name: s.Name, Transport: s.Transport.Type, Target: mcpTarget(s),
+		Connected: true, DurationMS: info.Duration.Milliseconds(),
+		ProtocolVersion: info.ProtocolVersion,
+		ServerName:      info.ServerName, ServerVersion: info.ServerVersion,
+	}
+	for _, l := range srv.Listed() {
+		r.TotalBytes += l.Bytes
+		r.Tools = append(r.Tools, explain.MCPToolReport{
+			Name: l.Name, Original: l.Original, Normalized: l.Normalized,
+			Bytes: l.Bytes, Hint: annotationHint(l.Annotations), Kept: true,
+		})
+	}
+	for _, sk := range srv.Skipped() {
+		r.Tools = append(r.Tools, explain.MCPToolReport{Name: sk.Name, Reason: sk.Reason})
+	}
+	r.EstTokens = explain.EstTokens(r.TotalBytes)
+	return r
+}
+
+// annotationHint is the report's short spelling of a tool's annotations, in
+// the same precedence (*mcp.Tool).Hint uses for the approval prompt: the
+// warning first, the reassurance second. An unstated annotation yields "".
+func annotationHint(a mcp.Annotations) string {
+	switch {
+	case a.Destructive != nil && *a.Destructive:
+		return "destructive"
+	case a.ReadOnly != nil && *a.ReadOnly:
+		return "read-only"
+	}
+	return ""
+}
+
+// mcpTarget names what a server connection actually dials, for the report.
+//
+// SECURITY: the http form drops the URL's QUERY STRING. Some hosted MCP
+// endpoints carry the credential there (?key=...), and explain is the report
+// an operator pastes into a ticket - the redactor cannot help, because a query
+// token need not have come from an ${ENV} the config interpolated.
+func mcpTarget(s config.MCPServer) string {
+	if s.Transport.Type == config.MCPTransportStdio {
+		if cmd := s.Transport.Command; len(cmd) > 0 {
+			return cmd[0]
+		}
+		return ""
+	}
+	raw := s.Transport.URL
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable: Validate rejects it, but explain reports on configs
+		// Validate rejected. Showing nothing hides which endpoint was meant,
+		// so the raw value is shown - it is Go-quoted on output like every
+		// other config-sourced string.
+		return raw
+	}
+	u.RawQuery, u.Fragment = "", ""
+	return u.String()
 }

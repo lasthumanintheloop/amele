@@ -249,7 +249,7 @@ func TestRender(t *testing.T) {
 			if names == nil {
 				names = fsBuiltins
 			}
-			got := Render(tc.cfg(), registryWith(t, names...), nil, nil, alwaysFound)
+			got := Render(tc.cfg(), registryWith(t, names...), nil, nil, alwaysFound, nil)
 			for _, want := range tc.want {
 				if !strings.Contains(got, want) {
 					t.Errorf("report missing %q\nfull report:\n%s", want, got)
@@ -287,7 +287,7 @@ func TestRenderMarksOverrides(t *testing.T) {
 		"system_prompt_file=/tmp/p.txt",
 	}
 
-	got := Render(cfg, registryWith(t, fsBuiltins...), pairs, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, fsBuiltins...), pairs, nil, alwaysFound, nil)
 
 	// Every override is echoed verbatim at the top - including the two
 	// (prompt, system_prompt_file) that no report line below can carry.
@@ -317,7 +317,7 @@ func TestRenderMarksOverrides(t *testing.T) {
 // only when something was overridden, so the report of a plain
 // `amele explain agent.yaml` is unchanged by this feature.
 func TestRenderWithoutOverridesHasNoSection(t *testing.T) {
-	got := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, alwaysFound)
+	got := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
 	for _, notWant := range []string{"OVERRIDES", "overridden via --set"} {
 		if strings.Contains(got, notWant) {
 			t.Errorf("report mentions %q with no overrides:\n%s", notWant, got)
@@ -329,7 +329,7 @@ func TestRenderWithoutOverridesHasNoSection(t *testing.T) {
 // ApplyOverrides already accepted, so a pair with no "=" cannot occur - but a
 // report is not the place to panic if one ever does.
 func TestRenderIgnoresMalformedOverride(t *testing.T) {
-	got := Render(baseCfg(), registryWith(t, fsBuiltins...), []string{"model"}, nil, alwaysFound)
+	got := Render(baseCfg(), registryWith(t, fsBuiltins...), []string{"model"}, nil, alwaysFound, nil)
 	if strings.Contains(got, "overridden via --set") {
 		t.Errorf("malformed pair marked a line:\n%s", got)
 	}
@@ -340,7 +340,7 @@ func TestRenderIgnoresMalformedOverride(t *testing.T) {
 func TestRenderNeverPrintsSecrets(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Provider.APIKey = "sk-live-DO-NOT-PRINT"
-	got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
 	if strings.Contains(got, "sk-live-DO-NOT-PRINT") {
 		t.Fatalf("API key leaked into report:\n%s", got)
 	}
@@ -384,7 +384,7 @@ tools:
 		t.Fatal(err)
 	}
 
-	got := Render(cfg, registryWith(t, "shell", "upload"), nil, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, "shell", "upload"), nil, nil, alwaysFound, nil)
 	if strings.Contains(got, secret) {
 		t.Fatalf("interpolated secret leaked into report:\n%s", got)
 	}
@@ -446,7 +446,7 @@ tools:
 		t.Fatal(err)
 	}
 
-	got := Render(cfg, registryWith(t, "upload"), nil, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, "upload"), nil, nil, alwaysFound, nil)
 	// The escaped spelling is the one that actually appears in the report; the
 	// raw one is checked too so the test keeps meaning if quoting ever moves.
 	for _, leak := range []string{secret, `sk-\"quoted\"\\part`} {
@@ -594,7 +594,7 @@ func TestSectionHeadersAreUpperCase(t *testing.T) {
 	cfg.Lock = true
 
 	report := Render(cfg, registryWith(t, "notify"), []string{"model=m"},
-		[]string{"model is required (set it in the YAML or via --model)"}, alwaysFound)
+		[]string{"model is required (set it in the YAML or via --model)"}, alwaysFound, nil)
 
 	var headers []string
 	for _, line := range strings.Split(report, "\n") {
@@ -701,7 +701,7 @@ func TestRequirementsSectionOmission(t *testing.T) {
 		if out != "" {
 			t.Errorf("expected empty requirements output, got:\n%s", out)
 		}
-		full := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, found)
+		full := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, found, nil)
 		if strings.Contains(full, "REQUIREMENTS") {
 			t.Errorf("full report must not carry a REQUIREMENTS section with nothing to report:\n%s", full)
 		}
@@ -844,7 +844,7 @@ tools:
 		"TZ":         "Europe/Istanbul",
 	})
 
-	got := Render(cfg, registryWith(t, "shell", "upload"), nil, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, "shell", "upload"), nil, nil, alwaysFound, nil)
 
 	for _, want := range []string{
 		"model:           \"gpt-4o-mini\"",
@@ -925,7 +925,7 @@ func TestRenderProblemsSection(t *testing.T) {
 		"workspace \"/nope\" is not accessible",
 		"undefined environment variable(s): PACK_KEY",
 	}
-	got := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, problems, alwaysFound)
+	got := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, problems, alwaysFound, nil)
 
 	if !strings.HasPrefix(got, "PROBLEMS") {
 		t.Errorf("PROBLEMS must open the report:\n%s", got)
@@ -941,7 +941,7 @@ func TestRenderProblemsSection(t *testing.T) {
 			t.Errorf("report missing section %q:\n%s", section, got)
 		}
 	}
-	if clean := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, alwaysFound); strings.Contains(clean, "PROBLEMS") {
+	if clean := Render(baseCfg(), registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil); strings.Contains(clean, "PROBLEMS") {
 		t.Errorf("a clean config must not grow a PROBLEMS section:\n%s", clean)
 	}
 }
@@ -954,7 +954,7 @@ func TestRenderWithoutRegistry(t *testing.T) {
 	cfg := baseCfg()
 	cfg.Permissions = config.Permissions{Tools: map[string]config.Policy{"fs_write": config.PolicyAsk}}
 
-	got := Render(cfg, nil, nil, []string{"initializing fs tools: no such directory"}, alwaysFound)
+	got := Render(cfg, nil, nil, []string{"initializing fs tools: no such directory"}, alwaysFound, nil)
 	if !strings.Contains(got, "WARNINGS") {
 		t.Errorf("report truncated without a registry:\n%s", got)
 	}
@@ -980,7 +980,7 @@ func TestRenderStripsTerminalControls(t *testing.T) {
 	}}
 	cfg.Permissions = config.Permissions{Tools: map[string]config.Policy{spoof: config.PolicyAllow}}
 
-	got := Render(cfg, registryWith(t, fsBuiltins...), nil, []string{"a problem\u009b2K"}, alwaysFound)
+	got := Render(cfg, registryWith(t, fsBuiltins...), nil, []string{"a problem\u009b2K"}, alwaysFound, nil)
 	for _, r := range []rune{'\x1b', '\r', '\u009b', '\u202e'} {
 		if strings.ContainsRune(got, r) {
 			t.Errorf("control rune %q survived into the report:\n%q", r, got)
@@ -1005,7 +1005,7 @@ func TestRenderCannotForgeRowsWithNewlines(t *testing.T) {
 	cfg.Tools.Subprocess = []config.SubprocessTool{{Name: forgedTool, Description: "d", Command: []string{"date"}}}
 	cfg.Permissions = config.Permissions{Tools: map[string]config.Policy{forgedPerm: config.PolicyDeny}}
 
-	got := Render(cfg, registryWith(t, "shell"), nil, nil, alwaysFound)
+	got := Render(cfg, registryWith(t, "shell"), nil, nil, alwaysFound, nil)
 
 	// Every forged row is a line the config does not contain.
 	for _, forged := range []string{
@@ -1049,7 +1049,7 @@ func TestRenderCannotForgeRowsWithConfigValues(t *testing.T) {
 	}
 	problems := []string{"cannot run\n  - forged problem"}
 
-	got := Render(cfg, registryWith(t, fsBuiltins...), nil, problems, alwaysFound)
+	got := Render(cfg, registryWith(t, fsBuiltins...), nil, problems, alwaysFound, nil)
 
 	for _, forged := range []string{
 		"\n  base_url: https://evil.example/v1",
