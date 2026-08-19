@@ -149,8 +149,8 @@ func verify(k Key, r *Record) error {
 // during refresh-token rotation must leave a usable credential, not a truncated
 // file, because the rotated refresh token may be the only copy that still works.
 func (s *Store) Save(k Key, r *Record) error {
-	if err := os.MkdirAll(s.dir, 0o700); err != nil {
-		return fmt.Errorf("creating token dir: %w", err)
+	if err := s.ensureDir(); err != nil {
+		return err
 	}
 	//nolint:gosec // G117: writing the access token to disk is the whole point of this package; the bytes land in a 0600 file inside a 0700 directory.
 	data, err := json.Marshal(r)
@@ -188,6 +188,32 @@ func (s *Store) Save(k Key, r *Record) error {
 	if d, err := os.Open(s.dir); err == nil {
 		_ = d.Sync()
 		_ = d.Close()
+	}
+	return nil
+}
+
+// ensureDir creates the store directory and guarantees its mode is 0700.
+//
+// SECURITY: os.MkdirAll applies its mode only to directories it creates, so a
+// directory left behind by a stray mkdir, a looser umask or another tool would
+// keep its old (possibly world-readable) mode and quietly host 0600 token
+// files under a directory anyone can list. The chmod is therefore
+// unconditional-on-mismatch rather than best-effort, and a directory that
+// cannot be tightened aborts the Save: writing a credential into a readable
+// directory is worse than failing to write it.
+func (s *Store) ensureDir() error {
+	if err := os.MkdirAll(s.dir, 0o700); err != nil {
+		return fmt.Errorf("creating token dir: %w", err)
+	}
+	fi, err := os.Stat(s.dir)
+	if err != nil {
+		return fmt.Errorf("inspecting token dir: %w", err)
+	}
+	if fi.Mode()&os.ModePerm != 0o700 {
+		//nolint:gosec // G302: 0700 is the intended directory mode; gosec reads the constant as a file mode.
+		if err := os.Chmod(s.dir, 0o700); err != nil {
+			return fmt.Errorf("restricting token dir: %w", err)
+		}
 	}
 	return nil
 }
@@ -286,7 +312,9 @@ func CanonicalResource(raw string) (string, error) {
 	if u.Host == "" {
 		return "", fmt.Errorf("resource %q has no host", raw)
 	}
-	path := strings.TrimSuffix(u.EscapedPath(), "/")
+	// TrimRight, not TrimSuffix: ".../mcp//" must canonicalize to ".../mcp"
+	// too, otherwise two spellings of one server would key two credentials.
+	path := strings.TrimRight(u.EscapedPath(), "/")
 	return scheme + "://" + strings.ToLower(u.Host) + path, nil
 }
 

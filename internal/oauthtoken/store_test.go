@@ -205,6 +205,7 @@ func TestCanonicalResource(t *testing.T) {
 		wantErr  bool
 	}{
 		{"https://x.com/mcp/", "https://x.com/mcp", false},
+		{"https://x.com/mcp//", "https://x.com/mcp", false},
 		{"https://x.com/mcp?k=v", "https://x.com/mcp", false},
 		{"https://u:p@x.com/mcp", "https://x.com/mcp", false},
 		{"https://x.com/mcp#frag", "", true}, // fragment rejected per spec
@@ -437,5 +438,37 @@ func TestFilenameWithoutHostFallsBack(t *testing.T) {
 	files := listJSON(t, dir)
 	if len(files) != 1 || !strings.HasPrefix(filepath.Base(files[0]), "unknown-") {
 		t.Fatalf("files = %v, want one unknown-*.json", files)
+	}
+}
+
+// TestSaveTightensPreExistingDir guards the promise doc.go makes about the
+// directory mode: MkdirAll only applies its mode to directories it creates, so a
+// directory left behind by a stray mkdir or a looser umask must be tightened
+// before a token is written into it.
+func TestSaveTightensPreExistingDir(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "mcp")
+	//nolint:gosec // G301: the loose mode is the point of this regression test; Save must tighten it.
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Mkdir applies the umask, so assert the starting point is actually loose.
+	before, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.Mode()&0o077 == 0 {
+		t.Skipf("umask already restricts the dir to %o; nothing to tighten", before.Mode()&os.ModePerm)
+	}
+	s := NewStore(dir, fixedClock(time.Unix(1000, 0).UTC()))
+	k := testKey()
+	if err := s.Save(k, testRecord(k)); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.Mode() & os.ModePerm; got != 0o700 {
+		t.Fatalf("dir mode after Save = %o, want 700", got)
 	}
 }
