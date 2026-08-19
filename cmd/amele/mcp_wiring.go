@@ -15,6 +15,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/explain"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
+	"github.com/lasthumanintheloop/amele/internal/oauthtoken"
 	"github.com/lasthumanintheloop/amele/internal/session"
 	"github.com/lasthumanintheloop/amele/internal/tools"
 )
@@ -137,6 +138,16 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 	env config.LookupEnv, existing map[string]bool, version string) []dialResult {
 	servers := cfg.MCP.Servers
 	results := make([]dialResult, len(servers))
+	// cmd is the composition root, so the OAuth token store is built HERE -
+	// one store for the whole invocation, over the XDG state directory the
+	// `amele mcp login` commands write. internal/mcp never learns where
+	// credentials live; it is handed a store or nothing.
+	store := oauthtoken.NewStore(oauthtoken.DefaultDir(env), time.Now)
+	// SecretSet has no de-duplication, and every connect attempt (and every
+	// mid-run reconnect) builds a fresh OAuth handler that reads the same
+	// stored tokens. Without this guard a flapping server would grow the
+	// redactor's list one copy per attempt, for no added protection.
+	register := dedupRegistrar(set.secrets.Add)
 	var wg sync.WaitGroup
 	for i, s := range servers {
 		relay := &mcpStderr{mu: stderrMu, w: stderr, redact: redact,
@@ -157,11 +168,41 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 				Workspace:     cfg.Workspace,
 				ExistingNames: existing,
 				Version:       version,
+				TokenStore:    store,
+				// A token refreshed mid-run must be scrubbed from every sink
+				// this invocation already redacts through, which is why the
+				// registry is the run's live SecretSet rather than a snapshot.
+				RegisterSecret: register,
 			})
 		}(i, s)
 	}
 	wg.Wait()
 	return results
+}
+
+// dedupRegistrar wraps a secret registrar so each distinct value is passed on
+// at most once. Empty values are dropped; the returned function is safe for
+// concurrent use, because servers are dialled in parallel.
+func dedupRegistrar(add func(...string)) func(...string) {
+	var (
+		mu   sync.Mutex
+		seen = map[string]bool{}
+	)
+	return func(values ...string) {
+		mu.Lock()
+		fresh := make([]string, 0, len(values))
+		for _, v := range values {
+			if v == "" || seen[v] {
+				continue
+			}
+			seen[v] = true
+			fresh = append(fresh, v)
+		}
+		mu.Unlock()
+		if len(fresh) > 0 {
+			add(fresh...)
+		}
+	}
 }
 
 // connectMCP brings up every declared MCP server and registers its tools.

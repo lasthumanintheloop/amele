@@ -197,7 +197,7 @@ func TestHTTPHeadersAndNoSSE(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tr, _, err := newHTTPTransport(ts.URL, map[string]string{"Authorization": "Bearer t0ken"})
+	tr, _, err := newHTTPTransport(ts.URL, map[string]string{"Authorization": "Bearer t0ken"}, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestHTTPBodyCap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	tr, _, err := newHTTPTransport(ts.URL, nil)
+	tr, _, err := newHTTPTransport(ts.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestHTTPRedirectOtherOriginRejected(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	tr, _, err := newHTTPTransport(redirector.URL, map[string]string{"Authorization": "Bearer t0ken"})
+	tr, _, err := newHTTPTransport(redirector.URL, map[string]string{"Authorization": "Bearer t0ken"}, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestHTTP401ClassifiedAuth(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	tr, _, err := newHTTPTransport(ts.URL, nil)
+	tr, _, err := newHTTPTransport(ts.URL, nil, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestHTTP401ClassifiedAuth(t *testing.T) {
 }
 
 func TestNewHTTPTransportRejectsBadURL(t *testing.T) {
-	if _, _, err := newHTTPTransport("://nope", nil); err == nil {
+	if _, _, err := newHTTPTransport("://nope", nil, nil); err == nil {
 		t.Fatal("newHTTPTransport accepted an unparseable URL")
 	}
 }

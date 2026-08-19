@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -33,12 +34,17 @@ const noDeadlineTimeout = 10 * time.Second
 // server: the operator's headers on every request, no standalone SSE stream,
 // no SDK-level reconnects, same-origin redirects only and a response body cap.
 //
+// handler, when non-nil, makes the transport an OAuth client: the SDK asks it
+// for a token before every request and calls it again on a 401/403. nil keeps
+// slice 1's behaviour, where the only credentials are the operator's static
+// headers.
+//
 // It returns the transport plus a release function that drops the client's
 // idle connections - the HTTP analogue of the stdio kill: a fleet worker that
 // closed its session must not keep a warm socket to the server for the rest
 // of its life. An error is returned only when rawURL cannot be parsed or is
 // not http(s); no network I/O happens here.
-func newHTTPTransport(rawURL string, headers map[string]string) (*sdk.StreamableClientTransport, func(), error) {
+func newHTTPTransport(rawURL string, headers map[string]string, handler auth.OAuthHandler) (*sdk.StreamableClientTransport, func(), error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing url %q: %w", rawURL, err)
@@ -92,6 +98,7 @@ func newHTTPTransport(rawURL string, headers map[string]string) (*sdk.Streamable
 		// server-initiated stream could tell us that we act on - and a fleet of
 		// cron workers must not each hold an idle connection open.
 		DisableStandaloneSSE: true,
+		OAuthHandler:         handler,
 	}, base.CloseIdleConnections, nil
 }
 

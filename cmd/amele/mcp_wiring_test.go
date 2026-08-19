@@ -706,3 +706,36 @@ func TestExplainMCPHasSecretSet(t *testing.T) {
 		t.Errorf("mid-report secret leaked: %q", got)
 	}
 }
+
+func TestDedupRegistrarPassesEachValueOnce(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	register := dedupRegistrar(func(values ...string) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, values...)
+	})
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			register("at1", "rt1", "")
+		}()
+	}
+	wg.Wait()
+	register("at2", "rt1")
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"at1", "rt1", "at2"}
+	if len(got) != len(want) {
+		t.Fatalf("registered %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("registered %v, want %v", got, want)
+		}
+	}
+}

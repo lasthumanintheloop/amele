@@ -22,6 +22,11 @@ const (
 	// badArgsText prefixes arguments the model did not manage to encode as
 	// JSON. The call never leaves the harness, so the model can just retry.
 	badArgsText = errorPrefix + "invalid JSON arguments: "
+	// authDeadText is shown once this server's OAuth credential has been
+	// refused for good. CONTRACT (spec §5): the call is not attempted - a run
+	// that keeps hammering a dead credential is exactly the browser-less
+	// retry storm the cached verdict exists to prevent.
+	authDeadText = errorPrefix + "authorization dead for this run; re-run 'amele mcp login'"
 	// abortedText is shown when the RUN ended under the call.
 	abortedText = errorPrefix + "run aborted"
 	// lostText is what the model is told when a request left amele but the
@@ -99,6 +104,12 @@ func (t *Tool) Invoke(ctx context.Context, rawArgs string) (string, error) {
 //
 // CONTRACT: a lost response yields OutcomeIndeterminate and is never retried.
 func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools.Outcome, error) {
+	// Checked before anything else: the authorization is dead for the whole
+	// run, so neither the arguments nor the session are worth touching, and no
+	// packet may leave for a server that would answer 401.
+	if t.srv.authDeadErr() != nil {
+		return authDeadText, tools.Outcome{Kind: tools.OutcomeToolError}, nil
+	}
 	args, err := decodeArgs(rawArgs)
 	if err != nil {
 		// The request never left amele: nothing happened, and the model can

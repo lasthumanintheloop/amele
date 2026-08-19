@@ -21,8 +21,10 @@ import (
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
+	"github.com/lasthumanintheloop/amele/internal/oauthtoken"
 	"github.com/lasthumanintheloop/amele/internal/schema"
 	"github.com/lasthumanintheloop/amele/internal/tools"
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -130,6 +132,18 @@ type Deps struct {
 	// Version is amele's version, reported to the server at initialize. Empty
 	// means "dev".
 	Version string
+	// TokenStore holds the OAuth credentials. REQUIRED when any server
+	// declares `auth`; ignored otherwise, so a config without OAuth needs no
+	// state directory at all.
+	TokenStore *oauthtoken.Store
+	// RegisterSecret publishes a value the run's redactor must scrub. It is
+	// how a token refreshed MID-RUN still gets kept out of the session log,
+	// which a redactor frozen at startup could not do. nil is allowed.
+	RegisterSecret func(...string)
+	// authFailed is set by Connect, not by the caller: it lets the OAuth
+	// handler tell its Server that this run's authorization is dead. It is
+	// unexported precisely because it is not a dependency cmd may choose.
+	authFailed func(error)
 }
 
 // withDefaults fills the optional fields and rejects a Deps missing a required
@@ -183,7 +197,19 @@ func defaultTransport(ctx context.Context, cfg config.MCPServer, deps Deps) (sdk
 	case config.MCPTransportStdio:
 		return newStdioTransport(ctx, cfg.Transport.Command, deps.Workspace, cfg.Transport.Env, deps.Env, deps.Stderr)
 	case config.MCPTransportHTTP:
-		return newHTTPTransport(cfg.Transport.URL, cfg.Transport.Headers)
+		// A typed nil would satisfy the interface and make the SDK ask a nil
+		// handler for tokens, so the handler is only ever assigned when there
+		// is a real one.
+		var handler auth.OAuthHandler
+		if cfg.Auth != nil {
+			h, err := newRunOAuthHandler(cfg, deps)
+			if err != nil {
+				return nil, nil, fmt.Errorf("mcp server %q: %w", cfg.Name, err)
+			}
+			h.onDead = deps.authFailed
+			handler = h
+		}
+		return newHTTPTransport(cfg.Transport.URL, cfg.Transport.Headers, handler)
 	default:
 		// Unreachable through a validated config; a library must still not
 		// dereference its way into a panic.
@@ -224,6 +250,7 @@ type Server struct {
 	reconnecting chan struct{}
 	reconnectErr error
 	errCount     int
+	authDead     error
 	info         ConnectInfo
 }
 
@@ -243,6 +270,13 @@ func Connect(ctx context.Context, cfg config.MCPServer, deps Deps) (*Server, err
 	deps, err := deps.withDefaults()
 	if err != nil {
 		return nil, err
+	}
+	// Checked here rather than defaulted: a server that declares OAuth in a
+	// process with no token store is a wiring mistake, and inventing a store
+	// (or a directory) on its behalf would write credentials somewhere nobody
+	// chose. Like the required Deps above it is an error, never a panic.
+	if cfg.Auth != nil && deps.TokenStore == nil {
+		return nil, fmt.Errorf("mcp server %q: %w", cfg.Name, errNoTokenStore)
 	}
 	start := deps.Clock()
 	s := &Server{cfg: cfg, deps: deps, runCtx: ctx}
@@ -294,7 +328,12 @@ func Connect(ctx context.Context, cfg config.MCPServer, deps Deps) (*Server, err
 // On any failure it releases everything it created, so a failed attempt leaves
 // no process and no goroutine behind.
 func (s *Server) connectOnce(procCtx, ctx context.Context, discoverTools bool) error {
-	transport, kill, err := newTransport(procCtx, s.cfg, s.deps)
+	// The transport's OAuth handler must be able to condemn THIS server when
+	// the authorization server refuses the credential, so the callback is
+	// attached to the copy of Deps the factory sees.
+	deps := s.deps
+	deps.authFailed = s.markAuthDead
+	transport, kill, err := newTransport(procCtx, s.cfg, deps)
 	if err != nil {
 		return fmt.Errorf("mcp server %q: %w", s.cfg.Name, err)
 	}
@@ -643,6 +682,30 @@ func (s *Server) countError() {
 	s.errCount++
 }
 
+// markAuthDead records that this run's authorization for the server is over:
+// the authorization server refused the credential and no refresh can fix it
+// before someone runs `amele mcp login`.
+//
+// CONTRACT (spec §5): the verdict is CACHED for the rest of the run - every
+// further tool call fails without a round trip - and counted ONCE, so
+// run_end.mcp_errors reports one dead server rather than one error per call.
+func (s *Server) markAuthDead(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.authDead != nil {
+		return
+	}
+	s.authDead = err
+	s.errCount++
+}
+
+// authDeadErr returns the cached authorization verdict, or nil.
+func (s *Server) authDeadErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.authDead
+}
+
 // markDead records that sess is unusable, so the next call reconnects. The
 // pointer comparison matters: a call that lost its response on the OLD session
 // must not condemn a session another goroutine has already replaced.
@@ -854,10 +917,16 @@ func classify(err error) ErrorClass {
 	if isSpawnError(err) {
 		return ClassSpawn
 	}
+	if errors.Is(err, errTransientAuth) {
+		// An authorization server that is down is an availability problem, not
+		// a rejected credential: reporting it as `auth` would send an operator
+		// hunting for a login he does not need.
+		return ClassNetwork
+	}
 	if isNetworkError(err) {
 		return ClassNetwork
 	}
-	if isAuthError(err) {
+	if errors.Is(err, errAuthDenied) || isAuthError(err) {
 		return ClassAuth
 	}
 	return ClassProtocol
