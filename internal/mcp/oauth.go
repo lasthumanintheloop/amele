@@ -340,14 +340,20 @@ func (h *runOAuthHandler) token(ctx context.Context, force bool, rejected string
 	if h.authDead != nil {
 		return nil, h.authDead
 	}
-	if force && h.lastForced != "" && h.rec != nil && h.rec.AccessToken == h.lastForced {
-		// The previous 401/403 already bought a forced refresh, and the token
-		// it produced is the one the server is now refusing again. Refreshing
-		// a second time would not change the answer - a 403 on a token whose
-		// scopes do not cover the tool never will - and the SDK calls
+	if force && rejected != "" && rejected == h.lastForced {
+		// The server refused THE VERY TOKEN the last forced refresh produced.
+		// Refreshing again would not change the answer - a 403 on a token
+		// whose scopes do not cover the tool never will - and the SDK calls
 		// Authorize on EVERY refused call, so an undamped forced path would
 		// rotate the credential once per tool call for the rest of the run.
 		// This is where that becomes auth death instead.
+		//
+		// The comparison is against the REJECTED token, not against whatever
+		// the handler currently holds: a call that was in flight with the old
+		// token comes back refused too, and that rejection says nothing about
+		// the replacement. Correlating on the handler's state instead would
+		// declare a healthy credential dead exactly when the concurrent-adopt
+		// path in refreshLocked was about to serve it.
 		err := fmt.Errorf("%w: the server refused the token this run refreshed for it (scopes?)%s", errAuthDenied, loginHint)
 		h.die(err)
 		return nil, err

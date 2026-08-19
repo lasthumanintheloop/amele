@@ -857,3 +857,45 @@ func TestFlexIntAcceptsTheSpellingsServersSend(t *testing.T) {
 		}
 	}
 }
+
+func TestStaleRejectedAdoptsAfterForcedRefresh(t *testing.T) {
+	as := newFakeAS(t,
+		asReply{status: 200, body: okBody("at2", "rt2", 3600)},
+		asReply{status: 200, body: okBody("at3", "rt3", 3600)},
+	)
+	f := newOAuthFixture(t, as, time.Hour)
+	h := f.handler(t)
+
+	authorize := func(rejected string) error {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, oauthResource, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+rejected)
+		return h.Authorize(context.Background(), req, &http.Response{StatusCode: 401, Body: http.NoBody})
+	}
+
+	// One call's 401 buys the forced refresh at1 -> at2.
+	if err := authorize("at1"); err != nil {
+		t.Fatalf("first Authorize: %v", err)
+	}
+	// A SECOND call was in flight with the old token and is refused too. Its
+	// rejection says nothing about at2: the credential was already replaced,
+	// and the run must simply adopt it - not declare the server dead.
+	if err := authorize("at1"); err != nil {
+		t.Fatalf("stale-token Authorize: %v", err)
+	}
+	if n := as.count(); n != 1 {
+		t.Errorf("token endpoint hit %d times, want 1: a stale rejection needs no refresh", n)
+	}
+	if len(f.dead) != 0 {
+		t.Errorf("a stale rejection killed a healthy credential: %v", f.dead)
+	}
+	got, err := tokenOf(t, h)
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if got != "at2" {
+		t.Errorf("access token = %q, want at2", got)
+	}
+}
