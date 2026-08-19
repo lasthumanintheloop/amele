@@ -35,10 +35,16 @@ type mcpSet struct {
 	// hints maps a model-facing tool name to the phrase the approval question
 	// shows beside it (see (*mcp.Tool).Hint).
 	hints map[string]string
-	// failed counts servers that were declared `required: false` and could not
-	// be reached - the run went on without them, but the loss is a fact the
-	// log must carry.
+	// failed counts servers that could not be reached, required and optional
+	// alike: an optional one the run went on without, and a required one that
+	// is about to end the run with exit 8 - either way run_end.mcp_errors must
+	// carry the loss, or a log line saying "0 mcp errors" would sit next to an
+	// exit code that says the opposite.
 	failed int
+	// redact is the run's secret scrubber, applied to every operator-facing
+	// line this set prints: a connect error may quote a header value the
+	// config interpolated.
+	redact func(string) string
 	// relays are the per-server stderr writers, kept so their last partial
 	// line can be flushed at shutdown.
 	relays []*mcpStderr
@@ -188,6 +194,7 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 	// server writes to them from its own goroutine.
 	observer := &sessionObserver{w: w}
 	redact := session.Redactor(agentSecrets(cfg))
+	set.redact = redact
 	var stderrMu sync.Mutex
 
 	results := dialMCP(ctx, cfg, set, observer, redact, &stderrMu, stderr, env, existing, version)
@@ -228,6 +235,12 @@ func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet, interrupted
 	}
 	var ce *mcp.ConnectError
 	if s.IsRequired() {
+		// Counted like an optional failure (unless the run was interrupted,
+		// which is nobody's unavailability): the exit-8 run's run_end must
+		// say how many declared dependencies were missing.
+		if !interrupted {
+			m.failed++
+		}
 		if errors.As(err, &ce) {
 			fail(&mcpUnavailableError{err: ce})
 			return
@@ -246,12 +259,23 @@ func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet, interrupted
 	}
 	// The class and the cause are read off the ConnectError rather than
 	// printing its own sentence, which would repeat "mcp server %q
-	// unavailable" inside a line that already says it.
+	// unavailable" inside a line that already says it. SECURITY: the cause is
+	// remote error text and may quote an interpolated header, so it goes
+	// through the run's redactor like every other operator-facing line.
 	if errors.As(err, &ce) {
-		_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q unavailable (%s): %s\n", s.Name, ce.Class, mcpCause(ce))
+		_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q unavailable (%s): %s\n", s.Name, ce.Class, m.scrub(mcpCause(ce)))
 		return
 	}
-	_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q unavailable: %v\n", s.Name, err)
+	_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q unavailable: %s\n", s.Name, m.scrub(err.Error()))
+}
+
+// scrub applies the set's redactor when it has one. A set built without one
+// (explain's, or a zero value in a test) passes text through.
+func (m *mcpSet) scrub(text string) string {
+	if m == nil || m.redact == nil {
+		return text
+	}
+	return m.redact(text)
 }
 
 // register adds one server's tools to the registry and collects their hints.
@@ -569,6 +593,9 @@ func mcpTarget(s config.MCPServer) string {
 		return raw
 	}
 	u.RawQuery, u.Fragment = "", ""
+	// Userinfo is rejected by Validate, but explain reports on configs
+	// Validate rejected - and a credential is a credential wherever it sits.
+	u.User = nil
 	return u.String()
 }
 

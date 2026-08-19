@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -538,5 +539,45 @@ func TestGoldenMCP(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Errorf("session log differs from golden.\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestWriterConcurrentUse pins the Writer's own locking: the MCP connect phase
+// (and, on the roadmap, parallel tool calls) drive one writer from several
+// goroutines, and `go test -race` turns any unguarded access here into a
+// failure.
+func TestWriterConcurrentUse(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	path := w.Path()
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w.MCPConnect(MCPConnect{Server: "s", Transport: "stdio", OK: true})
+			w.SetMCPErrors(i)
+			w.MCPDisconnect(MCPDisconnect{Server: "s", Reason: "reconnect"})
+		}()
+	}
+	wg.Wait()
+	w.RunEnd("success", 0, 1, 0, 0, 0)
+
+	data, rerr := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
+	if rerr != nil {
+		t.Fatalf("reading log: %v", rerr)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 17 { // 8x(connect+disconnect) + run_end
+		t.Fatalf("got %d lines, want 17", len(lines))
+	}
+	for _, line := range lines {
+		var e Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("torn event line %q: %v", line, err)
+		}
 	}
 }

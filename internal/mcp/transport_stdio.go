@@ -26,9 +26,6 @@ const (
 	// enough for a server to flush and close its own children, short enough
 	// that a run's shutdown stays snappy.
 	stdioGrace = 5 * time.Second
-	// maxStderrBytes bounds what a server's stderr can cost. Diagnostics are
-	// worth keeping; a server that loops printing is not.
-	maxStderrBytes = 16 << 10
 	// msgTooLargeText is the exact wording every size-cap failure carries. It is
 	// a constant because it is load-bearing: IsMessageTooLarge matches on it
 	// when the error chain has been severed (see that function).
@@ -79,7 +76,11 @@ func newStdioTransport(ctx context.Context, argv []string, dir string, allow []s
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // argv is operator config, not model input (docs/threat-model.md)
 	cmd.Dir = dir
 	cmd.Env = childEnv(allow, env)
-	cmd.Stderr = &cappedWriter{w: stderr, max: maxStderrBytes}
+	// stderr is handed over unwrapped: the caller's sink owns redaction AND
+	// bounding (cmd's relay budgets 64 KiB and announces the drop). A second,
+	// silent cap here would eat output the relay had budget for and turn its
+	// "(further output dropped)" announcement into a lie.
+	cmd.Stderr = stderr
 	setupProcessGroup(cmd)
 	// WaitDelay bounds the ctx-cancellation path (cmd.Cancel sends SIGTERM to
 	// the group); the explicit kill path below has its own grace timer.
@@ -187,38 +188,6 @@ func (r *lineCappedReader) Read(p []byte) (int, error) {
 // Close implements io.Closer.
 func (r *lineCappedReader) Close() error { return r.r.Close() }
 
-// cappedWriter forwards at most max bytes to w and silently drops the rest. It
-// wraps the operator's stderr sink, which is responsible for redaction.
-//
-// cappedWriter itself is not safe for concurrent use, and it does not
-// serialize writes to w: when one sink is shared by several servers, that sink
-// must be safe for concurrent use (os/exec writes each child's stderr from its
-// own goroutine).
-type cappedWriter struct {
-	w       io.Writer
-	max     int
-	written int
-}
-
-// Write implements io.Writer. It never reports a short write: dropping a
-// chatty server's output must not look like an I/O failure to os/exec.
-func (c *cappedWriter) Write(p []byte) (int, error) {
-	room := c.max - c.written
-	if room <= 0 {
-		return len(p), nil
-	}
-	out := p
-	if len(out) > room {
-		out = out[:room]
-	}
-	n, err := c.w.Write(out)
-	c.written += n
-	if err != nil {
-		return n, err
-	}
-	return len(p), nil
-}
-
 // waitForExit reaps cmd, calling force once if it has not exited within
 // stdioGrace. The goroutine it starts is owned by this call and always exits:
 // force is a signal the process cannot ignore, so cmd.Wait returns.
@@ -228,9 +197,11 @@ func waitForExit(cmd *exec.Cmd, force func()) {
 		_ = cmd.Wait()
 		close(done)
 	}()
+	timer := time.NewTimer(stdioGrace)
+	defer timer.Stop()
 	select {
 	case <-done:
-	case <-time.After(stdioGrace):
+	case <-timer.C:
 		force()
 		<-done
 	}

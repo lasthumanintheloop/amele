@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -105,6 +106,12 @@ type Writer struct {
 	clock  Clock
 	redact func(string) string
 	path   string
+	// mu serializes emit and the mcpErrors accesses, making a *Writer safe
+	// for concurrent use. Today's loop is sequential, but the MCP connect
+	// phase already drives one writer from several goroutines (through cmd's
+	// observer), and parallel tool calls (roadmap #2) will do the same for
+	// tool events - the lock belongs here, not in every caller.
+	mu sync.Mutex
 	// mcpErrors counts MCP-attributable failures over the whole run; it is
 	// reported once, on run_end, so an operator grepping a single line can see
 	// that a degraded MCP server was in play. SetMCPErrors is the only writer.
@@ -204,6 +211,8 @@ func (w *Writer) emit(e Event) {
 	if w == nil {
 		return
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	e.V = SchemaVersion
 	e.TS = w.clock().UTC()
 	line, err := json.Marshal(e)
@@ -383,7 +392,8 @@ type MCPToolListed struct {
 type MCPSkippedTool struct {
 	// Name is the server's name for the tool.
 	Name string `json:"name"`
-	// Reason is why it was dropped (e.g. `excluded`, `name_conflict`).
+	// Reason is why it was dropped (e.g. `excluded`, `not included`,
+	// `definition too large`; a name conflict is never a skip - it is fatal).
 	Reason string `json:"reason"`
 }
 
@@ -469,6 +479,8 @@ func (w *Writer) SetMCPErrors(n int) {
 	if w == nil {
 		return
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.mcpErrors = n
 }
 
@@ -477,10 +489,15 @@ func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalToke
 	if w == nil {
 		return
 	}
+	// The counter is read under the lock, then released before emit takes it
+	// again: mu is not reentrant.
+	w.mu.Lock()
+	mcpErrors := w.mcpErrors
+	w.mu.Unlock()
 	w.emit(Event{
 		Type: "run_end", Status: status, ExitCode: &exitCode,
 		Turns: turns, ToolCalls: toolCalls, TotalTokens: totalTokens,
-		DurationMS: duration.Milliseconds(), MCPErrors: w.mcpErrors,
+		DurationMS: duration.Milliseconds(), MCPErrors: mcpErrors,
 	})
 	_ = w.w.Close()
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
@@ -114,6 +115,17 @@ func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools
 
 	sess, err := t.srv.session(cctx)
 	if err != nil {
+		// A session that could not be produced because the CALLER's clock ran
+		// out is the same event as a call that hit that clock: classify it the
+		// same way, so a SIGTERM mid-reconnect logs `aborted` and a call
+		// timeout spent waiting on a reconnect logs `timeout` - not a generic
+		// dispatch error that reads like a harness bug.
+		switch {
+		case ctx.Err() != nil:
+			return abortedText, tools.Outcome{Kind: tools.OutcomeAborted}, nil
+		case errors.Is(cctx.Err(), context.DeadlineExceeded):
+			return timeoutText(timeout), tools.Outcome{Kind: tools.OutcomeTimedOut}, nil
+		}
 		// Not counted here: the failed reconnect already counted once. Counting
 		// per caller would multiply one server failure by the number of tool
 		// calls in the turn.
@@ -129,7 +141,7 @@ func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools
 		// The RUN ended (timeout or signal), not this call's own budget.
 		return abortedText, tools.Outcome{Kind: tools.OutcomeAborted}, nil
 	case errors.Is(cctx.Err(), context.DeadlineExceeded):
-		return fmt.Sprintf("%stool call timed out after %s", errorPrefix, timeout), tools.Outcome{Kind: tools.OutcomeTimedOut}, nil
+		return timeoutText(timeout), tools.Outcome{Kind: tools.OutcomeTimedOut}, nil
 	case isConnectionLoss(err):
 		// The request may have reached the server. Mark the session dead so the
 		// NEXT call reconnects; do not reconnect-and-retry here, because that
@@ -143,6 +155,15 @@ func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools
 		// The server is healthy; this one call failed.
 		return errorPrefix + err.Error(), tools.Outcome{Kind: tools.OutcomeToolError}, nil
 	}
+}
+
+// timeoutText is what the model reads when a call outran its budget.
+//
+// CONTRACT: like lostText, the wording refuses to promise failure - the
+// request HAD left amele, so the action may still complete server-side, and a
+// model that assumes a clean failure would happily fire the side effect twice.
+func timeoutText(timeout time.Duration) string {
+	return fmt.Sprintf("%stool call timed out after %s; the action may still complete server-side", errorPrefix, timeout)
 }
 
 // decodeArgs turns the model's raw argument string into the object MCP expects.

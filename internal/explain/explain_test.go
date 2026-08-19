@@ -126,6 +126,26 @@ func TestRender(t *testing.T) {
 			},
 		},
 		{
+			name: "glob permission entry matching a tool does not warn",
+			cfg: func() *config.Config {
+				c := baseCfg()
+				c.Permissions = config.Permissions{
+					Default: config.PolicyAsk,
+					Tools: map[string]config.Policy{
+						"github__*": config.PolicyAsk,
+						"gitlab__*": config.PolicyDeny,
+					},
+				}
+				return c
+			},
+			regTools: []string{"github__create_issue"},
+			want: []string{
+				// Only the glob that truly matches nothing is a typo suspect.
+				"  - permission entry \"gitlab__*\" matches no tool - typo?\n",
+			},
+			notWant: []string{"permission entry \"github__*\" matches no tool"},
+		},
+		{
 			name: "shell enabled without patterns warns",
 			cfg: func() *config.Config {
 				c := baseCfg()

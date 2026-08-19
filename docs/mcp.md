@@ -67,7 +67,7 @@ mcp:
 | `transport.env` | `[]` | Environment allowlist for the stdio child. **An empty list means the minimal environment** - `PATH`, `HOME`, `LANG` and nothing else. This differs from subprocess tools, where an empty allowlist means full inheritance: MCP is a new surface, so it got the safe default. Your provider API key does not reach an MCP server unless you name it. |
 | `tools.include` | all | Globs (only `*`, matching any substring; case-sensitive) matched against the **server-side** tool name, before the `<server>__` prefix. Empty means every tool. |
 | `tools.exclude` | none | Globs removing tools that `include` let through. Applied second. |
-| `call_timeout` | `60s` | Bounds one `tools/call`. A timeout is a tool error the model sees, not a run failure. |
+| `call_timeout` | `60s` | Bounds one `tools/call`. A timeout comes back to the model as result text with outcome `timeout` - the request had already left amele, so the action may still complete server-side - and is never a run failure. |
 | `required` | `true` | `true`: a connect failure aborts the run with exit 8. `false`: a warning on stderr (silenced by `-q`), an `mcp_connect{ok:false}` event, and the run continues without that server's tools. |
 
 Two values are deliberately not configurable: the connect timeout (30 s,

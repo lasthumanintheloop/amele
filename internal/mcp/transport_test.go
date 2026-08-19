@@ -197,7 +197,7 @@ func TestHTTPHeadersAndNoSSE(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	tr, err := newHTTPTransport(ts.URL, map[string]string{"Authorization": "Bearer t0ken"})
+	tr, _, err := newHTTPTransport(ts.URL, map[string]string{"Authorization": "Bearer t0ken"})
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestHTTPBodyCap(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	tr, err := newHTTPTransport(ts.URL, nil)
+	tr, _, err := newHTTPTransport(ts.URL, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -308,7 +308,7 @@ func TestHTTPRedirectOtherOriginRejected(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	tr, err := newHTTPTransport(redirector.URL, map[string]string{"Authorization": "Bearer t0ken"})
+	tr, _, err := newHTTPTransport(redirector.URL, map[string]string{"Authorization": "Bearer t0ken"})
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestHTTP401ClassifiedAuth(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	tr, err := newHTTPTransport(ts.URL, nil)
+	tr, _, err := newHTTPTransport(ts.URL, nil)
 	if err != nil {
 		t.Fatalf("newHTTPTransport: %v", err)
 	}
@@ -347,7 +347,7 @@ func TestHTTP401ClassifiedAuth(t *testing.T) {
 }
 
 func TestNewHTTPTransportRejectsBadURL(t *testing.T) {
-	if _, err := newHTTPTransport("://nope", nil); err == nil {
+	if _, _, err := newHTTPTransport("://nope", nil); err == nil {
 		t.Fatal("newHTTPTransport accepted an unparseable URL")
 	}
 }
@@ -398,21 +398,6 @@ func TestLineCappedReader(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
-	}
-}
-
-func TestCappedWriter(t *testing.T) {
-	var buf bytes.Buffer
-	w := &cappedWriter{w: &buf, max: 5}
-	n, err := w.Write([]byte("abcdefgh"))
-	if err != nil || n != 8 {
-		t.Fatalf("Write = %d, %v; want 8, nil (a dropped tail is not a short write)", n, err)
-	}
-	if n, err := w.Write([]byte("ijk")); err != nil || n != 3 {
-		t.Fatalf("second Write = %d, %v; want 3, nil", n, err)
-	}
-	if got := buf.String(); got != "abcde" {
-		t.Errorf("captured %q, want abcde", got)
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -29,8 +30,10 @@ import (
 // config keys on purpose: they bound what an unreviewed peer can cost, and an
 // operator who could raise them would be removing his own safety net.
 const (
-	// ConnectTimeout bounds one connect attempt (spawn or dial, initialize and
-	// discovery together).
+	// ConnectTimeout bounds the WHOLE of Connect - every attempt, the jittered
+	// pause between them, initialize and discovery together share this one
+	// window (docs/mcp.md promises "30 s, covering at most two jittered
+	// attempts").
 	ConnectTimeout = 30 * time.Second
 	// connectAttempts is how many times Connect tries before giving up. Two:
 	// enough to ride out a server that was still starting, few enough that a
@@ -114,8 +117,9 @@ type Deps struct {
 	Env func(string) (string, bool)
 	// Observer receives the connection lifecycle; nil means NopObserver.
 	Observer Observer
-	// Stderr is where a stdio server's stderr goes. The caller is responsible
-	// for redaction and for making it safe for concurrent use; nil means
+	// Stderr is where a stdio server's stderr goes, unwrapped and uncapped.
+	// The caller is responsible for redaction, for BOUNDING what a chatty
+	// server may write, and for making it safe for concurrent use; nil means
 	// io.Discard.
 	Stderr io.Writer
 	// Workspace is the working directory of a stdio server.
@@ -150,13 +154,24 @@ func (d Deps) withDefaults() (Deps, error) {
 
 // transportFactory builds the transport for one connection attempt. It returns
 // the transport and a kill function that releases whatever the transport owns
-// (a child process for stdio, nothing for HTTP).
+// (a child process for stdio, idle connections for HTTP).
 type transportFactory func(ctx context.Context, cfg config.MCPServer, deps Deps) (sdk.Transport, func(), error)
 
 // newTransport is the seam the tests replace with an in-memory pair. It is a
 // package variable rather than a Deps field because it is not a dependency an
 // operator or cmd may choose: production has exactly one implementation.
 var newTransport transportFactory = defaultTransport
+
+// connectWindow is ConnectTimeout behind a variable, so a test of the window
+// semantics does not have to wait thirty real seconds. Production never
+// changes it.
+var connectWindow = ConnectTimeout
+
+// reconnectWaiting, when non-nil, is called by session() just before a caller
+// starts waiting for another caller's reconnect. It exists ONLY so the
+// singleflight test can know deterministically that the second caller has
+// queued (a sleep there would be a scheduler bet); production never sets it.
+var reconnectWaiting func()
 
 // defaultTransport builds the real transport for cfg.
 //
@@ -168,11 +183,7 @@ func defaultTransport(ctx context.Context, cfg config.MCPServer, deps Deps) (sdk
 	case config.MCPTransportStdio:
 		return newStdioTransport(ctx, cfg.Transport.Command, deps.Workspace, cfg.Transport.Env, deps.Env, deps.Stderr)
 	case config.MCPTransportHTTP:
-		tr, err := newHTTPTransport(cfg.Transport.URL, cfg.Transport.Headers)
-		if err != nil {
-			return nil, nil, err
-		}
-		return tr, func() {}, nil
+		return newHTTPTransport(cfg.Transport.URL, cfg.Transport.Headers)
 	default:
 		// Unreachable through a validated config; a library must still not
 		// dereference its way into a panic.
@@ -218,8 +229,10 @@ type Server struct {
 
 // Connect establishes one MCP session and discovers its tools.
 //
-// It makes at most connectAttempts attempts, each bounded by ConnectTimeout,
-// with a jittered pause in between. On success the Observer has seen Connected
+// It makes at most connectAttempts attempts, with a jittered pause in between;
+// attempts and pause together share ONE ConnectTimeout window, so a required
+// server that is down delays a run by at most ~30 s, not by attempts × 30 s.
+// On success the Observer has seen Connected
 // and ToolsListed; on failure it has seen ConnectFailed and the returned error
 // is a *ConnectError wrapping ErrUnavailable - except for a toolset error
 // (a name collision), which is returned bare because retrying cannot help.
@@ -234,19 +247,27 @@ func Connect(ctx context.Context, cfg config.MCPServer, deps Deps) (*Server, err
 	start := deps.Clock()
 	s := &Server{cfg: cfg, deps: deps, runCtx: ctx}
 
+	// One window over everything: attempts must not each get a fresh 30 s, or
+	// a hanging server would cost a run twice the documented bound.
+	wctx, cancel := context.WithTimeout(ctx, connectWindow)
+	defer cancel()
+
 	var lastErr error
 	for attempt := range connectAttempts {
 		if attempt > 0 {
 			// Jittered pause so a fleet restarting on the same cron tick does
 			// not hammer one server in lockstep.
-			if err := sleepCtx(ctx, retryGap+time.Duration(deps.Rand()*float64(retryGap))); err != nil {
-				lastErr = err
+			if err := sleepCtx(wctx, retryGap+time.Duration(deps.Rand()*float64(retryGap))); err != nil {
+				// The window (or the run) ended during the pause. The failure
+				// worth reporting is the attempt that drove us here, when
+				// there was one.
+				if lastErr == nil {
+					lastErr = err
+				}
 				break
 			}
 		}
-		actx, cancel := context.WithTimeout(ctx, ConnectTimeout)
-		err := s.connectOnce(ctx, actx, true)
-		cancel()
+		err := s.connectOnce(ctx, wctx, true)
 		if err == nil {
 			deps.Observer.Connected(s.setDuration(deps.Clock().Sub(start)))
 			deps.Observer.ToolsListed(cfg.Name, s.Listed(), s.totalBytes, s.Skipped())
@@ -267,12 +288,12 @@ func Connect(ctx context.Context, cfg config.MCPServer, deps Deps) (*Server, err
 }
 
 // connectOnce performs one attempt: build the transport, initialize, and (only
-// at Connect) discover the toolset. procCtx bounds the transport's lifetime,
-// ctx bounds this attempt.
+// at Connect, discoverTools) discover the toolset. procCtx bounds the
+// transport's lifetime, ctx bounds this attempt.
 //
 // On any failure it releases everything it created, so a failed attempt leaves
 // no process and no goroutine behind.
-func (s *Server) connectOnce(procCtx, ctx context.Context, discover bool) error {
+func (s *Server) connectOnce(procCtx, ctx context.Context, discoverTools bool) error {
 	transport, kill, err := newTransport(procCtx, s.cfg, s.deps)
 	if err != nil {
 		return fmt.Errorf("mcp server %q: %w", s.cfg.Name, err)
@@ -286,7 +307,7 @@ func (s *Server) connectOnce(procCtx, ctx context.Context, discover bool) error 
 		kill()
 		return fmt.Errorf("mcp server %q: initialize: %w", s.cfg.Name, err)
 	}
-	if discover {
+	if discoverTools {
 		if err := s.discover(sess.Tools(ctx, nil)); err != nil {
 			closeSession(ctx, sess)
 			kill()
@@ -417,7 +438,19 @@ func (s *Server) acceptTool(t *sdk.Tool, st *discoverState) error {
 	if err != nil {
 		return fmt.Errorf("mcp server %q: tool %q: input schema: %w", s.cfg.Name, t.Name, err)
 	}
-	size := len(t.Name) + len(t.Description) + len(inputSchema)
+	// The output schema is marshalled here, before the size accounting, so its
+	// bytes count toward the discovery caps like every other part of the
+	// definition - a server must not get a free 4 MiB channel just because the
+	// bytes arrived under a different key. A value that will not even marshal
+	// has no measurable size; it costs the tool, not the budget.
+	var outputRaw []byte
+	if t.OutputSchema != nil {
+		if outputRaw, err = json.Marshal(t.OutputSchema); err != nil {
+			s.skip(t.Name, "invalid output schema")
+			return nil
+		}
+	}
+	size := len(t.Name) + len(t.Description) + len(inputSchema) + len(outputRaw)
 	st.totalBytes += size
 	if st.totalBytes > MaxDiscoveryBytes {
 		return fmt.Errorf("mcp server %q: tool definitions exceed %d bytes", s.cfg.Name, MaxDiscoveryBytes)
@@ -430,6 +463,14 @@ func (s *Server) acceptTool(t *sdk.Tool, st *discoverState) error {
 		s.skip(t.Name, reason)
 		return nil
 	}
+	// Providers require a tool's parameters to be an OBJECT schema; a boolean
+	// or array-rooted schema is valid JSON Schema but would be rejected (or
+	// silently mangled) downstream, so the tool is skipped here with a reason
+	// the operator can see instead of failing at the first provider call.
+	if !isObjectSchema(inputSchema) {
+		s.skip(t.Name, "input schema not an object")
+		return nil
+	}
 
 	named := EffectiveName(s.cfg.Name, t.Name)
 	if s.deps.ExistingNames[named.Effective] || st.effective[named.Effective] {
@@ -437,7 +478,7 @@ func (s *Server) acceptTool(t *sdk.Tool, st *discoverState) error {
 	}
 	st.effective[named.Effective] = true
 
-	validator, err := outputValidator(t.OutputSchema)
+	validator, err := outputValidator(outputRaw)
 	if err != nil {
 		s.skip(t.Name, "invalid output schema")
 		return nil
@@ -488,19 +529,34 @@ func marshalSchema(v any) (json.RawMessage, error) {
 	return encoded, nil
 }
 
-// outputValidator compiles a tool's output schema once, at discovery, so that
-// RenderResult can check every result without paying for a compile per call.
-// A schema that will not compile is the tool's problem, not the server's: the
-// caller skips that one tool.
-func outputValidator(raw any) (*schema.Validator, error) {
-	if raw == nil {
+// outputValidator compiles a tool's already-marshalled output schema once, at
+// discovery, so that RenderResult can check every result without paying for a
+// compile per call. A schema that will not compile is the tool's problem, not
+// the server's: the caller skips that one tool.
+func outputValidator(encoded []byte) (*schema.Validator, error) {
+	if encoded == nil {
 		return nil, nil //nolint:nilnil // "no schema" is a legitimate, non-error result
 	}
-	encoded, err := json.Marshal(raw)
-	if err != nil {
-		return nil, err
-	}
 	return schema.Compile(encoded)
+}
+
+// isObjectSchema reports whether a marshalled JSON Schema describes an object -
+// the only shape a provider accepts as a tool's parameters. A boolean schema
+// (`true`) and a root that declares a non-object type both fail; a root with
+// no `type` passes, because "properties without type" conventionally means an
+// object and rejecting it would drop real-world tools.
+func isObjectSchema(encoded json.RawMessage) bool {
+	var root map[string]json.RawMessage
+	if json.Unmarshal(encoded, &root) != nil {
+		return false
+	}
+	if t, ok := root["type"]; ok {
+		var name string
+		if json.Unmarshal(t, &name) == nil && name != "object" {
+			return false
+		}
+	}
+	return true
 }
 
 // copyAnnotations maps the SDK's annotation shape onto amele's.
@@ -616,6 +672,9 @@ func (s *Server) session(ctx context.Context) (*sdk.ClientSession, error) {
 	}
 	if ch := s.reconnecting; ch != nil {
 		s.mu.Unlock()
+		if reconnectWaiting != nil {
+			reconnectWaiting()
+		}
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -676,7 +735,9 @@ func (s *Server) reconnect(ctx context.Context) error {
 	// A short jittered pause: a server that just died is often being restarted
 	// by something else, and a fleet must not all retry on the same tick.
 	if err := sleepCtx(ctx, time.Duration(s.deps.Rand()*float64(reconnectJitter))); err != nil {
-		s.countError()
+		// The CALLER's context ended (a SIGTERM, or the call's own budget):
+		// that is the run stopping, not the server failing, and counting it
+		// would inflate run_end.mcp_errors on every interrupted fleet.
 		return err
 	}
 
@@ -684,11 +745,16 @@ func (s *Server) reconnect(ctx context.Context) error {
 	actx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 	if err := s.connectOnce(s.runCtx, actx, false); err != nil {
-		// A reconnect that lost the race with Close is a shutdown, not a
-		// failure of the server: it must not inflate the error count.
-		if !errors.Is(err, errClosed) {
-			s.countError()
+		// A reconnect that lost the race with Close, or one cut short by the
+		// caller's own context ending, is the run shutting down - not a
+		// failure of the server. Only a genuine failure is counted, and only
+		// a genuine failure earns a mcp_connect{ok:false} event, so the log
+		// shows WHY the tools kept failing after the disconnect.
+		if errors.Is(err, errClosed) || ctx.Err() != nil {
+			return err
 		}
+		s.countError()
+		s.deps.Observer.ConnectFailed(s.cfg.Name, s.cfg.Transport.Type, classify(err), err, s.deps.Clock().Sub(start))
 		return err
 	}
 	s.deps.Observer.Connected(s.setDuration(s.deps.Clock().Sub(start)))
@@ -771,8 +837,10 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 
 // classify names the coarse reason a connection failed, in a fixed order:
 // deadline first (it can wrap anything), then the failures that identify
-// themselves through the error chain, then the HTTP statuses the SDK only
-// renders as text, and protocol as the catch-all.
+// themselves through the error chain, and only then the text-matched auth
+// statuses - a typed network error whose message happens to contain "401"
+// (an address, a byte count) must classify as the network failure it is.
+// protocol is the catch-all.
 func classify(err error) ErrorClass {
 	if err == nil {
 		return ""
@@ -786,11 +854,11 @@ func classify(err error) ErrorClass {
 	if isSpawnError(err) {
 		return ClassSpawn
 	}
-	if isAuthError(err) {
-		return ClassAuth
-	}
 	if isNetworkError(err) {
 		return ClassNetwork
+	}
+	if isAuthError(err) {
+		return ClassAuth
 	}
 	return ClassProtocol
 }
@@ -811,15 +879,22 @@ func isSpawnError(err error) bool {
 		errors.As(err, new(*exec.Error))
 }
 
+// authStatusRe matches a 401/403 that stands alone as a status code rather
+// than as digits inside something longer (a port, a byte count, a request id).
+var authStatusRe = regexp.MustCompile(`(?:^|[^0-9])(?:401|403)(?:[^0-9]|$)`)
+
 // isAuthError reports credentials the server refused.
 //
 // It matches on TEXT because it has to: the SDK renders an HTTP failure status
 // into the error message rather than a typed error, so there is nothing else to
-// match on. The status names come first and the bare numbers are the fallback.
+// match on. The status names come first; the bare numbers are a fallback and
+// must be delimited, so "port 4013" or "403 bytes read" in some other failure
+// cannot turn it into an auth verdict (classify also asks the typed checks
+// first for the same reason).
 func isAuthError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "Unauthorized") || strings.Contains(msg, "Forbidden") ||
-		strings.Contains(msg, "401") || strings.Contains(msg, "403")
+		authStatusRe.MatchString(msg)
 }
 
 // isNetworkError reports a failure below the protocol.

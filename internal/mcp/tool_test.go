@@ -168,7 +168,7 @@ func TestInvokeCallTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InvokeOutcome returned a Go error: %v", err)
 	}
-	if text != "error: tool call timed out after 50ms" || out.Kind != tools.OutcomeTimedOut {
+	if text != "error: tool call timed out after 50ms; the action may still complete server-side" || out.Kind != tools.OutcomeTimedOut {
 		t.Errorf("got (%q, %v), want the timeout wording", text, out.Kind)
 	}
 }
@@ -257,6 +257,10 @@ func TestReconnectSingleflightOnce(t *testing.T) {
 	// caller is guaranteed to arrive while the first attempt is in flight.
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
+	queued := make(chan struct{}, 2)
+	prevWaiting := reconnectWaiting
+	reconnectWaiting = func() { queued <- struct{}{} }
+	t.Cleanup(func() { reconnectWaiting = prevWaiting })
 	fc.mu.Lock()
 	fc.entered, fc.release = entered, release
 	fc.failErr = errNoServer
@@ -276,9 +280,11 @@ func TestReconnectSingleflightOnce(t *testing.T) {
 	}
 	// One caller is now inside the factory and the other is queued behind it;
 	// only then is the attempt allowed to finish, so "one factory call" is a
-	// property of the code and not of the scheduler.
+	// property of the code and not of the scheduler. The queued caller is
+	// observed through the reconnectWaiting hook - deterministic, where the
+	// former 200 ms sleep was a scheduler bet.
 	<-entered
-	time.Sleep(200 * time.Millisecond)
+	<-queued
 	close(release)
 	wg.Wait()
 

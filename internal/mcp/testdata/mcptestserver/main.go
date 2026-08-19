@@ -52,10 +52,15 @@ func text(s string) *sdk.CallToolResult {
 func main() {
 	spawnChild := flag.Bool("spawn-child", false, "spawn a long-lived grandchild in the same process group")
 	exitOnStart := flag.Bool("exit-on-start", false, "exit(3) immediately instead of serving")
+	stderrBytes := flag.Int("stderr-bytes", 0, "write this many bytes of banner noise to stderr before serving")
 	flag.Parse()
 
 	if *exitOnStart {
 		os.Exit(3)
+	}
+	if *stderrBytes > 0 {
+		// One long line: the reader side must relay it whole, however chatty.
+		fmt.Fprintln(os.Stderr, strings.Repeat("e", *stderrBytes))
 	}
 
 	if *spawnChild {

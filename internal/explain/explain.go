@@ -958,7 +958,10 @@ func collectWarnings(cfg *config.Config, reg *tools.Registry, mcpReports []MCPSe
 	if reg != nil {
 		registered := reg.Names()
 		for _, name := range sortedToolNames(cfg.Permissions.Tools) {
-			if !slices.Contains(registered, name) {
+			// Glob-aware, like the permission lookup itself: `github__*` is a
+			// perfectly healthy entry when github tools are registered, and
+			// warning "typo?" about it taught operators to ignore the warning.
+			if !matchesAnyTool(name, registered) {
 				ws = append(ws, fmt.Sprintf("permission entry %q matches no tool - typo?", name))
 			}
 		}
@@ -1004,6 +1007,18 @@ func patternList(ps []string) string {
 		quoted[i] = fmt.Sprintf("%q", p)
 	}
 	return strings.Join(quoted, ", ")
+}
+
+// matchesAnyTool reports whether a permission entry - exact name or glob,
+// exactly the vocabulary internal/perm accepts - matches at least one
+// registered tool.
+func matchesAnyTool(entry string, registered []string) bool {
+	for _, name := range registered {
+		if tools.GlobMatch(entry, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // sortedToolNames returns the permission map's keys sorted. Sorted iteration

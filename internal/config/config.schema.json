@@ -250,7 +250,7 @@
                     "type": "array",
                     "items": { "type": "string", "minLength": 1, "pattern": "^[^=]+$" },
                     "uniqueItems": true,
-                    "description": "Environment allowlist for a stdio server's child process, with the same semantics as a subprocess tool's env: names, never assignments. Empty or omitted means the child inherits amele's entire environment."
+                    "description": "Environment allowlist for a stdio server's child process: names, never assignments. Unlike a subprocess tool's env, empty or omitted means the MINIMAL environment - PATH, HOME and LANG only; amele's other variables (including the provider API key) reach the server only when named here."
                   }
                 }
               },

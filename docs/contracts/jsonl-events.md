@@ -141,7 +141,7 @@ happened", never as a failure to parse: new values may be added additively.
 | `server` | string | The server's name from the config. |
 | `tools` | object[] | The definitions actually exposed to the model (see below). |
 | `total_bytes` | int | Summed size of **every** definition the server sent, skipped and filtered ones included - the bytes that crossed the wire, not the tokens the model is charged for. |
-| `skipped` | object[] | Advertised tools that were **not** exposed: `{ "name": <server's name>, "reason": <one of "not included", "excluded", "definition too large", "invalid output schema"> }`. Absent when nothing was skipped. (A name conflict is never skipped - it is a fatal config error, exit 2.) |
+| `skipped` | object[] | Advertised tools that were **not** exposed: `{ "name": <server's name>, "reason": <one of "not included", "excluded", "definition too large", "invalid output schema", "input schema not an object"> }`. Absent when nothing was skipped. (A name conflict is never skipped - it is a fatal config error, exit 2.) |
 
 Each `tools` entry:
 
@@ -167,7 +167,7 @@ because the SDK models two of them as plain booleans:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `server` | string | The server's name from the config. |
-| `reason` | string | `run_end` (the run finished), `reconnect` (amele is re-establishing the connection) or `error`. |
+| `reason` | string | `run_end` (the run finished) or `reconnect` (amele is re-establishing the connection). |
 
 ### `run_end` - last event of every file
 
@@ -193,7 +193,8 @@ truthful partial accounting.
   strictly between `run_start` and `run_end`. The **initial** connects and
   tool listings happen before the first `llm_response` of the run. After that
   a lost session may add further `mcp_disconnect` (reason `reconnect`) /
-  `mcp_connect` pairs at any point between `run_start` and `run_end`. The
+  `mcp_connect` pairs at any point between `run_start` and `run_end` - with
+  `ok` false when the reconnect itself failed. The
   orderly shutdown emits a `mcp_disconnect` (reason `run_end`) for every
   still-connected server before `run_end`.
 - Within a turn: the `llm_response` comes first, then its tool calls as

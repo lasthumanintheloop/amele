@@ -1733,7 +1733,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		}
 		code := exitCodeFor(mcpErr)
 		finish()
-		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr)
+		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr, session.Redactor(agentSecrets(cfg)))
 		return code
 	}
 
@@ -1741,7 +1741,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	code := exitCodeFor(runErr)
 
 	finish()
-	reportRun(agent, res, runErr, code, validator != nil, parsed.quiet, stderr)
+	reportRun(agent, res, runErr, code, validator != nil, parsed.quiet, stderr, session.Redactor(agentSecrets(cfg)))
 
 	if runErr == nil {
 		// CONTRACT: stdout carries only the agent's final answer, so runs
@@ -1801,7 +1801,7 @@ func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string
 	code := exitCodeFor(err)
 	agent.Session.RunStart(cfg.Model, taskArgs)
 	// Zero accounting: nothing was spent, and the summary must not invent turns.
-	reportRun(agent, &loop.Result{}, err, code, schemaMode, quiet, stderr)
+	reportRun(agent, &loop.Result{}, err, code, schemaMode, quiet, stderr, session.Redactor(agentSecrets(cfg)))
 	return code
 }
 
@@ -1814,11 +1814,15 @@ func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string
 // exactly while it is healthy. schemaMode says whether output.schema was in
 // play; without it a provider flagging unenforced responses has nothing worth
 // warning about.
-func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schemaMode, quiet bool, stderr io.Writer) {
+func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schemaMode, quiet bool, stderr io.Writer, redact func(string) string) {
 	status := "success"
 	if runErr != nil {
 		status = "error"
-		_, _ = fmt.Fprintln(stderr, runErr)
+		// SECURITY: the error line can quote remote text - an MCP connect
+		// failure echoes whatever the server sent, which may include a header
+		// value this run interpolated - so it is redacted like every other
+		// operator-facing line.
+		_, _ = fmt.Fprintln(stderr, redact(runErr.Error()))
 	}
 	agent.Session.RunEnd(status, code, res.Turns, res.ToolCalls, res.Usage.Total(), res.Duration)
 	if quiet {
@@ -2167,7 +2171,8 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 	status := "success"
 	if err != nil {
 		status = "error"
-		_, _ = fmt.Fprintln(stderr, err)
+		// SECURITY: same rule as reportRun - the error may quote remote text.
+		_, _ = fmt.Fprintln(stderr, session.Redactor(agentSecrets(s.cfg))(err.Error()))
 	}
 	s.agent.Session.RunEnd(status, code, s.turns, s.toolCalls, s.tokens, s.duration)
 	if !s.quiet {

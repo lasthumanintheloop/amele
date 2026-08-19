@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -206,6 +208,11 @@ func TestRunMCPRequiredUnavailableExit8(t *testing.T) {
 	last := events[len(events)-1]
 	if last.Type != "run_end" || last.ExitCode == nil || *last.ExitCode != ExitMCPUnavailable {
 		t.Fatalf("run_end: %+v", last)
+	}
+	// The missing REQUIRED dependency is an MCP failure like any other: an
+	// exit-8 run_end saying "0 mcp errors" would contradict its own exit code.
+	if last.MCPErrors != 1 {
+		t.Errorf("run_end.mcp_errors = %d, want 1", last.MCPErrors)
 	}
 }
 
@@ -596,5 +603,70 @@ func TestExplainMCPRequirements(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Errorf("report missing %q:\n%s", want, stdout)
 		}
+	}
+}
+
+// TestConnectFailedRedactsWarning pins the redaction of the degradation
+// warning: a connect error may quote a header value the config interpolated,
+// and the warning lands in cron mail.
+func TestConnectFailedRedactsWarning(t *testing.T) {
+	var buf bytes.Buffer
+	set := &mcpSet{redact: session.Redactor([]string{"s3cret-token"})}
+	err := &mcp.ConnectError{Server: "github", Class: mcp.ClassAuth,
+		Err: errors.New("401 Unauthorized: bad token s3cret-token")}
+	cfg := config.MCPServer{Name: "github", Required: new(bool)} // required: false
+	set.connectFailed(cfg, err, false, false, &buf, func(error) {})
+
+	out := buf.String()
+	if strings.Contains(out, "s3cret-token") {
+		t.Errorf("warning leaked the secret: %q", out)
+	}
+	if !strings.Contains(out, "[REDACTED]") || !strings.Contains(out, "auth") {
+		t.Errorf("warning lost its content: %q", out)
+	}
+	if set.failed != 1 {
+		t.Errorf("failed = %d, want 1", set.failed)
+	}
+}
+
+// TestConnectFailedCountsRequired pins fix: a required server's connect
+// failure is counted toward mcp_errors (unless the run was interrupted, which
+// is nobody's unavailability).
+func TestConnectFailedCountsRequired(t *testing.T) {
+	err := &mcp.ConnectError{Server: "files", Class: mcp.ClassSpawn, Err: errors.New("no such file")}
+	for _, tc := range []struct {
+		name        string
+		interrupted bool
+		want        int
+	}{
+		{"required failure counts", false, 1},
+		{"interrupted does not", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := &mcpSet{}
+			var fatal error
+			set.connectFailed(config.MCPServer{Name: "files"}, err, true, tc.interrupted, io.Discard, func(e error) { fatal = e })
+			if fatal == nil {
+				t.Fatal("required failure did not fail the run")
+			}
+			if set.failed != tc.want {
+				t.Errorf("failed = %d, want %d", set.failed, tc.want)
+			}
+		})
+	}
+}
+
+// TestMCPTargetStripsUserinfo: explain's target column must not print a
+// credential embedded in the URL, even on a config Validate rejected.
+func TestMCPTargetStripsUserinfo(t *testing.T) {
+	//nolint:gosec // G101: the fake credential IS the test input
+	s := config.MCPServer{Transport: config.MCPTransport{
+		Type: config.MCPTransportHTTP, URL: "https://user:hunter2@example.com/mcp?key=abc#frag"}}
+	got := mcpTarget(s)
+	if strings.Contains(got, "hunter2") || strings.Contains(got, "abc") {
+		t.Errorf("target leaked credentials: %q", got)
+	}
+	if got != "https://example.com/mcp" {
+		t.Errorf("target = %q, want https://example.com/mcp", got)
 	}
 }
