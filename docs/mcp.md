@@ -182,10 +182,10 @@ The consequence for server authors and operators: **design MCP tools to be
 idempotent**, and prefer tools that can be asked "did this already happen?".
 
 On the *next* call to that server, amele reconnects: a single jittered attempt,
-coalesced per server so concurrent calls do not stampede (`Retry-After` is
-honoured), with the SDK's own retry loop turned off. Over Streamable HTTP, a
-`404` to a request carrying an `Mcp-Session-Id` means the session is gone, and
-amele re-initializes from scratch without the stale id. If reconnecting fails,
+coalesced per server so concurrent calls do not stampede, with the SDK's own
+retry loop turned off. Over Streamable HTTP, a `404` to a request carrying an
+`Mcp-Session-Id` means the session is gone, and amele re-initializes from
+scratch without the stale id. If reconnecting fails,
 the tool keeps returning errors and the run continues - the budgets are the kill
 switch, and `run_end.mcp_errors` makes the degradation visible afterwards.
 
