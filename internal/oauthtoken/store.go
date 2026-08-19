@@ -39,15 +39,27 @@ type Key struct{ Issuer, Resource, ClientID string }
 // second discovery round-trip, and the granted scopes so a caller can tell
 // whether a cached credential still covers what it needs.
 type Record struct {
-	Version       int       `json:"v"`
-	Issuer        string    `json:"issuer"`
-	Resource      string    `json:"resource"`
-	ClientID      string    `json:"client_id"`
-	TokenEndpoint string    `json:"token_endpoint"`
-	AccessToken   string    `json:"access_token"`
-	RefreshToken  string    `json:"refresh_token,omitempty"`
-	ExpiresAt     time.Time `json:"expires_at"`
-	Scopes        []string  `json:"scopes,omitempty"`
+	Version       int    `json:"v"`
+	Issuer        string `json:"issuer"`
+	Resource      string `json:"resource"`
+	ClientID      string `json:"client_id"`
+	TokenEndpoint string `json:"token_endpoint"`
+	// AuthResource is the RFC 8707 resource indicator VERBATIM as the
+	// protected resource metadata declared it, which is the string the
+	// authorization server bound the token to. It is additive (schema Version
+	// stays 1) and may be empty, in which case Resource is used.
+	//
+	// It exists because Resource is CANONICALIZED (lowercased host, trailing
+	// slashes trimmed) so two spellings of one server key one credential,
+	// while a strict authorization server compares the resource parameter of a
+	// refresh byte for byte against what it issued the token for. Storing both
+	// keeps the lookup stable without ever sending a string the server did not
+	// see at issuance.
+	AuthResource string    `json:"auth_resource,omitempty"`
+	AccessToken  string    `json:"access_token"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	Scopes       []string  `json:"scopes,omitempty"`
 }
 
 // Entry pairs a stored Record with the Key it is filed under. List returns
@@ -346,6 +358,7 @@ func recordEqual(a, b *Record) bool {
 		a.Resource == b.Resource &&
 		a.ClientID == b.ClientID &&
 		a.TokenEndpoint == b.TokenEndpoint &&
+		a.AuthResource == b.AuthResource &&
 		a.AccessToken == b.AccessToken &&
 		a.RefreshToken == b.RefreshToken &&
 		a.ExpiresAt.Equal(b.ExpiresAt) &&

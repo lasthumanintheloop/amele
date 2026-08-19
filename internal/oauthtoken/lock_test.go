@@ -472,3 +472,28 @@ func TestWithLockMonotonicTimeIsNotAChange(t *testing.T) {
 		t.Fatal("file was rewritten for an unchanged expiry")
 	}
 }
+
+// TestWithLockAuthResourceChangePersists guards the field-wise comparison for
+// the additive auth_resource field: a record that differs only there is a
+// different credential record and must reach disk.
+func TestWithLockAuthResourceChangePersists(t *testing.T) {
+	s := NewStore(t.TempDir(), fixedClock(time.Unix(1000, 0)))
+	k := testKey()
+	if err := s.Save(k, testRecord(k)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := s.WithLock(context.Background(), k, func(current *Record) (*Record, error) {
+		next := *current
+		next.AuthResource = current.Resource + "/"
+		return &next, nil
+	}); err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	loaded, err := s.Load(k)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.AuthResource != loaded.Resource+"/" {
+		t.Fatalf("auth_resource not persisted: %+v", loaded)
+	}
+}

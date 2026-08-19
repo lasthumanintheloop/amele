@@ -529,12 +529,22 @@ func refreshGrant(ctx context.Context, client *http.Client, rec *oauthtoken.Reco
 	if rec.RefreshToken == "" {
 		return nil, fmt.Errorf("%w: stored credential for %q has no refresh token%s", errAuthDenied, resource, loginHint)
 	}
+	// RFC 8707: the token stays bound to the MCP server it was issued for, so
+	// a compromised peer cannot replay it against another resource. The value
+	// sent is the LITERAL one the protected resource metadata declared at
+	// login (Record.AuthResource) whenever it is known, because a strict
+	// authorization server compares it byte for byte against what it issued
+	// the token for; the canonical form - which lowercases the host and trims
+	// trailing slashes so one server keys one credential - is the fallback for
+	// records written before that field existed.
+	indicator := rec.AuthResource
+	if indicator == "" {
+		indicator = resource
+	}
 	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {rec.RefreshToken},
-		// RFC 8707: the token stays bound to the MCP server it was issued for,
-		// so a compromised peer cannot replay it against another resource.
-		"resource": {resource},
+		"resource":      {indicator},
 	}
 	if rec.ClientID != "" {
 		form.Set("client_id", rec.ClientID)

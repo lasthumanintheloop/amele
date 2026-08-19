@@ -36,6 +36,9 @@ type fakeAuthServer struct {
 	noASMetadata bool
 	// challengeScope is the `scope` parameter of the 401 challenge.
 	challengeScope string
+	// mcpPath is the path of the protected endpoint. A trailing slash makes
+	// the declared resource literal differ from its canonical form.
+	mcpPath string
 	// prmScopes is the PRM scopes_supported list.
 	prmScopes []string
 	// authorizeError, when set, makes /authorize redirect with an error.
@@ -57,7 +60,7 @@ type fakeAuthServer struct {
 // client that trusts its certificate.
 func newFakeAuthServer(t *testing.T) *fakeAuthServer {
 	t.Helper()
-	f := &fakeAuthServer{}
+	f := &fakeAuthServer{mcpPath: "/mcp"}
 	f.ts = httptest.NewTLSServer(http.HandlerFunc(f.route))
 	t.Cleanup(f.ts.Close)
 	prev := newOAuthClient
@@ -67,7 +70,12 @@ func newFakeAuthServer(t *testing.T) *fakeAuthServer {
 }
 
 // mcpURL is the protected MCP endpoint a config would name.
-func (f *fakeAuthServer) mcpURL() string { return f.ts.URL + "/mcp" }
+func (f *fakeAuthServer) mcpURL() string { return f.ts.URL + f.mcpPath }
+
+// prmURL is where this fixture publishes its protected resource metadata.
+func (f *fakeAuthServer) prmURL() string {
+	return f.ts.URL + "/.well-known/oauth-protected-resource" + f.mcpPath
+}
 
 // issuer is the authorization server identifier this fixture publishes.
 func (f *fakeAuthServer) issuer() string { return f.ts.URL }
@@ -75,16 +83,16 @@ func (f *fakeAuthServer) issuer() string { return f.ts.URL }
 func (f *fakeAuthServer) route(w http.ResponseWriter, r *http.Request) {
 	base := f.ts.URL
 	switch r.URL.Path {
-	case "/mcp":
-		params := fmt.Sprintf("resource_metadata=%q", base+"/.well-known/oauth-protected-resource/mcp")
+	case f.mcpPath:
+		params := fmt.Sprintf("resource_metadata=%q", f.prmURL())
 		if f.challengeScope != "" {
 			params += fmt.Sprintf(", scope=%q", f.challengeScope)
 		}
 		w.Header().Set("WWW-Authenticate", "Bearer "+params)
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
-	case "/.well-known/oauth-protected-resource/mcp":
+	case "/.well-known/oauth-protected-resource" + f.mcpPath:
 		writeJSON(w, map[string]any{
-			"resource":              base + "/mcp",
+			"resource":              f.mcpURL(),
 			"authorization_servers": []string{base},
 			"scopes_supported":      f.prmScopes,
 		})
@@ -750,5 +758,86 @@ func TestSafeParam(t *testing.T) {
 	}
 	if got := safeParam(strings.Repeat("a", 200)); len(got) != 64 {
 		t.Errorf("safeParam did not clip: %d runes", len(got))
+	}
+}
+
+func TestPickAuthServer(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		servers []string
+		want    string
+	}{
+		{"single https", []string{"https://as.example"}, "https://as.example"},
+		// The SDK uses entry [0] unconditionally. Scanning past it for the
+		// first https entry would run our checks against a different server
+		// than the flow itself, so a plaintext [0] is a refusal, never a skip.
+		{"plaintext first", []string{"http://as.local", "https://as.example"}, ""},
+		{"relative", []string{"/authorize"}, ""},
+		{"empty", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := pickAuthServer(tc.servers)
+			if tc.want == "" {
+				if err == nil {
+					t.Fatalf("pickAuthServer(%v) = %q, want a refusal", tc.servers, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("pickAuthServer(%v): %v", tc.servers, err)
+			}
+			if got != tc.want {
+				t.Errorf("pickAuthServer(%v) = %q, want %q", tc.servers, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoginPersistsLiteralAuthResource(t *testing.T) {
+	f := newFakeAuthServer(t)
+	// A PRM that declares the resource WITH a trailing slash: it canonicalizes
+	// to the config url, but the authorization server binds the token to this
+	// literal string, so every later refresh must send it verbatim.
+	f.mcpPath = "/mcp/"
+	lf := newLoginFixture(t, f)
+	rec, err := lf.login(t)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	want := f.mcpURL()
+	if rec.AuthResource != want {
+		t.Errorf("AuthResource = %q, want %q", rec.AuthResource, want)
+	}
+	if got := f.lastTokenForm(t).Get("resource"); got != want {
+		t.Errorf("token exchange resource = %q, want %q", got, want)
+	}
+	canonical, err := oauthtoken.CanonicalResource(f.mcpURL())
+	if err != nil {
+		t.Fatalf("CanonicalResource: %v", err)
+	}
+	if rec.Resource != canonical {
+		t.Errorf("Resource = %q, want the canonical %q", rec.Resource, canonical)
+	}
+}
+
+func TestRefreshGrantSendsAuthResource(t *testing.T) {
+	as := newFakeAS(t, asReply{status: 200, body: `{"access_token":"at2","token_type":"Bearer","expires_in":3600}`})
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	rec := &oauthtoken.Record{
+		Version:       oauthtoken.Version,
+		Issuer:        as.ts.URL,
+		Resource:      "https://mcp.example/mcp",
+		AuthResource:  "https://mcp.example/mcp/",
+		ClientID:      "cid",
+		TokenEndpoint: as.tokenURL(),
+		AccessToken:   "at1",
+		RefreshToken:  "rt1",
+		ExpiresAt:     now,
+	}
+	if _, err := refreshGrant(context.Background(), as.ts.Client(), rec, rec.Resource, now); err != nil {
+		t.Fatalf("refreshGrant: %v", err)
+	}
+	if got := as.lastForm().Get("resource"); got != rec.AuthResource {
+		t.Errorf("refresh resource = %q, want the literal %q", got, rec.AuthResource)
 	}
 }

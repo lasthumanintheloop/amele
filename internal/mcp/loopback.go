@@ -58,6 +58,13 @@ type callbackResult struct {
 // favicon probe, a browser prefetch or a hostile GET from another process on
 // the box must not be able to make a login fail; the state comparison the SDK
 // performs afterwards is what makes a forged callback useless.
+//
+// SECURITY: the residual risk is denial of service only. Any local process
+// that guesses the port can send a structurally valid callback and consume the
+// single shot, which aborts the login (the SDK then rejects the mismatched
+// state); it can NEVER learn the real code, which goes to whoever holds the
+// browser. Doing better would mean comparing state here, and the SDK keeps the
+// state it generated private - so this layer cannot.
 type loopbackListener struct {
 	ln  net.Listener
 	srv *http.Server

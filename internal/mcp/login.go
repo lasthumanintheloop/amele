@@ -293,19 +293,26 @@ func prmCandidates(challenges []oauthex.Challenge, mcpURL string) []prmCandidate
 	return out
 }
 
-// pickAuthServer chooses among the authorization servers a PRM lists.
+// pickAuthServer resolves the authorization server a PRM points at.
 //
-// The choice is deterministic - the first https entry - because a login that
-// picked differently from one run to the next would file credentials under
-// changing keys.
+// It takes entry [0] and nothing else, because that is exactly what the SDK
+// does inside Authorize. Scanning past a non-https [0] for a usable entry
+// would be worse than useless: amele's PKCE, CIMD and issuer checks - and the
+// stored record - would describe one server while the flow itself ran against
+// another, so a login could report success while filing a credential no run
+// can ever use. A [0] that is not an absolute https URL is therefore a
+// refusal, not a skip.
 func pickAuthServer(servers []string) (string, error) {
-	for _, s := range servers {
-		u, err := url.Parse(s)
-		if err == nil && u.Scheme == "https" && u.Host != "" {
-			return s, nil
-		}
+	if len(servers) == 0 {
+		return "", errors.New("protected resource metadata lists no authorization server")
 	}
-	return "", errors.New("protected resource metadata lists no https authorization server")
+	first := servers[0]
+	u, err := url.Parse(first)
+	if err != nil || u.Scheme != "https" || u.Host == "" {
+		return "", fmt.Errorf("protected resource metadata names %s as its authorization server, which is not an absolute https url",
+			safeParam(first))
+	}
+	return first, nil
 }
 
 // checkDiscovery applies the refusals that must happen before a browser opens.
@@ -314,6 +321,12 @@ func checkDiscovery(disc *asDiscovery, cfg config.MCPServer, resource string) er
 	// which advertises nothing supports S256 anyway.
 	if !slices.Contains(disc.codeChallengeMethods, "S256") {
 		return fmt.Errorf("authorization server %s does not advertise S256 PKCE support", safeParam(disc.issuer))
+	}
+	// The endpoint is checked with the run path's own rule, at login time,
+	// while the operator is still watching: a credential whose token endpoint
+	// a run would refuse is not worth storing.
+	if err := checkTokenEndpoint(disc.tokenEndpoint); err != nil {
+		return fmt.Errorf("authorization server %s: %w", safeParam(disc.issuer), err)
 	}
 	if cfg.Auth.ClientID == "" && !disc.cimdSupported {
 		return fmt.Errorf("authorization server %s supports neither client id metadata documents nor anonymous clients; set auth.client_id for this server",
@@ -442,6 +455,11 @@ func (f *loginFlow) record(disc *asDiscovery, resource string, now time.Time) (*
 	if endpoint == "" {
 		endpoint = disc.tokenEndpoint
 	}
+	// The endpoint the exchange ACTUALLY used, re-checked: checkDiscovery saw
+	// the advertised one, and these must not be allowed to diverge.
+	if err := checkTokenEndpoint(endpoint); err != nil {
+		return nil, fmt.Errorf("token endpoint: %w", err)
+	}
 	expiry := tok.Expiry
 	if expiry.IsZero() {
 		// RFC 6749 makes expires_in optional. An unknown lifetime is treated
@@ -454,10 +472,14 @@ func (f *loginFlow) record(disc *asDiscovery, resource string, now time.Time) (*
 		Resource:      resource,
 		ClientID:      f.clientID,
 		TokenEndpoint: endpoint,
-		AccessToken:   tok.AccessToken,
-		RefreshToken:  tok.RefreshToken,
-		ExpiresAt:     expiry,
-		Scopes:        grantedScopes(tok, f.requested),
+		// Verbatim, not canonicalized: this is the literal string the
+		// authorization server bound the token to, and every refresh has to
+		// send it back byte for byte.
+		AuthResource: disc.resource,
+		AccessToken:  tok.AccessToken,
+		RefreshToken: tok.RefreshToken,
+		ExpiresAt:    expiry,
+		Scopes:       grantedScopes(tok, f.requested),
 	}, nil
 }
 
