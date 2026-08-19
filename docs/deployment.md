@@ -84,6 +84,7 @@ WorkingDirectory=/srv/myapp
 EnvironmentFile=/etc/amele/log-sentry.env
 ExecStart=/usr/local/bin/amele run /srv/myapp/log-sentry/ "daily log triage"
 TimeoutStartSec=310
+KillMode=control-group
 ```
 
 `/etc/systemd/system/amele-agent.timer`:
@@ -125,6 +126,14 @@ Notes on the fields that matter:
   amele-agent.service` or an operator's Ctrl-C. systemd then reports the unit
   as failed (a oneshot service exiting non-zero is a failure), which shows up
   in `systemctl status` and can drive `OnFailure=` alerting.
+- **`KillMode=control-group`** (systemd's default, but write it down once an
+  agent spawns children) makes systemd kill everything in the unit's cgroup,
+  not just the main process. amele already kills a `stdio` MCP server as a
+  process group at the end of every run, including on SIGTERM
+  ([docs/mcp.md](mcp.md#failure-semantics)) - but an amele that is itself
+  SIGKILLed never runs that cleanup, and its grandchildren would survive. The
+  cgroup is the only thing that reliably reaps them. `KillMode=process` on a
+  unit that runs MCP servers leaks a process per run.
 - **`OnCalendar=*-*-* 03:00:00`** is systemd's calendar syntax for "every
   day at 03:00"; `Persistent=true` means a run that was missed because the
   machine was off at 03:00 fires once at the next boot instead of being

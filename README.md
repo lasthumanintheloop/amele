@@ -30,7 +30,7 @@ no Python · no Node · no platform · no account
   language already speaks. Nobody has to write Go.
 - **For everyone.** If you can edit a config file, you can author an agent.
   Nothing to install around it, nobody to sign up with.
-- **Zero dependencies, runs everywhere.** One static ~7.5 MB binary; the
+- **Zero dependencies, runs everywhere.** One static ~9.3 MB binary; the
   answer to `pip install` is `scp`.
 - **A well-mannered process.** Meaningful exit codes, schema-guaranteed JSON
   on stdout, one JSONL log per run - your scripts get a contract, not a
@@ -229,6 +229,14 @@ questions as an agent tool, six YAML lines later:
 
 ![a 2007 Perl CLI called live as an agent tool](docs/demos/perltool.gif)
 
+**Or borrow someone else's tools.** amele is an MCP client: declare the
+servers in the same YAML - `stdio` (a local binary) or Streamable HTTP with
+static header auth - and their tools join the registry under the same
+permissions, budgets and session log, named `<server>__<tool>`. The toolset is
+frozen for the run, a missing `required` server is exit 8 rather than a
+half-equipped agent, and `amele explain` connects and shows you exactly what a
+server would contribute before you run it: [docs/mcp.md](docs/mcp.md).
+
 More demos: [build an agent in 40 seconds](docs/demos/d1-build.gif) ·
 [the full pipe demo](docs/demos/pipe.gif) ·
 [it fails like a program - exit 2, 3, 7](docs/demos/failmodes.gif) ·
@@ -263,8 +271,8 @@ No GUI, no embedded vector store, no workflow DSL, no plugin system, no
 scheduler, no multi-tenant server. amele does one thing: run one agent from
 one file, well, unattended. Everything else composes from the outside - your
 scheduler schedules, your shell pipes, and new capabilities arrive as
-subprocess tools in the language of your choice (with MCP as the planned
-second road), not as core features.
+subprocess tools in the language of your choice, or as MCP servers amele
+connects to, not as core features.
 
 ## Roadmap
 
@@ -272,8 +280,9 @@ Direction, not dates. Details and discussion live in
 [issues](https://github.com/lasthumanintheloop/amele/issues) and
 [milestones](https://github.com/lasthumanintheloop/amele/milestones).
 
-- **v0.2 - connected and fast.** MCP client (stdio first); parallel tool
-  calls within a turn; sampling parameters (`temperature`, `top_p`) and a
+- **v0.2 - connected and fast.** MCP client - **done**: stdio and Streamable
+  HTTP with static header auth ([docs/mcp.md](docs/mcp.md)); OAuth is next.
+  Then: parallel tool calls within a turn; sampling parameters (`temperature`, `top_p`) and a
   provider-normalized `reasoning` setting (effort / thinking budget) that
   survives tool loops across OpenAI, Anthropic, DeepSeek and OpenRouter;
   configurable retry policy.
@@ -353,6 +362,7 @@ changes require a semver major and a migration note.
 | 5 | provider/network error, retries exhausted |
 | 6 | output schema unmet |
 | 7 | run lock held by another run |
+| 8 | a required MCP server was unavailable |
 
 ## Install
 

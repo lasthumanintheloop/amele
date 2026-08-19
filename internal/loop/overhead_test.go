@@ -12,6 +12,10 @@ import (
 // overhead (docs/engineering.md §8): the total size of all builtin tool definitions.
 // The estimate is chars/4 - crude but stable, and it only needs to catch
 // definitions bloating over time, not be exact.
+// Subprocess and MCP tool definitions are deliberately NOT counted here: they
+// are the operator's own budget, chosen per config, and `amele explain` reports
+// their size (with a warning past ~4000 tokens) - this ceiling governs only what
+// the harness itself injects into every context, whatever the config says.
 const harnessTokenBudget = 1500
 
 // TestBuiltinToolDefinitionBudget guards the "measured minimalism" promise:

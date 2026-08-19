@@ -1,0 +1,58 @@
+# mcp-filesystem: borrowing tools from an MCP server.
+#
+# The agent answers questions about a directory using an MCP filesystem
+# server's tools instead of amele's builtin fs tools - the smallest honest
+# demonstration of `mcp.servers`:
+#
+#   amele explain mcp-filesystem/           # what would this connect to?
+#   amele run mcp-filesystem/ "what changed in the notes last week?"
+#
+# Requires: AMELE_API_KEY (a key for the endpoint in base_url below) and an
+# MCP filesystem server installed at the path in transport.command - see
+# README.md. Full documentation: docs/mcp.md.
+
+model: gpt-4.1-mini
+provider:
+  base_url: https://api.openai.com/v1
+  api_key: ${AMELE_API_KEY}
+
+system_prompt: |
+  You answer questions about the files in the directory the "files" MCP
+  server exposes. Use its tools to look; never guess at content you have
+  not read. Answer in plain text, quoting the paths you relied on.
+
+tools:
+  fs: false          # the MCP server is the only way to the filesystem here
+
+mcp:
+  servers:
+    - name: files
+      transport:
+        type: stdio
+        # SECURITY: a pinned, preinstalled binary with an absolute path. Never
+        # `npx -y ...` in production: that resolves a version at run time, so
+        # the code inside the agent's trust boundary changes without a deploy
+        # (docs/mcp.md, "Production guidance").
+        command: ["/usr/local/bin/mcp-server-filesystem", "${AMELE_MCP_ROOT}"]
+        # An empty allowlist would already mean the minimal environment
+        # (PATH/HOME/LANG). TZ is named so the server timestamps in local
+        # time; the provider API key is deliberately not on this list.
+        env: ["TZ"]
+      tools:
+        # Read-only by construction: the write tools are never offered to the
+        # model, so no permission decision depends on it behaving.
+        include: ["read_*", "list_*", "search_*", "directory_*", "get_file_info"]
+      call_timeout: 30s
+      required: true
+
+permissions:
+  default: ask
+  tools:
+    "files__*": allow   # every tool that survived the include filter is a read
+
+limits:
+  max_turns: 12
+  max_tokens: 120000
+  timeout: 3m
+
+session_dir: ./sessions

@@ -10,6 +10,7 @@ Exit codes are unchanged and frozen
 ```
 0 success · 1 task failed · 2 config error · 3 budget exceeded
 4 permission denied · 5 provider error · 6 output schema unmet
+7 run lock held · 8 required MCP server unavailable
 ```
 
 ## Structured output (`output.schema`)
@@ -107,6 +108,10 @@ permissions:
     "github__*": ask      # every tool of the github server
     "*_delete*": deny     # ...except deleting anything, ever
 ```
+
+The `<server>__<tool>` names come from MCP servers declared in the same file;
+[docs/mcp.md](mcp.md) covers connecting them, and why a server's own
+`destructiveHint` annotation is shown to you but never changes a ruling.
 
 **TTY fail-safe (headless-first):** when stdin is not a terminal - cron, CI, a
 pipe - `ask` degrades to `deny` automatically and the reason is logged to
