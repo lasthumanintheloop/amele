@@ -1750,7 +1750,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// on a terminal, and readPipedInput never reads a terminal).
 	lines := newLineReader(stdin)
 
-	release, startCode := startRun(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet)
+	release, startCode := startRun(ctx, cfg, validator, parsed, taskArgs, lines, stderr, env, secrets)
 	if startCode != ExitOK {
 		return startCode
 	}
@@ -1943,22 +1943,66 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 // server are not the agent's budget.
 //
 // It returns the lock's release function and ExitOK, or nil and the exit code
-// to return - having already released the lock and reported the reason.
-func startRun(ctx context.Context, cfg *config.Config, cfgPath string, lines *lineReader,
-	stderr io.Writer, env config.LookupEnv, secrets *session.SecretSet, quiet bool) (func(), int) {
-	release, code := acquireRunLock(cfg, cfgPath, stderr)
+// to return - having already released the lock and left the run's evidence.
+func startRun(ctx context.Context, cfg *config.Config, validator *schema.Validator, parsed agentArgs,
+	taskArgs string, lines *lineReader, stderr io.Writer, env config.LookupEnv,
+	secrets *session.SecretSet) (func(), int) {
+	release, code := acquireRunLock(cfg, parsed.configPath, stderr)
 	if code != ExitOK {
 		return nil, code
 	}
-	if err := mcpCredentialGate(ctx, cfg, cfgPath, lines, stderr, env, secrets, quiet); err != nil {
+	if err := mcpCredentialGate(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet); err != nil {
 		// The lock is dropped here rather than by the caller: the run never
 		// started, and a config whose credential is missing must not keep the
 		// next attempt out while the operator logs in.
-		release()
-		_, _ = fmt.Fprintln(stderr, secrets.Redact(err.Error()))
-		return nil, exitCodeFor(err)
+		defer release()
+		return nil, reportGateFailure(cfg, validator, parsed, taskArgs, err, lines, stderr, secrets)
 	}
 	return release, ExitOK
+}
+
+// reportGateFailure ends a run that the OAuth phase refused, leaving exactly
+// the evidence a connect failure would have left.
+//
+// CONTRACT (docs/contracts/jsonl-events.md): an exit-8 run writes run_start and
+// run_end with mcp_errors, whether the missing dependency was discovered by the
+// pre-connect phase or by the connect itself. Without this the credential gate
+// would be the one silent failure in the binary - the same reason
+// reportInterruptedRead exists for a run interrupted while reading stdin.
+//
+// The session is opened HERE, after the refusal: building the agent is what
+// creates the session file, and a run that is about to be refused must not
+// leave one behind unless it also leaves the ending that explains it.
+func reportGateFailure(cfg *config.Config, validator *schema.Validator, parsed agentArgs, taskArgs string,
+	gateErr error, lines *lineReader, stderr io.Writer, secrets *session.SecretSet) int {
+	code := exitCodeFor(gateErr)
+	agent, _, _, err := buildAgent(cfg, validator, lines, stderr, secrets)
+	if err != nil {
+		// No session could be opened at all (a bad session_dir, a broken tool
+		// definition). Both failures are reported: the one that ended the run
+		// first, then the one that stopped it being recorded.
+		_, _ = fmt.Fprintln(stderr, secrets.Redact(gateErr.Error()))
+		_, _ = fmt.Fprintln(stderr, err)
+		return ExitConfigError
+	}
+	// The task recorded is what the operator typed: nothing was rendered, and
+	// stdin was never read.
+	agent.Session.RunStart(cfg.Model, taskArgs)
+	agent.Session.SetMCPErrors(gateMCPErrors(gateErr))
+	// Zero accounting: nothing was spent, and the summary must not invent turns.
+	reportRun(agent, &loop.Result{}, gateErr, code, validator != nil, parsed.quiet, stderr, secrets.Redact)
+	return code
+}
+
+// gateMCPErrors counts what the OAuth phase cost the run: the one declared
+// dependency it could not equip. An INTERRUPTED phase counts nothing - a
+// SIGTERM is not a server's unavailability, the same rule connectFailed
+// applies.
+func gateMCPErrors(gateErr error) int {
+	if errors.Is(gateErr, mcp.ErrUnavailable) {
+		return 1
+	}
+	return 0
 }
 
 // acquireRunLock enforces the single-flight contract of `lock: true`. It
@@ -2072,15 +2116,6 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	// ONE registry for the whole conversation (see runSecrets).
 	secrets := runSecrets(cfg)
 
-	// The same pre-connect OAuth phase `run` applies, for the same reason: a
-	// conversation whose tools never came up would mislead the human at the
-	// keyboard for its whole length, and the question belongs before the REPL
-	// rather than in the middle of it.
-	if err := mcpCredentialGate(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet); err != nil {
-		_, _ = fmt.Fprintln(stderr, secrets.Redact(err.Error()))
-		return exitCodeFor(err)
-	}
-
 	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr, secrets)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
@@ -2088,6 +2123,19 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	}
 	if parsed.verbose {
 		agent.Progress = progressLogger(stderr, secrets)
+	}
+
+	// The same pre-connect OAuth phase `run` applies, in the same place - before
+	// run_start - and for the same reason: a conversation whose tools never
+	// came up would mislead the human at the keyboard for its whole length,
+	// and the question belongs before the REPL rather than in the middle of
+	// it. A refusal still ends through the normal path, so a chat that never
+	// opened is as auditable as a run that never started.
+	if gateErr := mcpCredentialGate(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet); gateErr != nil {
+		agent.Session.RunStart(cfg.Model, chatTaskLabel)
+		s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet,
+			mcp: &mcpSet{failed: gateMCPErrors(gateErr)}, runCtx: ctx, secrets: secrets}
+		return s.finish(stderr, exitCodeFor(gateErr), gateErr)
 	}
 
 	// A chat writes ONE run_start for the whole session, and the MCP servers

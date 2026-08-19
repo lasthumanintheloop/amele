@@ -834,11 +834,56 @@ func TestRunOAuthNoTokenHeadlessExit8(t *testing.T) {
 	if !strings.Contains(stderr, "amele mcp login "+cfgPath+" github") {
 		t.Errorf("stderr does not name the login command: %q", stderr)
 	}
-	// The gate runs before run_start by contract, so a run that never started
-	// leaves no session behind.
-	files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
-	if len(files) != 0 {
-		t.Errorf("session written for a run that never started: %v", files)
+	// The gate ends the run BEFORE the loop, but not before the audit trail:
+	// an exit-8 run leaves the same evidence whether the credential was
+	// missing here or the connect failed later - run_start, run_end, and the
+	// one missing dependency counted exactly once.
+	events := readSessionEvents(t, dir)
+	if events[0].Type != "run_start" {
+		t.Fatalf("first event: %+v", events[0])
+	}
+	last := events[len(events)-1]
+	if last.Type != "run_end" || last.ExitCode == nil || *last.ExitCode != ExitMCPUnavailable {
+		t.Fatalf("run_end: %+v", last)
+	}
+	if last.MCPErrors != 1 {
+		t.Errorf("run_end.mcp_errors = %d, want 1", last.MCPErrors)
+	}
+}
+
+// TestRunOAuthLoginTimeIsNotTheRunBudget pins the ordering the phase exists
+// for: the `limits.timeout` clock starts AFTER the login phase returns, so the
+// minutes a human spends at an authorization server can never be charged to
+// the agent. A login slower than the whole budget must still leave a run that
+// runs.
+func TestRunOAuthLoginTimeIsNotTheRunBudget(t *testing.T) {
+	fakeTTY(t, true)
+	mcpSrv := bearerMCPServer(t, "seeded-access-1")
+	llm := scriptedServer(t, textBody("done"))
+	stateDir := t.TempDir()
+	cfgPath, _ := writeTestConfig(t, llm.URL,
+		"limits:\n  timeout: 1s\n"+oauthServerYAML("github", mcpSrv.URL, "true"))
+
+	prev := loginToServer
+	loginToServer = func(_ context.Context, s config.MCPServer, _ mcp.Deps, _ mcp.LoginOptions) (*oauthtoken.Record, error) {
+		// Longer than the whole run budget: if the deadline were armed before
+		// the phase, everything after this would already be cancelled.
+		time.Sleep(1500 * time.Millisecond)
+		seedOAuthRecord(t, stateDir, s.Transport.URL, nil)
+		return &oauthtoken.Record{ExpiresAt: time.Now().Add(time.Hour)}, nil
+	}
+	t.Cleanup(func() { loginToServer = prev })
+
+	start := time.Now()
+	code, stdout, stderr := mcpCLI(t, stateDir, []string{"run", cfgPath, "task"}, "y\n")
+	if code != ExitOK {
+		t.Fatalf("exit %d (budget exceeded is %d), stderr: %s", code, ExitBudgetExceeded, stderr)
+	}
+	if stdout != "done\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if elapsed := time.Since(start); elapsed < 1500*time.Millisecond {
+		t.Fatalf("the slow login did not actually happen (elapsed %s)", elapsed)
 	}
 }
 
@@ -989,8 +1034,8 @@ func TestRunOAuthPromptAcceptsAndLogsIn(t *testing.T) {
 // never opens when a required server has no credential.
 func TestChatOAuthSameGate(t *testing.T) {
 	srv := scriptedServer(t)
-	cfgPath, _ := writeTestConfig(t, srv.URL,
-		oauthServerYAML("github", "https://mcp.example/mcp", "true"))
+	cfgPath, dir := writeTestConfig(t, srv.URL,
+		"session_dir: sessions\n"+oauthServerYAML("github", "https://mcp.example/mcp", "true"))
 
 	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"chat", cfgPath}, "hello\n")
 	if code != ExitMCPUnavailable {
@@ -1001,5 +1046,15 @@ func TestChatOAuthSameGate(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "amele mcp login "+cfgPath+" github") {
 		t.Errorf("stderr does not name the login command: %q", stderr)
+	}
+	// Same audit trail as `run`: the conversation that never opened is still
+	// a session with an ending.
+	events := readSessionEvents(t, dir)
+	last := events[len(events)-1]
+	if events[0].Type != "run_start" || last.Type != "run_end" {
+		t.Fatalf("events: %+v", events)
+	}
+	if last.ExitCode == nil || *last.ExitCode != ExitMCPUnavailable || last.MCPErrors != 1 {
+		t.Fatalf("run_end: %+v", last)
 	}
 }
