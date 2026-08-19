@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -645,5 +646,214 @@ func TestApplyTokenResponse(t *testing.T) {
 	}
 	if !got.ExpiresAt.Equal(now.Add(defaultTokenLifetime)) {
 		t.Errorf("expiry = %v, want now+%v", got.ExpiresAt, defaultTokenLifetime)
+	}
+}
+
+func TestConnectStopsAfterTerminalAuthDenial(t *testing.T) {
+	var attempts int
+	useTransport(t, func(context.Context, config.MCPServer, Deps) (sdk.Transport, func(), error) {
+		attempts++
+		return nil, nil, fmt.Errorf("%w: refresh token rejected", errAuthDenied)
+	})
+	as := newFakeAS(t, asReply{status: 400, body: `{"error":"invalid_grant"}`})
+	f := newOAuthFixture(t, as, time.Hour)
+
+	if _, err := Connect(context.Background(), f.cfg(), f.deps()); err == nil {
+		t.Fatal("Connect succeeded on a terminal auth denial")
+	}
+	if attempts != 1 {
+		t.Errorf("connect attempts = %d, want 1: a refused credential fails identically on every retry", attempts)
+	}
+}
+
+func TestForcedRefreshRepeatedIsAuthDeath(t *testing.T) {
+	// The token endpoint always answers; the MCP server is the one refusing
+	// (a 403 on a token whose scopes do not cover the tool).
+	as := newFakeAS(t,
+		asReply{status: 200, body: okBody("at2", "rt2", 3600)},
+		asReply{status: 200, body: okBody("at3", "rt3", 3600)},
+	)
+	f := newOAuthFixture(t, as, time.Hour)
+	h := f.handler(t)
+
+	forbid := func(token string) error {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, oauthResource, nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		return h.Authorize(context.Background(), req, &http.Response{StatusCode: http.StatusForbidden, Body: http.NoBody})
+	}
+
+	// Call 1: the token is valid, the server refuses it anyway; one forced
+	// refresh is fair.
+	tok, err := tokenOf(t, h)
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if err := forbid(tok); err != nil {
+		t.Fatalf("first Authorize: %v", err)
+	}
+	if n := as.count(); n != 1 {
+		t.Fatalf("token endpoint hit %d times, want 1", n)
+	}
+	// Call 2: the freshly refreshed token is refused too. Refreshing again
+	// would rotate the credential once per tool call for the rest of the run.
+	tok, err = tokenOf(t, h)
+	if err != nil {
+		t.Fatalf("second Token: %v", err)
+	}
+	if err := forbid(tok); err == nil {
+		t.Fatal("second Authorize succeeded on a server that keeps refusing")
+	}
+	if n := as.count(); n != 1 {
+		t.Errorf("token endpoint hit %d times, want no second refresh", n)
+	}
+	if len(f.dead) != 1 {
+		t.Errorf("onDead called %d times, want 1", len(f.dead))
+	}
+	if _, err := tokenOf(t, h); err == nil {
+		t.Error("Token succeeded after the death")
+	}
+}
+
+func TestStringExpiresInAccepted(t *testing.T) {
+	as := newFakeAS(t, asReply{status: 200,
+		body: `{"access_token":"at2","refresh_token":"rt2","token_type":"Bearer","expires_in":"3600"}`})
+	f := newOAuthFixture(t, as, -time.Minute)
+	h := f.handler(t)
+
+	got, err := tokenOf(t, h)
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if got != "at2" {
+		t.Errorf("access token = %q, want at2", got)
+	}
+	rec, err := f.store.Load(f.key)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if rec.RefreshToken != "rt2" {
+		t.Errorf("refresh token = %q, want the rotated rt2 persisted", rec.RefreshToken)
+	}
+	if want := f.now.Add(time.Hour); !rec.ExpiresAt.Equal(want) {
+		t.Errorf("expiry = %v, want %v", rec.ExpiresAt, want)
+	}
+}
+
+func TestInvalidGrantAdoptsRefreshOnlyRotation(t *testing.T) {
+	as := newFakeAS(t, asReply{status: 400, body: `{"error":"invalid_grant"}`})
+	f := newOAuthFixture(t, as, -time.Minute)
+	h := f.handler(t)
+	// The other process rotated ONLY the refresh token (an authorization
+	// server may hand back the same access token) and pushed the expiry out.
+	as.hook = func(int) { f.save(t, "at1", "rt7", time.Hour) }
+
+	if _, err := tokenOf(t, h); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if len(f.dead) != 0 {
+		t.Errorf("credential declared dead despite a concurrent rotation: %v", f.dead)
+	}
+}
+
+func TestTokenSourceTerminalFailureSetsAuthDead(t *testing.T) {
+	as := newFakeAS(t, asReply{status: 400, body: `{"error":"invalid_grant"}`})
+	f := newOAuthFixture(t, as, -time.Minute)
+	h := f.handler(t)
+
+	// A terminal failure that never produced a 401 (the request was never
+	// sent) must still end this run's authorization, or every call would
+	// re-POST a doomed refresh.
+	if _, err := tokenOf(t, h); err == nil {
+		t.Fatal("Token succeeded on a stable invalid_grant")
+	}
+	if len(f.dead) != 1 {
+		t.Fatalf("onDead called %d times, want 1", len(f.dead))
+	}
+	if _, err := tokenOf(t, h); err == nil {
+		t.Fatal("second Token succeeded after the death")
+	}
+	if n := as.count(); n != 1 {
+		t.Errorf("token endpoint hit %d times, want 1", n)
+	}
+}
+
+func TestOAuthClientRefusesRedirect(t *testing.T) {
+	// SECURITY: the refresh token travels in the request body; a redirect
+	// would replay it to a location the stored token endpoint never named.
+	if err := newOAuthHTTPClient().CheckRedirect(nil, nil); err == nil {
+		t.Error("the token endpoint client follows redirects")
+	}
+}
+
+func TestAuthDeathDuringReconnectCountsOnce(t *testing.T) {
+	inner := (&fakeConn{defs: callToolset()}).factory()
+	var calls int
+	useTransport(t, func(ctx context.Context, cfg config.MCPServer, deps Deps) (sdk.Transport, func(), error) {
+		calls++
+		if calls == 1 {
+			return inner(ctx, cfg, deps)
+		}
+		// What the OAuth handler does when the refresh is refused mid-run.
+		err := fmt.Errorf("%w: refresh token rejected", errAuthDenied)
+		if deps.authFailed != nil {
+			deps.authFailed(err)
+		}
+		return nil, nil, err
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	srv, err := Connect(ctx, testCfg("s", config.MCPToolFilter{}), testDeps(nil))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	t.Cleanup(func() { _ = srv.Close(context.Background()) })
+
+	// The session is condemned directly rather than through a dropped fake
+	// connection: what this test is about starts at the RECONNECT, and driving
+	// a real lost response first would make it depend on the scheduler.
+	srv.mu.Lock()
+	sess := srv.sess
+	srv.mu.Unlock()
+	srv.markDead(sess)
+	srv.countError() // the lost response that condemned the session
+	if got := srv.Errors(); got != 1 {
+		t.Fatalf("Errors() = %d after the loss, want 1", got)
+	}
+	// The reconnect fails on a refused credential: ONE event, one count.
+	if _, _, err := toolNamed(t, srv, "s__echo").InvokeOutcome(context.Background(), `{"text":"x"}`); err == nil {
+		t.Fatal("call succeeded after a refused credential")
+	}
+	if got := srv.Errors(); got != 2 {
+		t.Errorf("Errors() = %d, want 2 (the lost response plus one death)", got)
+	}
+	if srv.authDeadErr() == nil {
+		t.Error("the server was not marked auth-dead")
+	}
+}
+
+func TestFlexIntAcceptsTheSpellingsServersSend(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want flexInt
+	}{
+		{raw: `3600`, want: 3600},
+		{raw: `"3600"`, want: 3600},
+		{raw: `3599.5`, want: 3599},
+		{raw: `null`, want: 0},
+		{raw: `"soon"`, want: 0},
+		{raw: `""`, want: 0},
+	}
+	for _, tc := range tests {
+		var got flexInt
+		if err := json.Unmarshal([]byte(tc.raw), &got); err != nil {
+			t.Errorf("Unmarshal(%s): %v", tc.raw, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("Unmarshal(%s) = %d, want %d", tc.raw, got, tc.want)
+		}
 	}
 }

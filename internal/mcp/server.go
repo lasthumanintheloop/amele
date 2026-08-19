@@ -308,8 +308,13 @@ func Connect(ctx context.Context, cfg config.MCPServer, deps Deps) (*Server, err
 			return s, nil
 		}
 		lastErr = err
-		if errors.Is(err, ErrToolset) {
-			break // static problem: another attempt would fail identically
+		if errors.Is(err, ErrToolset) || errors.Is(err, errAuthDenied) {
+			// Static problems: another attempt would fail identically. A
+			// refused credential (an empty store, a client_id nothing was
+			// logged in under, a refresh token the server rejects) is as
+			// static as a name collision - retrying only costs the run a
+			// second doomed token POST and a jittered pause.
+			break
 		}
 	}
 
@@ -706,6 +711,19 @@ func (s *Server) authDeadErr() error {
 	return s.authDead
 }
 
+// countErrorFor counts one failure unless the auth-death path already counted
+// it: an OAuth handler that condemns the credential DURING a reconnect calls
+// markAuthDead, and counting the same event twice would report two missing
+// dependencies in run_end.mcp_errors where an operator lost exactly one.
+func (s *Server) countErrorFor(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.authDead != nil && errors.Is(err, errAuthDenied) {
+		return
+	}
+	s.errCount++
+}
+
 // markDead records that sess is unusable, so the next call reconnects. The
 // pointer comparison matters: a call that lost its response on the OLD session
 // must not condemn a session another goroutine has already replaced.
@@ -816,7 +834,7 @@ func (s *Server) reconnect(ctx context.Context) error {
 		if errors.Is(err, errClosed) || ctx.Err() != nil {
 			return err
 		}
-		s.countError()
+		s.countErrorFor(err)
 		s.deps.Observer.ConnectFailed(s.cfg.Name, s.cfg.Transport.Type, classify(err), err, s.deps.Clock().Sub(start))
 		return err
 	}
@@ -989,6 +1007,15 @@ func isConnectionLoss(err error) bool {
 		return false
 	}
 	if errors.Is(err, sdk.ErrConnectionClosed) || errors.Is(err, sdk.ErrSessionMissing) {
+		return true
+	}
+	// A pipe torn down under the call. Which of the two errors surfaces is a
+	// race between the SDK noticing the closed connection and the write
+	// failing, so both must mean the same thing to the model - otherwise one
+	// lost response is reported as an indeterminate outcome and the next as a
+	// plain tool error, and a side effect that MAY have happened would look
+	// like one that certainly did not.
+	if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, fs.ErrClosed) {
 		return true
 	}
 	return isNetworkError(err) || IsMessageTooLarge(err)

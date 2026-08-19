@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"iter"
 	"net/http"
 	"net/http/httptest"
@@ -341,5 +342,18 @@ func TestStdioStderrUncapped(t *testing.T) {
 	// completed it has been relayed in full.
 	if got := buf.Len(); got < banner {
 		t.Errorf("captured %d stderr bytes, want at least %d (inner cap resurrected?)", got, banner)
+	}
+}
+
+// TestClosedPipeIsConnectionLoss: the two errors a transport torn down under a
+// call can produce mean the same thing. Which one surfaces is a race, and the
+// drop-based tests above flaked on it (a tool_error instead of the
+// indeterminate outcome the contract promises for a possibly-delivered
+// request).
+func TestClosedPipeIsConnectionLoss(t *testing.T) {
+	for _, err := range []error{io.ErrClosedPipe, fs.ErrClosed} {
+		if !isConnectionLoss(fmt.Errorf(`calling "tools/call": %w`, err)) {
+			t.Errorf("isConnectionLoss(%v) = false, want true", err)
+		}
 	}
 }

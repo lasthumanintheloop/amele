@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -140,7 +141,11 @@ type runOAuthHandler struct {
 	// across the lock is deliberate: it makes in-process refreshes
 	// single-flight, so a turn with eight parallel tool calls performs one
 	// refresh rather than eight that would each rotate the previous one's
-	// refresh token.
+	// refresh token. The cost is stated plainly: the context captured by the
+	// token source is the CONNECTION's, not one call's, so a foreign process
+	// wedged on the credential lock blocks this server's calls until the run
+	// itself ends. Only the token POST carries a bound of its own
+	// (refreshTimeout).
 	mu sync.Mutex
 	// rec is the credential this handler last served or adopted.
 	rec *oauthtoken.Record
@@ -150,6 +155,9 @@ type runOAuthHandler struct {
 	// lastAccess and lastRefresh are the values already handed to register;
 	// the secret set has no de-duplication, so a token is registered once.
 	lastAccess, lastRefresh string
+	// lastForced is the access token the previous FORCED refresh produced. It
+	// damps the 403 loop: see token.
+	lastForced string
 }
 
 // Compile-time proof that the handler is what the SDK transport accepts. The
@@ -332,6 +340,18 @@ func (h *runOAuthHandler) token(ctx context.Context, force bool, rejected string
 	if h.authDead != nil {
 		return nil, h.authDead
 	}
+	if force && h.lastForced != "" && h.rec != nil && h.rec.AccessToken == h.lastForced {
+		// The previous 401/403 already bought a forced refresh, and the token
+		// it produced is the one the server is now refusing again. Refreshing
+		// a second time would not change the answer - a 403 on a token whose
+		// scopes do not cover the tool never will - and the SDK calls
+		// Authorize on EVERY refused call, so an undamped forced path would
+		// rotate the credential once per tool call for the rest of the run.
+		// This is where that becomes auth death instead.
+		err := fmt.Errorf("%w: the server refused the token this run refreshed for it (scopes?)%s", errAuthDenied, loginHint)
+		h.die(err)
+		return nil, err
+	}
 	if !force && h.rec != nil && h.rec.Fresh(h.store.Now(), h.margin) {
 		return bearer(h.rec), nil
 	}
@@ -349,6 +369,9 @@ func (h *runOAuthHandler) token(ctx context.Context, force bool, rejected string
 		return nil, err
 	}
 	h.adopt(next)
+	if force {
+		h.lastForced = next.AccessToken
+	}
 	return bearer(next), nil
 }
 
@@ -383,11 +406,22 @@ func (h *runOAuthHandler) refreshLocked(ctx context.Context, cur *oauthtoken.Rec
 		// this call's read and its POST, in which case the refresh token amele
 		// just sent was merely the OLD one. The record is never deleted here;
 		// that is `amele mcp logout`'s job.
-		if again, lerr := h.store.Load(h.key); lerr == nil && again.AccessToken != cur.AccessToken {
+		if again, lerr := h.store.Load(h.key); lerr == nil && rotated(cur, again) {
 			return again, nil
 		}
 	}
 	return nil, err
+}
+
+// rotated reports whether next is a different credential from cur.
+//
+// Both halves count: an authorization server may hand back the SAME access
+// token with a fresh refresh token, and treating that as "nothing changed"
+// would condemn a credential a concurrent process had just rescued.
+func rotated(cur, next *oauthtoken.Record) bool {
+	return next.AccessToken != cur.AccessToken ||
+		next.RefreshToken != cur.RefreshToken ||
+		!next.ExpiresAt.Equal(cur.ExpiresAt)
 }
 
 // die records the terminal verdict and tells the Server once.
@@ -434,11 +468,42 @@ func bearer(rec *oauthtoken.Record) *oauth2.Token {
 // tokenResponse is the RFC 6749 §5.1 success body. Unknown fields are ignored:
 // authorization servers routinely add their own.
 type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int64  `json:"expires_in"`
-	RefreshToken string `json:"refresh_token"`
-	Scope        string `json:"scope"`
+	AccessToken  string  `json:"access_token"`
+	TokenType    string  `json:"token_type"`
+	ExpiresIn    flexInt `json:"expires_in"`
+	RefreshToken string  `json:"refresh_token"`
+	Scope        string  `json:"scope"`
+}
+
+// flexInt is an integer that also accepts the quoted spelling.
+//
+// RFC 6749 says expires_in is a number, and plenty of authorization servers
+// send `"3600"` anyway. Refusing those responses would be principled and
+// useless: the whole body - including a ROTATED refresh token - would be
+// thrown away on every attempt, so a working credential would be poisoned by
+// one non-compliant field. An unusable value falls back to 0, which the
+// caller reads as "lifetime unknown" and turns into defaultTokenLifetime.
+type flexInt int64
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (f *flexInt) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		// A float ("3599.5") or nonsense: unknown lifetime, not a failure.
+		if v, ferr := strconv.ParseFloat(s, 64); ferr == nil && v > 0 {
+			*f = flexInt(v)
+			return nil
+		}
+		*f = 0
+		return nil
+	}
+	*f = flexInt(n)
+	return nil
 }
 
 // refreshGrant performs one RFC 6749 §6 refresh and returns the updated record.
@@ -506,11 +571,15 @@ func refreshGrant(ctx context.Context, client *http.Client, rec *oauthtoken.Reco
 // applyTokenResponse folds a successful token response into a new record.
 func applyTokenResponse(rec *oauthtoken.Record, body []byte, now time.Time) (*oauthtoken.Record, error) {
 	var tr tokenResponse
-	if err := json.Unmarshal(body, &tr); err != nil || tr.AccessToken == "" {
-		// A 200 that is not a token response proves nothing about the
-		// credential - a captive portal or a misrouted proxy answers exactly
-		// like this - so it must not kill it.
+	// The two failures are reported apart on purpose: a body that is not JSON
+	// at all is a captive portal or a misrouted proxy, while a JSON object
+	// without an access_token is an authorization server answering oddly.
+	// Neither proves the credential is bad, so both are transient.
+	if err := json.Unmarshal(body, &tr); err != nil {
 		return nil, fmt.Errorf("%w: token endpoint returned a body that is not a token response", errTransientAuth)
+	}
+	if tr.AccessToken == "" {
+		return nil, fmt.Errorf("%w: token response carries no access_token", errTransientAuth)
 	}
 	if tr.TokenType != "" && !strings.EqualFold(tr.TokenType, "bearer") {
 		// amele only knows how to present a bearer token; a DPoP or MAC token
@@ -520,7 +589,7 @@ func applyTokenResponse(rec *oauthtoken.Record, body []byte, now time.Time) (*oa
 
 	next := *rec
 	next.AccessToken = tr.AccessToken
-	next.ExpiresAt = now.Add(tokenLifetime(tr.ExpiresIn))
+	next.ExpiresAt = now.Add(tokenLifetime(int64(tr.ExpiresIn)))
 	// Rotation: a new refresh token replaces the old one, its ABSENCE keeps
 	// the old one. Overwriting with an empty string here would lose the only
 	// way this machine can ever refresh again.
