@@ -11,6 +11,7 @@ amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v] [
 amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]
 amele validate <config.yaml|dir> [--set key=value] [-w DIR]
 amele explain <config.yaml|dir> [--set key=value] [-w DIR]
+amele mcp login|status|logout <config.yaml|dir> [server]
 amele schema
 amele init [path]
 amele version
@@ -325,7 +326,13 @@ up yet.
   per tool (`✓ kept`, with `(destructive)` / `(read-only)` when the server
   annotates it and `(was "<original>")` when the name had to be rewritten, or
   `- <reason>` for a tool a `tools.include`/`exclude` filter or a size cap
-  left out), and a `definitions: N tools, B bytes ≈ T tokens` summary.
+  left out), and a `definitions: N tools, B bytes ≈ T tokens` summary. A
+  server with an `auth` block also gets a credential line directly under its
+  row - `auth: oauth (token valid until <RFC3339>, refresh: yes)`, or
+  `auth: oauth (no token - run 'amele mcp login <config> <server>')` - which
+  states facts ABOUT the stored credential and never the credential itself.
+  Note that `explain` **uses** that credential: it connects for real, so a
+  stale token may be refreshed (and rotated) by an `explain`.
   A connect failure is **reported, never fatal**: `explain` still exits 0 even
   for a `required: true` server whose failure would abort `amele run` with
   exit 8. A tool-name collision is different - it is a mistake in the config,
@@ -348,6 +355,83 @@ up yet.
   (case-insensitive, anywhere in the name). This display rule is explain's
   alone - session-log redaction (`docs/contracts/jsonl-events.md`) stays
   unconditional by value.
+
+## `amele mcp login|status|logout <config.yaml|dir> [server]`
+
+Credential management for the MCP servers a config declares with
+`auth: {type: oauth}` ([docs/mcp.md](../mcp.md#oauth)). Added additively
+2026-08-19.
+
+- **Arguments**: the subcommand first, then the config path (a directory is
+  resolved exactly as `run` resolves one, see
+  [Directory arguments](#directory-arguments)). `login` and `logout` take an
+  optional server name after it; with none, they act on **every** server in
+  the config that declares oauth, in config order. `status` takes **no** server
+  argument - naming one would invite the reader to believe the others had been
+  checked and found fine. Anything else is a usage error (exit 2).
+- **Flags**: none, ever, apart from `-h`/`--help`. `--set` and `-w` are not
+  accepted here: no `mcp.*` key is overridable
+  (see "Config overrides" under `amele run`), so an override could only point a
+  credential command at a server the run would never use.
+- **The config is loaded and validated first**, exactly as `run` would (minus
+  overrides). A config `run` would refuse is refused here too, at exit 2: the
+  URL a credential is about to be keyed by is only trustworthy once `Validate`
+  has seen it.
+
+### `login`
+
+Runs the interactive browser flow, one server at a time in config order - three
+servers must not race three browser windows.
+
+- **stdin**: must be a **real terminal**. A pipe, a closed stdin or
+  `/dev/null` is refused with exit 2 rather than left waiting; the permission
+  system's "EOF is a refusal" tolerance is deliberately not reused, because a
+  cron job must hear that a login needs a human.
+- **stdout**: nothing. Safe to redirect.
+- **stderr**: the confirmation questions, the authorization URL, and one
+  `mcp login ok: <server> (expires <RFC3339>)` line per server.
+- **Exit**: 0 when every selected login completed; **1** when one did not -
+  declined at either question, or the flow failed (`login` is a command that
+  did not do its job, not a gated run: a run gated on a missing credential is
+  [exit 8](exit-codes.md#8---required-mcp-server-unavailable)); **2** for a
+  usage error, a config error, an unknown server name, a server with no `auth`
+  block, or a non-interactive stdin.
+
+### `status`
+
+A **report**, like `explain`: it never refreshes, never opens a browser,
+never contacts any server and never changes a byte on disk.
+
+- **stdout**: one row per stored credential (a server can hold more than one),
+  or a `no token` row for a server with none, followed by a `problem: ...` line
+  for each unreadable file. The row carries the state (`ok`/`expired`), the
+  expiry, whether a refresh token is present, the granted scopes and the
+  issuer. **A token value is never printed.**
+- **The table's layout is INFORMATIONAL and NOT frozen**: column order,
+  spacing and wording may change without a contract bump. What is frozen is
+  the stream (stdout), the exit code, and that no credential appears in it.
+  Scripts must not parse it.
+- **stderr**: empty.
+- **Exit**: **0** whenever the config loaded - including when nothing at all is
+  stored ("no token" is an answer, not a failure) and when a token file could
+  not be read. 2 only for a usage or config error.
+
+### `logout`
+
+Hands the credential back to the authorization server (RFC 7009) when one was
+advertised at login, then deletes it locally.
+
+- The revocation is **best effort**: if it fails, the local delete still
+  happens and the line says so. An operator who asked to be rid of a
+  credential must not keep it because a server is down.
+- **stdout**: nothing.
+- **stderr**: one `mcp logout: <server> (<label>)` line per server, where the
+  label is `revoked` (the server confirmed), `local only` (no revocation
+  endpoint, or telling it failed - the credential is gone here and may still be
+  live there) or `no token` (there was nothing to delete). A failed revocation
+  also prints an `amele: warning: ...` line.
+- **Exit**: 0 normally; 1 when a credential file could not be deleted; 2 for a
+  usage or config error.
 
 ## `amele schema`
 
@@ -430,8 +514,8 @@ usage** on stdout, exit 0. Naming a command is the new part.
   honored only as the command's **sole** argument; alongside other arguments
   (`--set` pairs included) the invocation stays a usage error (exit 2), per
   the global rule above.
-- Documented commands: `run`, `chat`, `validate`, `explain`, `schema`, `init`,
-  `version`, `completion`, `help`. Alternate spellings resolve to their
+- Documented commands: `run`, `chat`, `validate`, `explain`, `mcp`, `schema`,
+  `init`, `version`, `completion`, `help`. Alternate spellings resolve to their
   command, so `amele help --version` reaches the `version` page.
 - **`amele help <not-a-command>`** prints `unknown command "..."` plus the
   short usage to stderr and exits 2.

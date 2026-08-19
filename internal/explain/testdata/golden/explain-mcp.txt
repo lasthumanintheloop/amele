@@ -12,12 +12,14 @@ TOOLS
 
 MCP SERVERS
   "github"       http  "https://mcp.example.com/v1/mcp": ✓ connected (12 ms, proto "2025-06-18", "gh" "1.0")
+    auth: oauth (token valid until 2026-08-19T12:00:00Z, refresh: yes)
     "github__create_issue"           ✓ kept (destructive)
     "github__list_issues"            ✓ kept (read-only)
     "github__a_b_1f2e3d4c"           ✓ kept (was "a.b")
     "repo_delete"                    - excluded
     definitions: 3 tools, 1234 bytes ≈ 308 tokens
   "files"        stdio "/opt/mcp/files-server": ✗ FAILED (auth): 401 Unauthorized (sent Authorization: [REDACTED])
+    auth: oauth (no token - run 'amele mcp login agent.yaml files')
 
 REQUIREMENTS
   env:

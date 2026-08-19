@@ -1,5 +1,5 @@
 {"v":1,"type":"run_start","ts":"2026-08-10T12:00:02Z","model":"test-model","task":"list issues"}
-{"v":1,"type":"mcp_connect","ts":"2026-08-10T12:00:03Z","server":"github","transport":"http","ok":true,"protocol_version":"2025-06-18","server_name":"gh","server_version":"1.0","session_fp":"ab12cd34","tool_count":2,"duration_ms":12}
+{"v":1,"type":"mcp_connect","ts":"2026-08-10T12:00:03Z","server":"github","transport":"http","ok":true,"protocol_version":"2025-06-18","server_name":"gh","server_version":"1.0","session_fp":"ab12cd34","tool_count":2,"auth":"oauth","duration_ms":12}
 {"v":1,"type":"mcp_connect","ts":"2026-08-10T12:00:04Z","server":"flaky","transport":"stdio","ok":false,"error_class":"network","error":"handshake failed with header \"[REDACTED]\"","duration_ms":3}
 {"v":1,"type":"mcp_tools_listed","ts":"2026-08-10T12:00:05Z","server":"github","tools":[{"name":"github__x","sha256":"9f2c000000000000000000000000000000000000000000000000000000000000","bytes":120,"annotations":{"readOnly":true}}],"total_bytes":120,"skipped":[{"name":"a.b","reason":"excluded"}]}
 {"v":1,"type":"tool_result","ts":"2026-08-10T12:00:06Z","tool_call_id":"call_1","tool":"github__x","result":"not found","outcome":"tool_error","result_bytes":9}

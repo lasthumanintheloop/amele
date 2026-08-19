@@ -172,6 +172,15 @@ type MCPServerReport struct {
 	// ServerName and ServerVersion are what the server called itself -
 	// UNTRUSTED display strings, quoted on output.
 	ServerName, ServerVersion string
+	// Auth is the credential mechanism the config declared for this server
+	// ("oauth"), empty when it declared none. AuthStatus is the caller's
+	// one-line summary of the stored credential - an expiry, whether a refresh
+	// token is present, or the command that would obtain one.
+	//
+	// SECURITY: AuthStatus is FACTS ABOUT a credential, never the credential.
+	// The report is the output an operator pastes into a ticket, so no token
+	// value may ever reach it (see cmd/amele's authRow, which builds it).
+	Auth, AuthStatus string
 	// Tools lists the kept tools first (in registration order), then the
 	// skipped ones.
 	Tools []MCPToolReport
@@ -345,6 +354,12 @@ func mcpSection(b *strings.Builder, reports []MCPServerReport) {
 		// cannot prevent in a line-oriented report.
 		fmt.Fprintf(b, "  %-14q %-5s %s: %s\n", r.Name, r.Transport,
 			field(r.Target, "(unset)"), mcpStatus(r))
+		// The credential line sits under the server it belongs to and above
+		// its tools, connected or not: a server that failed WITH an auth class
+		// is exactly where the reader wants to know whether a token is stored.
+		if r.Auth != "" {
+			fmt.Fprintf(b, "    auth: %s\n", mcpAuth(r))
+		}
 		for _, t := range r.Tools {
 			fmt.Fprintf(b, "    %-32q %s\n", t.Name, mcpToolState(t))
 		}
@@ -369,6 +384,19 @@ func mcpStatus(r MCPServerReport) string {
 	return fmt.Sprintf("✓ connected (%d ms, proto %s, %s %s)", r.DurationMS,
 		field(r.ProtocolVersion, "(unstated)"),
 		field(r.ServerName, "(unnamed)"), field(r.ServerVersion, "(no version)"))
+}
+
+// mcpAuth renders the credential line of one server: the mechanism, plus the
+// caller's summary of what is stored for it when there is one.
+//
+// SECURITY: the summary is flattened onto one line like every other value in
+// this section - it is assembled from a stored record whose fields an
+// authorization server chose.
+func mcpAuth(r MCPServerReport) string {
+	if r.AuthStatus == "" {
+		return singleLine(r.Auth)
+	}
+	return fmt.Sprintf("%s (%s)", singleLine(r.Auth), singleLine(r.AuthStatus))
 }
 
 // mcpToolState renders one tool row's verdict: kept (with the server's

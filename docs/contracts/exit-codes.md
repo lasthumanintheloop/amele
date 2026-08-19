@@ -21,7 +21,7 @@ via `// CONTRACT:` markers.
 | 5 | provider error | The LLM provider or the network failed after the client's retries were exhausted. |
 | 6 | output schema unmet | `output.schema` is set, the model produced answers, but none validated within the retry budget. |
 | 7 | lock held | `lock: true` is set and another run of this config is in progress; this run did nothing. |
-| 8 | MCP unavailable | a required MCP server failed to start/connect/authenticate |
+| 8 | MCP unavailable | a required MCP server failed to start, connect or authenticate (including a missing or refused OAuth credential) |
 
 ## Per-code semantics
 
@@ -140,13 +140,33 @@ A cron wrapper that treats overlap as normal should special-case 7:
 An MCP server declared with `required: true` could not be brought up: the
 process failed to spawn, the transport never connected, the `initialize`
 handshake failed or was rejected, the peer spoke something other than the
-expected protocol, or authentication was refused. The run stops before the
-agent loop starts - no provider call is made. stdout stays empty; stderr names
-the server and the error class:
+expected protocol, or a **required OAuth credential was missing, declined or
+unrefreshable** - either at the pre-connect credential gate or at the connect
+itself. The run stops before the agent loop starts - no provider call is made.
+stdout stays empty; stderr names the server and the error class:
 
 ```
 amele: mcp server "github": auth: 401 Unauthorized
+mcp server "github": no oauth credential: mcp server unavailable (run 'amele mcp login agent.yaml github' first)
 ```
+
+**The credential gate is still audited.** A run that ends at the gate - no
+token and no terminal to ask on, or a login the operator declined - writes its
+`run_start` and `run_end` (with `exit_code: 8` and `mcp_errors`) exactly like a
+run whose connect failed later. The two are the same incident to whoever reads
+the log afterwards, and an exit-8 run with no session line at all would be the
+one case an operator could not reconstruct.
+
+**Mid-run is different.** A credential that dies *during* a run - a refresh
+refused, a token revoked under a live session - is **degradation, never a
+mid-run exit 8**: the affected calls come back to the model as tool errors, the
+loss is counted in `run_end.mcp_errors`, and the run ends on its own merits.
+Exit 8 is a statement about **startup**: the toolset the config declared was
+not there when the run began.
+
+An interactive `amele mcp login` that does not complete - declined, or the flow
+failed - is **exit 1**, not 8: nothing was gated, a command simply did not do
+its job (see [cli.md](cli.md#amele-mcp-loginstatuslogout-configyamldir-server)).
 
 Distinct from exit 5 on purpose. 5 means "the provider or the network was
 flaky, retry the same command later"; 8 means "a dependency this config

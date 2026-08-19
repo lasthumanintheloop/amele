@@ -70,21 +70,25 @@ type Event struct {
 	// MCP events (v1.2). Server names one server; the rest is per event type.
 	// OK is a pointer for the same reason ExitCode is: `ok:false` is the
 	// interesting half of a connect attempt and omitempty would delete it.
-	Server          string           `json:"server,omitempty"`
-	Transport       string           `json:"transport,omitempty"`
-	OK              *bool            `json:"ok,omitempty"`
-	ErrorClass      string           `json:"error_class,omitempty"`
-	Error           string           `json:"error,omitempty"`
-	ProtocolVersion string           `json:"protocol_version,omitempty"`
-	ServerName      string           `json:"server_name,omitempty"`
-	ServerVersion   string           `json:"server_version,omitempty"`
-	SessionFP       string           `json:"session_fp,omitempty"`
-	ToolCount       int              `json:"tool_count,omitempty"`
-	Tools           []MCPToolListed  `json:"tools,omitempty"`
-	TotalBytes      int              `json:"total_bytes,omitempty"`
-	Skipped         []MCPSkippedTool `json:"skipped,omitempty"`
-	Reason          string           `json:"reason,omitempty"`
-	MCPErrors       int              `json:"mcp_errors,omitempty"`
+	Server          string `json:"server,omitempty"`
+	Transport       string `json:"transport,omitempty"`
+	OK              *bool  `json:"ok,omitempty"`
+	ErrorClass      string `json:"error_class,omitempty"`
+	Error           string `json:"error,omitempty"`
+	ProtocolVersion string `json:"protocol_version,omitempty"`
+	ServerName      string `json:"server_name,omitempty"`
+	ServerVersion   string `json:"server_version,omitempty"`
+	SessionFP       string `json:"session_fp,omitempty"`
+	ToolCount       int    `json:"tool_count,omitempty"`
+	// Auth names the credential mechanism the connect used ("oauth"), and is
+	// absent when the server needed none (v1.3, additive). SECURITY: it is the
+	// MECHANISM, never the credential - no token, issuer or expiry is logged.
+	Auth       string           `json:"auth,omitempty"`
+	Tools      []MCPToolListed  `json:"tools,omitempty"`
+	TotalBytes int              `json:"total_bytes,omitempty"`
+	Skipped    []MCPSkippedTool `json:"skipped,omitempty"`
+	Reason     string           `json:"reason,omitempty"`
+	MCPErrors  int              `json:"mcp_errors,omitempty"`
 
 	// run_end
 	Status      string `json:"status,omitempty"`
@@ -494,6 +498,10 @@ type MCPConnect struct {
 	SessionFP string
 	// ToolCount is how many tools the server advertised.
 	ToolCount int
+	// Auth is the credential mechanism the attempt used (`oauth`), or empty
+	// when the server needed none. SECURITY: the mechanism only - the token
+	// itself never reaches the log.
+	Auth string
 }
 
 // MCPToolsListed is the tool inventory amele took from one MCP server.
@@ -526,6 +534,7 @@ func (w *Writer) MCPConnect(e MCPConnect) {
 		ErrorClass: e.ErrorClass, Error: w.clip(e.Error), DurationMS: e.DurationMS,
 		ProtocolVersion: e.ProtocolVersion, ServerName: e.ServerName,
 		ServerVersion: e.ServerVersion, SessionFP: e.SessionFP, ToolCount: e.ToolCount,
+		Auth: e.Auth,
 	})
 }
 

@@ -241,6 +241,27 @@ server is acceptable - which is what granting them already means.
   `docs/packs.md` makes credential naming a pack rule. Session-log redaction
   is unaffected and stays unconditional by value.
 
+- **OAuth credentials live on disk, and the file permissions are the whole
+  fence.** `amele mcp login` writes one `0600` JSON record per credential
+  (access token, refresh token, expiry, issuer) into a `0700`
+  `${XDG_STATE_HOME:-$HOME/.local/state}/amele/mcp` directory, created with
+  those modes and re-`chmod`ed if it is found looser. That stops **other
+  users**; it does not stop **this** user. Any process running as the same
+  account - a compromised subprocess tool, an MCP server amele itself spawned,
+  a shell the operator left open - can read the refresh token and use it until
+  it is revoked, exactly as it could read `~/.aws/credentials` or the
+  environment file the API key comes from. The mitigation is not a file mode,
+  it is **process-account isolation**: give an agent that holds remote
+  credentials its own service user, and do not grant that user's agent a shell
+  tool. On Windows the modes are advisory - Go maps them onto ACLs
+  approximately - so the directory's inherited ACL is what actually protects
+  it there; amele does not adjust it.
+  Facts about a credential appear in `amele mcp status`, in the `explain`
+  `auth:` row and as `mcp_connect.auth` in the session log; the credential
+  itself appears in none of them, and a token minted mid-run is registered with
+  the live redactor so an error message quoting it is scrubbed before it
+  reaches a log or a terminal.
+
 ### 4.6 Terminal output sanitization (S4)
 
 The strings rendered into the **permission prompt and its audit note** -

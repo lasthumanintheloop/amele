@@ -1,9 +1,9 @@
 # JSONL event schema
 
-**v1.2 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
-`result_bytes` (v1.1) and the MCP events plus `run_end.mcp_errors` (v1.2)
-added additively (every v1 field unchanged, and the on-the-wire `v` stays
-`1`).** This is the format of the session log: one append-only JSONL
+**v1.3 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+`result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2) and
+`mcp_connect.auth` (v1.3) added additively (every v1 field unchanged, and the
+on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
 and (future) replay input are deliberately the same format. Source of truth:
 `session.Event` in `internal/session/session.go`.
@@ -29,7 +29,7 @@ Every line is one JSON object with three always-present fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `v` | int | Wire schema version. Always `1` for this document - the `v1.1` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
+| `v` | int | Wire schema version. Always `1` for this document - the `v1.3` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
 | `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
@@ -133,6 +133,7 @@ happened", never as a failure to parse: new values may be added additively.
 | `server_version` | string | The server's self-reported version. |
 | `session_fp` | string | Short SHA-256 fingerprint of the MCP session id, for correlating events across a run. The raw session id is a bearer credential and is **never** written to the log. |
 | `tool_count` | int | How many tools this server contributes **after** filtering - the count of definitions actually exposed to the model, not the raw advertised count. |
+| `auth` | string | The credential mechanism the attempt used: `oauth`, or **absent** when the server needed none (a static `Authorization` header counts as none - nothing about it is amele's to manage). Present on failed attempts too, so "the oauth server did not come up" is distinguishable from "the plain server did not come up". SECURITY: the mechanism only - no token, issuer, scope or expiry is ever written here. Since v1.3. |
 
 ### `mcp_tools_listed` - the tool inventory taken from one server
 
@@ -286,3 +287,20 @@ Concretely:
   v0.2.0;
 - the two new `outcome` values follow the standing rule: an unknown `outcome`
   is "something else happened", never a parse failure.
+
+### v1.3 (amele v0.2.0) - MCP OAuth (additive, `v` stays `1`)
+
+Added one optional field to `mcp_connect`: `auth`. Nothing was removed,
+renamed or re-typed, no other event type changed a byte, and no new event type
+appeared - an OAuth login is deliberately **not** an event: it happens before
+`run_start` (the run's session file does not exist yet), and the only thing
+worth recording afterwards is which mechanism authenticated the connect.
+
+**Migration:** none required. Concretely:
+
+- absent `auth` means the connect used no credential amele manages - or the
+  log predates v0.2.0. It never means "unknown";
+- the value is a mechanism from a closed set (`oauth` today). A consumer must
+  treat an unknown value as "some other mechanism", never as a parse failure;
+- a token value is not in the log and never will be: a reader that needs the
+  expiry or the issuer reads `amele mcp status`, not the session file.

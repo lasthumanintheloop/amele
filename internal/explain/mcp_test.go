@@ -84,6 +84,8 @@ func mcpTestReports() []MCPServerReport {
 			Name: "github", Transport: "http", Target: "https://mcp.example.com/v1/mcp",
 			Connected: true, DurationMS: 12, ProtocolVersion: "2025-06-18",
 			ServerName: "gh", ServerVersion: "1.0",
+			Auth:       "oauth",
+			AuthStatus: "token valid until 2026-08-19T12:00:00Z, refresh: yes",
 			Tools: []MCPToolReport{
 				{Name: "github__create_issue", Kept: true, Bytes: 500, Hint: "destructive"},
 				{Name: "github__list_issues", Kept: true, Bytes: 400, Hint: "read-only"},
@@ -95,7 +97,9 @@ func mcpTestReports() []MCPServerReport {
 		{
 			Name: "files", Transport: "stdio", Target: "/opt/mcp/files-server",
 			DurationMS: 30, ErrorClass: "auth",
-			Error: "401 Unauthorized (sent Authorization: Bearer ghp-token-value)",
+			Auth:       "oauth",
+			AuthStatus: "no token - run 'amele mcp login agent.yaml files'",
+			Error:      "401 Unauthorized (sent Authorization: Bearer ghp-token-value)",
 		},
 	}
 }
@@ -237,5 +241,42 @@ func TestMCPFailedServerHasNoDefinitionsLine(t *testing.T) {
 	}
 	if !strings.Contains(got, "✗ FAILED (spawn):") {
 		t.Errorf("failed server not marked:\n%s", got)
+	}
+}
+
+// TestMCPAuthRow pins the credential line: it names the mechanism and the
+// state of the stored token, it appears for a failed server too (a connect
+// that was refused is where the reader most needs to know whether a token is
+// even stored), and it is omitted entirely for a server with no auth block.
+func TestMCPAuthRow(t *testing.T) {
+	cfg, _ := loadMCPConfig(t)
+	got := Render(cfg, registryWith(t, "fs_read"), nil, nil, alwaysFound, mcpTestReports())
+	for _, want := range []string{
+		"    auth: oauth (token valid until 2026-08-19T12:00:00Z, refresh: yes)\n",
+		"    auth: oauth (no token - run 'amele mcp login agent.yaml files')\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("report does not carry %q:\n%s", want, got)
+		}
+	}
+
+	plain := mcpTestReports()
+	plain[0].Auth, plain[0].AuthStatus = "", ""
+	plain[1].Auth, plain[1].AuthStatus = "", ""
+	if out := Render(cfg, registryWith(t, "fs_read"), nil, nil, alwaysFound, plain); strings.Contains(out, "auth:") {
+		t.Errorf("a server without an auth block still got a credential line:\n%s", out)
+	}
+}
+
+// TestMCPAuthRowIsFlattened is the forgery regression: the status text is
+// assembled from a record whose issuer and scopes an authorization server
+// chose, so a newline in it must not be able to write a report row of its own.
+func TestMCPAuthRowIsFlattened(t *testing.T) {
+	cfg, _ := loadMCPConfig(t)
+	reports := mcpTestReports()
+	reports[0].AuthStatus = "ok\n    \"evil\" http \"x\": ✓ connected"
+	got := Render(cfg, registryWith(t, "fs_read"), nil, nil, alwaysFound, reports)
+	if strings.Contains(got, "\n    \"evil\"") {
+		t.Errorf("the auth status forged a row:\n%s", got)
 	}
 }

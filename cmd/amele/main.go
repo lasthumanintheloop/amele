@@ -1139,7 +1139,7 @@ func cmdExplain(ctx context.Context, args []string, stdout, stderr io.Writer, en
 	// so the servers are not contacted at all.
 	var mcpReports []explain.MCPServerReport
 	if registry != nil {
-		reports, mcpProblems, set := explainMCP(ctx, cfg, registry, env, version)
+		reports, mcpProblems, set := explainMCP(ctx, cfg, parsed.configPath, registry, env, version)
 		set.close(context.WithoutCancel(ctx))
 		mcpReports = reports
 		problems = append(problems, mcpProblems...)

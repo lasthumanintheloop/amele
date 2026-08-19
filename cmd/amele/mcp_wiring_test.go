@@ -699,7 +699,7 @@ func TestConnectMCPSharesLiveSecretSet(t *testing.T) {
 // log to share with, but it still owns exactly one registry so an OAuth flow
 // started for the report has somewhere to register its token.
 func TestExplainMCPHasSecretSet(t *testing.T) {
-	_, _, set := explainMCP(context.Background(), &config.Config{}, nil,
+	_, _, set := explainMCP(context.Background(), &config.Config{}, "agent.yaml", nil,
 		func(string) (string, bool) { return "", false }, "test")
 	if set.secrets == nil {
 		t.Fatal("explainMCP left the set without a secret registry")
@@ -910,6 +910,13 @@ func TestRunOAuthNoTokenOptionalContinues(t *testing.T) {
 	if last.Type != "run_end" || last.MCPErrors != 1 {
 		t.Fatalf("run_end: %+v", last)
 	}
+	// A FAILED connect carries the mechanism too: "the oauth server did not
+	// come up" and "the plain server did not come up" are different incidents,
+	// and only this field tells them apart in the log.
+	connects := eventsOfType(events, "mcp_connect")
+	if len(connects) != 1 || connects[0].Auth != "oauth" {
+		t.Fatalf("mcp_connect.auth on a failed connect: %+v", connects)
+	}
 }
 
 // TestRunOAuthQuietOptionalStaysSilent: -q drops the gate's informational
@@ -949,7 +956,18 @@ func TestRunOAuthFreshTokenSkipsQuestion(t *testing.T) {
 	if strings.Contains(stderr, "needs a login") {
 		t.Errorf("asked for a login it already had: %q", stderr)
 	}
-	assertListedTool(t, readSessionEvents(t, dir), "github__echo")
+	events := readSessionEvents(t, dir)
+	assertListedTool(t, events, "github__echo")
+	// v1.3: the connect record says WHICH mechanism authenticated it, so a
+	// reader of the log can tell an OAuth session from a static-header one -
+	// and never carries the credential itself.
+	connects := eventsOfType(events, "mcp_connect")
+	if len(connects) != 1 || connects[0].Auth != "oauth" {
+		t.Fatalf("mcp_connect.auth: %+v", connects)
+	}
+	if strings.Contains(stderr, "seeded-access-1") {
+		t.Errorf("the access token reached stderr: %q", stderr)
+	}
 }
 
 // TestRunOAuthStaleWithRefreshSkipsQuestion: an EXPIRED credential that still
@@ -1056,5 +1074,60 @@ func TestChatOAuthSameGate(t *testing.T) {
 	}
 	if last.ExitCode == nil || *last.ExitCode != ExitMCPUnavailable || last.MCPErrors != 1 {
 		t.Fatalf("run_end: %+v", last)
+	}
+}
+
+// TestExplainOAuthAuthRow pins the explain credential line: with a token
+// stored, the row states the expiry and whether a refresh token is present;
+// with nothing stored, it names the command that fixes it. Neither form may
+// contain the token.
+func TestExplainOAuthAuthRow(t *testing.T) {
+	mcpSrv := bearerMCPServer(t, "seeded-access-1")
+	stateDir := t.TempDir()
+	seedOAuthRecord(t, stateDir, mcpSrv.URL, nil)
+	cfgPath, _ := writeTestConfig(t, "http://127.0.0.1:1",
+		oauthServerYAML("github", mcpSrv.URL, "true"))
+
+	code, stdout, stderr := mcpCLI(t, stateDir, []string{"explain", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "auth: oauth (token valid until ") ||
+		!strings.Contains(stdout, ", refresh: yes)") {
+		t.Errorf("report has no credential line:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "seeded-access-1") || strings.Contains(stdout, "seeded-refresh-1") {
+		t.Errorf("a token value reached the report:\n%s", stdout)
+	}
+}
+
+// TestExplainOAuthNoTokenRow: the same line on an empty store is the
+// actionable one - the exact command that obtains the credential.
+func TestExplainOAuthNoTokenRow(t *testing.T) {
+	cfgPath, _ := writeTestConfig(t, "http://127.0.0.1:1",
+		oauthServerYAML("github", "https://mcp.example/mcp", "true"))
+
+	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"explain", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	want := "auth: oauth (no token - run 'amele mcp login " + cfgPath + " github')"
+	if !strings.Contains(stdout, want) {
+		t.Errorf("report does not carry %q:\n%s", want, stdout)
+	}
+}
+
+// TestExplainNoAuthBlockHasNoAuthRow: a server with static headers (or none)
+// must render exactly as it did before OAuth existed.
+func TestExplainNoAuthBlockHasNoAuthRow(t *testing.T) {
+	cfgPath, _ := writeTestConfig(t, "http://127.0.0.1:1",
+		stdioServerYAML("plain", buildMCPTestServer(t), ""))
+
+	code, stdout, stderr := mcpCLI(t, t.TempDir(), []string{"explain", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if strings.Contains(stdout, "auth:") {
+		t.Errorf("a server without an auth block got a credential line:\n%s", stdout)
 	}
 }

@@ -18,6 +18,8 @@ scheduler can act on.
   Streamable HTTP.
 - **Static authentication.** Extra HTTP headers, whose credential-shaped values
   must come from the environment (`${VAR}`), never from the file.
+- **OAuth 2.1.** `auth: {type: oauth}` on an http server, with `amele mcp
+  login|status|logout` and silent refresh inside a run - see [OAuth](#oauth).
 - **Tool filtering.** `include` / `exclude` globs per server, applied before the
   model ever sees a definition.
 - **Deterministic naming.** Every tool is `<server>__<tool>`, rewritten by a
@@ -68,6 +70,7 @@ mcp:
 | `tools.include` | all | Globs (only `*`, matching any substring; case-sensitive) matched against the **server-side** tool name, before the `<server>__` prefix. Empty means every tool. |
 | `tools.exclude` | none | Globs removing tools that `include` let through. Applied second. |
 | `call_timeout` | `60s` | Bounds one `tools/call`. A timeout comes back to the model as result text with outcome `timeout` - the request had already left amele, so the action may still complete server-side - and is never a run failure. |
+| `auth` | none | OAuth for an `http` server, instead of a static `Authorization` header. See [OAuth](#oauth) for its own keys (`type`, `client_id`, `scopes`). |
 | `required` | `true` | `true`: a connect failure aborts the run with exit 8. `false`: a warning on stderr (silenced by `-q`), an `mcp_connect{ok:false}` event, and the run continues without that server's tools. |
 
 Two values are deliberately not configurable: the connect timeout (30 s,
@@ -204,6 +207,161 @@ sessions get a best-effort `DELETE` (2 s), and stdio servers are killed as a
 process group (SIGTERM to the group, SIGKILL after a 5 s grace) so a server's own
 children do not survive it.
 
+## OAuth
+
+An http MCP server that wants OAuth instead of a static header gets an `auth`
+block. amele is a **public** OAuth 2.1 client: authorization code with PKCE, a
+loopback redirect, refresh tokens, and no client secret anywhere (a secret in a
+YAML recipe would be a secret in a git repository).
+
+```yaml
+mcp:
+  servers:
+    - name: github
+      required: true
+      transport:
+        type: http
+        url: https://mcp.example.com/mcp
+      auth:
+        type: oauth                  # the only accepted value
+        client_id: my-registered-id  # optional; see "Client identity" below
+        scopes: ["repo", "read:org"] # optional; extra scopes to request
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `auth.type` | - | Required inside the block. Only `oauth`. |
+| `auth.client_id` | none | A pre-registered client id. Omit it when the authorization server supports client-id metadata documents (amele then identifies itself by URL); supply it when it does not. |
+| `auth.scopes` | server's default | Extra scopes to request at login. |
+
+`auth` is only valid on an `http` server (a stdio child process has no HTTP
+exchange to authenticate), and it cannot be combined with an `Authorization`
+header - that is a config error, not a precedence rule.
+
+### The three commands
+
+```
+amele mcp login  <config.yaml|dir> [server]   # obtain a credential (interactive)
+amele mcp status <config.yaml|dir>            # report what is stored
+amele mcp logout <config.yaml|dir> [server]   # revoke (best effort) + delete
+```
+
+With no server named, `login` and `logout` act on **every** server in the
+config that declares `auth: {type: oauth}`, in config order. `status` always
+reports on all of them. The full contract - streams, exit codes, argument
+shapes - is in [contracts/cli.md](contracts/cli.md#amele-mcp-loginstatuslogout-configyamldir-server).
+
+`login` needs a **real terminal** on stdin. A pipe or `/dev/null` is refused
+(exit 2) rather than left waiting for a browser nobody will see.
+
+### Logging in from a run
+
+`amele run` and `amele chat` do not fail on a missing credential when a human
+is present: before any server is dialled, a **pre-connect phase** walks the
+OAuth servers sequentially and offers to log in.
+
+- On a TTY you are asked **twice**, deliberately. The first question names the
+  server and its URL - all the config knows. The second, after discovery,
+  names the **issuer** that would receive the identity, which is the fact
+  worth consenting to and which cannot be known before the first question is
+  answered.
+- Without a TTY nothing is asked: a `required` server ends the run with
+  [exit 8](contracts/exit-codes.md#8---required-mcp-server-unavailable) and a
+  line naming the exact `amele mcp login <config> <server>` that fixes it; an
+  optional one warns and the run continues without its tools.
+- **The login phase is outside `limits.timeout`.** The run deadline is armed
+  after the phase returns, so minutes spent walking to a browser are never
+  charged to the agent's budget.
+- The phase runs before `run_start`, so a run that never obtained a credential
+  writes no session file at all. A run that was *gated* (declined, or headless
+  with nothing stored) still writes `run_start` + `run_end` with
+  `mcp_errors` - the audit trail of an exit-8 run is the same whether the
+  credential was missing at the gate or the connect was refused later.
+
+### Refresh and rotation
+
+A stored credential is usable when it is unexpired **or** carries a refresh
+token. A stale-but-refreshable record is refreshed **silently at connect
+time** - a cron agent never becomes interactive because an access token aged
+out. Refreshes happen up to 60 s before expiry, plus a per-process jitter of
+up to another 60 s so a fleet does not refresh in the same second, and they
+are serialized across processes by a lock file next to the record: a rotating
+authorization server that invalidates the old refresh token on use cannot be
+raced into invalidating the credential of a parallel run.
+
+If a refresh fails, the failure is classed like any other connect failure
+(`auth` for a refusal, `network` for an unreachable token endpoint) and the
+required/optional policy decides the run's fate. A credential that dies
+**mid-run** is degradation, never a mid-run exit 8: the affected calls come
+back to the model as tool errors and `run_end.mcp_errors` records the loss.
+
+### Where credentials live
+
+```
+${XDG_STATE_HOME:-$HOME/.local/state}/amele/mcp/
+```
+
+One `0600` JSON file per credential (keyed by issuer + resource + client id)
+in a `0700` directory, plus a sibling `.lock` file per credential. With
+neither `XDG_STATE_HOME` nor `HOME` set, the `amele mcp` commands report that
+there is nowhere to keep credentials (exit 2) rather than write them somewhere
+unexpected.
+
+- **The file format is subject to change until v0.3.** Read it with `amele mcp
+  status`, not with `jq`; treat the directory as opaque state.
+- **Containers:** mount the directory as a volume, or every restart starts
+  logged out. It is the only state amele keeps outside the workspace.
+- **NFS and other network filesystems are unsupported** for this directory:
+  the refresh lock is `flock(2)`, whose cross-host semantics there range from
+  weak to absent, and two hosts refreshing one credential is how a rotating
+  server revokes it.
+- **Move it, do not copy it.** Two machines sharing one credential race each
+  other's rotations. If you must transplant one, copy it and then run `amele
+  mcp logout` on the **source** so only one copy survives.
+- **`amele explain` connects for real**, which means it uses - and may refresh
+  and rotate - a stored credential. That is deliberate (a pre-flight that did
+  not authenticate would not be a pre-flight), but it is not a read-only
+  operation on the token store.
+
+`explain` prints one credential line per OAuth server, under the server's row:
+
+```
+MCP SERVERS
+  "github"       http  "https://mcp.example.com/mcp": ✓ connected (91 ms, proto "2025-06-18", "gh" "1.0")
+    auth: oauth (token valid until 2026-08-20T09:12:44Z, refresh: yes)
+```
+
+or, when nothing is stored, the command that fixes it:
+
+```
+    auth: oauth (no token - run 'amele mcp login agent.yaml github')
+```
+
+Facts *about* the credential only - never the credential. The session log says
+the same much more briefly: `mcp_connect.auth` is `"oauth"` (or absent), and no
+token, issuer or expiry is ever written
+([contracts/jsonl-events.md](contracts/jsonl-events.md#mcp_connect---one-connection-attempt-to-one-mcp-server)).
+
+### Client identity
+
+Servers differ in how they want a client to identify itself:
+
+- **Client-id metadata document (default).** amele sends
+  `https://amele.work/oauth/client-v1.json` as its `client_id`; the
+  authorization server fetches it. Nothing to configure, nothing to register.
+  The document is versioned in this repo at
+  [docs/oauth/client-v1.json](oauth/client-v1.json).
+- **Pre-registered client.** Set `auth.client_id` to the id the server issued
+  you. Required whenever the authorization server does not support metadata
+  documents - dynamic client registration (RFC 7591) is **not** implemented.
+
+### Known coverage boundary
+
+The silent-refresh path is exercised end to end at the `internal/mcp` level
+(and was live-tested); the cmd-level wiring around it has no automated test of
+its own, because a test would need an authorization server that rotates. Treat
+a refresh failure report from the field as a first-class bug.
+
 ## Running a fleet
 
 amele is built to be a worker: hundreds of processes, each with its own YAML.
@@ -270,7 +428,8 @@ The rest of the hardening advice is the ordinary amele advice:
 | Elicitation | ✗ not yet |
 | Roots | ✗ not yet |
 | Tasks | ✗ not yet |
-| OAuth 2.1 | ✗ next slice of v0.2 |
+| OAuth 2.1 (authorization code + PKCE, refresh) | ✓ |
+| Dynamic client registration (RFC 7591) | ✗ - client-id metadata document, or a pre-registered `auth.client_id` |
 | Legacy HTTP+SSE transport | ✗ not planned for now - use a bridge |
 | `tools/list_changed` mid-run | ✗ by design (frozen toolset) |
 | `Last-Event-ID` resumption | ✗ meaningless without the SSE stream amele does not open |
@@ -295,4 +454,6 @@ preinstalled binary.
 - [contracts/exit-codes.md](contracts/exit-codes.md) - exit 8.
 - [contracts/jsonl-events.md](contracts/jsonl-events.md) - the MCP events.
 - [contracts/cli.md](contracts/cli.md) - the `MCP SERVERS` section of `explain`.
-- [threat-model.md](threat-model.md) - S9, tool poisoning via MCP definitions.
+- [threat-model.md](threat-model.md) - S9, tool poisoning via MCP definitions;
+  §4.5, the credential store.
+- [oauth/](oauth/) - the client-id metadata document amele publishes.

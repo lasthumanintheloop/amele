@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.2). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.3). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -68,6 +68,17 @@ Within a frozen version, changes must be additive and backwards-compatible:
   `v` stays `1`, nothing was removed, renamed or re-typed. Migration: none
   required; absent `mcp_errors` means 0, and an unknown `outcome` stays
   "something else happened".
+
+- **2026-08-19 - JSONL v1.3, MCP OAuth.** `mcp_connect` gains the optional
+  `auth` field, naming the credential mechanism a connect used (`oauth`, or
+  absent) - jsonl-events.md v1.3. Additive: the wire `v` stays `1`, nothing was
+  removed, renamed or re-typed, and no credential is written. Migration: none
+  required; absent `auth` means "no mechanism amele manages", never "unknown".
+- **2026-08-19 - `amele mcp login|status|logout`.** A new command for the
+  OAuth credentials of MCP servers, plus an `auth:` row per OAuth server in
+  the `amele explain` report - cli.md. Additive: no existing command, flag or
+  report line changed. The `status` table's layout is explicitly
+  informational and NOT frozen; the streams and exit codes are.
 
 ## Schema versioning note (`$id`)
 

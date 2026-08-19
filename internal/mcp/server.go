@@ -405,6 +405,11 @@ func (s *Server) adopt(sess *sdk.ClientSession, kill func()) bool {
 		SessionFP: fingerprint(sess.ID()),
 		ToolCount: len(s.tools),
 	}
+	// The MECHANISM the config declared, not the credential it produced: the
+	// observer copies this straight into the session log.
+	if s.cfg.Auth != nil {
+		s.info.Auth = s.cfg.Auth.Type
+	}
 	if init := sess.InitializeResult(); init != nil {
 		s.info.ProtocolVersion = init.ProtocolVersion
 		if init.ServerInfo != nil {

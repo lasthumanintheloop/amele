@@ -134,6 +134,16 @@ Notes on the fields that matter:
   SIGKILLed never runs that cleanup, and its grandchildren would survive. The
   cgroup is the only thing that reliably reaps them. `KillMode=process` on a
   unit that runs MCP servers leaks a process per run.
+- **OAuth MCP servers need a writable state directory for the service user.**
+  A credential obtained by `amele mcp login` lives in
+  `${XDG_STATE_HOME:-$HOME/.local/state}/amele/mcp`, and a headless run never
+  logs in - it fails with [exit 8](contracts/exit-codes.md#8---required-mcp-server-unavailable)
+  when nothing is stored. So: log in **as the service user**
+  (`sudo -u amele -H amele mcp login /srv/myapp/log-sentry/`) on a terminal
+  once, give that user a real `HOME` (or set `Environment=XDG_STATE_HOME=...`
+  in the unit, matching what the login used), and keep the directory out of
+  any `PrivateTmp=`-style sandboxing that would hide it from the run. Refreshes
+  then happen silently inside each run ([docs/mcp.md](mcp.md#oauth)).
 - **`OnCalendar=*-*-* 03:00:00`** is systemd's calendar syntax for "every
   day at 03:00"; `Persistent=true` means a run that was missed because the
   machine was off at 03:00 fires once at the next boot instead of being

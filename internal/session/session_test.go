@@ -491,7 +491,7 @@ func TestGoldenMCP(t *testing.T) {
 	w.MCPConnect(MCPConnect{
 		Server: "github", Transport: "http", OK: true, DurationMS: 12,
 		ProtocolVersion: "2025-06-18", ServerName: "gh", ServerVersion: "1.0",
-		SessionFP: "ab12cd34", ToolCount: 2,
+		SessionFP: "ab12cd34", ToolCount: 2, Auth: "oauth",
 	})
 	w.MCPConnect(MCPConnect{
 		Server: "flaky", Transport: "stdio", OK: false,
@@ -522,6 +522,12 @@ func TestGoldenMCP(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "[REDACTED]") {
 		t.Errorf("mcp_connect error was not redacted:\n%s", got)
+	}
+	// v1.3: the authenticated connect says so, and the one that used no
+	// credential says nothing - `auth` is omitempty, and an absent field must
+	// keep meaning "no OAuth", not "unknown".
+	if strings.Count(string(got), `"auth":"oauth"`) != 1 {
+		t.Errorf("mcp_connect.auth is not written exactly once:\n%s", got)
 	}
 
 	goldenPath := filepath.Join("testdata", "golden", "session-mcp.jsonl")

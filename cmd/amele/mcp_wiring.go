@@ -239,7 +239,7 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 	// One observer and one stderr mutex for the whole set: session.Writer and
 	// the process's stderr are both single-threaded resources, and every
 	// server writes to them from its own goroutine.
-	observer := &sessionObserver{w: w}
+	observer := &sessionObserver{w: w, auth: mcpAuthKinds(cfg)}
 	// The registry comes from the caller: `run` and `chat` build exactly one
 	// per invocation and hand the same set to every other sink (see
 	// runSecrets), so nothing here may build a second one.
@@ -354,6 +354,12 @@ func (m *mcpSet) register(name string, srv *mcp.Server, reg *tools.Registry, fai
 type sessionObserver struct {
 	mu sync.Mutex
 	w  *session.Writer
+	// auth maps a server name to the credential mechanism its config declared
+	// ("oauth"), so a FAILED connect can carry it too: ConnectFailed has no
+	// ConnectInfo to read it off, and an oauth server that never came up is
+	// exactly the connect a reader wants the mechanism on. A nil map is fine -
+	// a lookup then yields "", which is what a server without auth reports.
+	auth map[string]string
 }
 
 // Connected implements mcp.Observer.
@@ -365,7 +371,7 @@ func (o *sessionObserver) Connected(info mcp.ConnectInfo) {
 		DurationMS:      info.Duration.Milliseconds(),
 		ProtocolVersion: info.ProtocolVersion,
 		ServerName:      info.ServerName, ServerVersion: info.ServerVersion,
-		SessionFP: info.SessionFP, ToolCount: info.ToolCount,
+		SessionFP: info.SessionFP, ToolCount: info.ToolCount, Auth: info.Auth,
 	})
 }
 
@@ -378,7 +384,7 @@ func (o *sessionObserver) ConnectFailed(server, transport string, class mcp.Erro
 	o.w.MCPConnect(session.MCPConnect{
 		Server: server, Transport: transport, OK: false,
 		ErrorClass: string(class), Error: err.Error(),
-		DurationMS: d.Milliseconds(),
+		DurationMS: d.Milliseconds(), Auth: o.auth[server],
 	})
 }
 
@@ -410,6 +416,19 @@ func (o *sessionObserver) Disconnected(server, reason string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.w.MCPDisconnect(session.MCPDisconnect{Server: server, Reason: reason})
+}
+
+// mcpAuthKinds is the server-name -> credential-mechanism map the observer
+// needs for the connects that failed. It is read-only once built, so the
+// observer's mutex does not have to cover it.
+func mcpAuthKinds(cfg *config.Config) map[string]string {
+	m := make(map[string]string, len(cfg.MCP.Servers))
+	for _, s := range cfg.MCP.Servers {
+		if s.Auth != nil {
+			m[s.Name] = s.Auth.Type
+		}
+	}
+	return m
 }
 
 // annotationMap flattens the MCP tool hints for the log. A nil pointer means
@@ -528,7 +547,7 @@ func (s *mcpStderr) emit(line string) {
 //
 // Nothing here writes to stderr: the command's contract is a report on stdout
 // and an empty stderr.
-func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
+func explainMCP(ctx context.Context, cfg *config.Config, cfgPath string, reg *tools.Registry,
 	env config.LookupEnv, version string) ([]explain.MCPServerReport, []string, *mcpSet) {
 	// `explain` is its own invocation with no other sink to share with, so it
 	// builds the one registry it needs here.
@@ -540,7 +559,7 @@ func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 	existing := existingToolNames(reg)
 	// A nil session.Writer discards every event: explain writes no session
 	// log, and its connects must not land in the one a `run` is keeping.
-	observer := &sessionObserver{w: nil}
+	observer := &sessionObserver{w: nil, auth: mcpAuthKinds(cfg)}
 	redact := set.redact
 	var stderrMu sync.Mutex
 	// CONTRACT (docs/contracts/cli.md): `explain` writes the report to stdout
@@ -552,10 +571,16 @@ func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 
 	var problems []string
 	reports := make([]explain.MCPServerReport, 0, len(results))
+	// The credential rows are read AFTER the dial, so they describe the store
+	// as the connect left it: an expired token the run-mode path just refreshed
+	// (and rotated) must not be reported with the expiry it had a second ago.
+	store := newTokenStore(env)
 	for i, s := range cfg.MCP.Servers {
 		r := results[i]
 		if r.err != nil {
-			reports = append(reports, failedServerReport(s, r.err))
+			row := failedServerReport(s, r.err)
+			row.Auth, row.AuthStatus = mcpAuthReport(s, store, cfgPath)
+			reports = append(reports, row)
 			continue
 		}
 		// Appended before registration so a half-registered server is still
@@ -565,9 +590,66 @@ func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 		set.register(s.Name, r.srv, reg, func(err error) {
 			problems = append(problems, err.Error())
 		})
-		reports = append(reports, serverReport(s, r.srv))
+		row := serverReport(s, r.srv)
+		row.Auth, row.AuthStatus = mcpAuthReport(s, store, cfgPath)
+		reports = append(reports, row)
 	}
 	return reports, problems, set
+}
+
+// mcpAuthReport summarises one server's credential for the explain report:
+// the mechanism the config declared, plus what is stored for it.
+//
+// SECURITY: FACTS ABOUT the credential only - the expiry, whether a refresh
+// token exists, how many records are filed. No token, and no issuer either:
+// `amele mcp status` is the place for the full picture, and this line is meant
+// to be safe in a pasted report.
+//
+// It reads the store through serverCredentials, the same lookup `status`,
+// `logout` and the run path use, so the report cannot disagree with the
+// runner about which credential a server would pick up.
+func mcpAuthReport(s config.MCPServer, store *oauthtoken.Store, cfgPath string) (kind, status string) {
+	if s.Auth == nil {
+		return "", ""
+	}
+	kind = s.Auth.Type
+	matches, err := serverCredentials(store, s)
+	if len(matches) == 0 {
+		if err != nil {
+			// An unreadable store is not a failed report: explain reports.
+			return kind, "credential state unknown: " + err.Error()
+		}
+		return kind, fmt.Sprintf("no token - run 'amele mcp login %s %s'", cfgPath, s.Name)
+	}
+	rec := freshestCredential(matches)
+	// The raw expiry, with no refresh margin: this states what is on disk, and
+	// the margin is a decision about when to refresh, not a fact about the
+	// credential (the same rule `amele mcp status` follows).
+	verb := "token valid until"
+	if !rec.ExpiresAt.After(store.Now()) {
+		verb = "token expired at"
+	}
+	status = fmt.Sprintf("%s %s, refresh: %s", verb,
+		rec.ExpiresAt.UTC().Format(mcpTimeFormat), yesNo(rec.RefreshToken != ""))
+	// More than one record can be filed for one server (a pre-registered client
+	// and a discovered one). The row summarises the one a run would most likely
+	// still be able to use, and says the others exist rather than hiding them.
+	if extra := len(matches) - 1; extra > 0 {
+		status += fmt.Sprintf(", +%d more stored", extra)
+	}
+	return kind, status
+}
+
+// freshestCredential picks the record with the latest expiry, the one most
+// likely to carry a run without a refresh. matches must be non-empty.
+func freshestCredential(matches []oauthtoken.Entry) *oauthtoken.Record {
+	best := matches[0].Record
+	for _, m := range matches[1:] {
+		if m.Record.ExpiresAt.After(best.ExpiresAt) {
+			best = m.Record
+		}
+	}
+	return best
 }
 
 // failedServerReport renders a connect failure as a report row. The class and

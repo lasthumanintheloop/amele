@@ -231,7 +231,8 @@ questions as an agent tool, six YAML lines later:
 
 **Or borrow someone else's tools.** amele is an MCP client: declare the
 servers in the same YAML - `stdio` (a local binary) or Streamable HTTP with
-static header auth - and their tools join the registry under the same
+static header auth or OAuth (`amele mcp login`, silent refresh in the run) -
+and their tools join the registry under the same
 permissions, budgets and session log, named `<server>__<tool>`. The toolset is
 frozen for the run, a missing `required` server is exit 8 rather than a
 half-equipped agent, and `amele explain` connects and shows you exactly what a
@@ -281,7 +282,8 @@ Direction, not dates. Details and discussion live in
 [milestones](https://github.com/lasthumanintheloop/amele/milestones).
 
 - **v0.2 - connected and fast.** MCP client - **done**: stdio and Streamable
-  HTTP with static header auth ([docs/mcp.md](docs/mcp.md)); OAuth is next.
+  HTTP with static header auth, plus OAuth 2.1 with `amele mcp
+  login|status|logout` ([docs/mcp.md](docs/mcp.md)).
   Then: parallel tool calls within a turn; sampling parameters (`temperature`, `top_p`) and a
   provider-normalized `reasoning` setting (effort / thinking budget) that
   survives tool loops across OpenAI, Anthropic, DeepSeek and OpenRouter;

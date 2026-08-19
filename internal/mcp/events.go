@@ -54,6 +54,14 @@ type ConnectInfo struct {
 	SessionFP string
 	// ToolCount is how many tools the server contributed after filtering.
 	ToolCount int
+	// Auth is the credential mechanism the session authenticated with
+	// ("oauth"), or "" when the server needed none - a static header counts as
+	// none, since nothing about it is amele's to manage.
+	//
+	// SECURITY: the mechanism only. The token, the issuer and the expiry are
+	// deliberately absent: this value is copied into the session log, and a
+	// connect record must never be a place a credential can leak from.
+	Auth string
 }
 
 // ListedTool is one tool amele accepted from a server, in the form an operator
