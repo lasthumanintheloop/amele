@@ -55,11 +55,21 @@ type Record struct {
 	// refresh byte for byte against what it issued the token for. Storing both
 	// keeps the lookup stable without ever sending a string the server did not
 	// see at issuance.
-	AuthResource string    `json:"auth_resource,omitempty"`
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token,omitempty"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	Scopes       []string  `json:"scopes,omitempty"`
+	AuthResource string `json:"auth_resource,omitempty"`
+	// RevocationEndpoint is the RFC 7009 endpoint the authorization server
+	// advertised at login, stored so `amele mcp logout` can hand the token
+	// back instead of only forgetting it locally. It is additive (schema
+	// Version stays 1) and may be empty, which means the server advertises no
+	// revocation endpoint and logout is a local delete.
+	//
+	// It lives in the record rather than being rediscovered at logout time
+	// because discovery needs the protected resource to answer a 401, and a
+	// logout must work for a server that is gone, moved or unreachable.
+	RevocationEndpoint string    `json:"revocation_endpoint,omitempty"`
+	AccessToken        string    `json:"access_token"`
+	RefreshToken       string    `json:"refresh_token,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at"`
+	Scopes             []string  `json:"scopes,omitempty"`
 }
 
 // Entry pairs a stored Record with the Key it is filed under. List returns
@@ -359,6 +369,7 @@ func recordEqual(a, b *Record) bool {
 		a.ClientID == b.ClientID &&
 		a.TokenEndpoint == b.TokenEndpoint &&
 		a.AuthResource == b.AuthResource &&
+		a.RevocationEndpoint == b.RevocationEndpoint &&
 		a.AccessToken == b.AccessToken &&
 		a.RefreshToken == b.RefreshToken &&
 		a.ExpiresAt.Equal(b.ExpiresAt) &&

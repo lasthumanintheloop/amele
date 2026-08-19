@@ -119,7 +119,7 @@ func TestCompletionZshFishStatic(t *testing.T) {
 			if strings.TrimSpace(stdout) == "" {
 				t.Fatalf("%s script is empty", shell)
 			}
-			for _, name := range []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "help"} {
+			for _, name := range []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "mcp", "help"} {
 				if !strings.Contains(stdout, name) {
 					t.Errorf("%s script never mentions command %q", shell, name)
 				}
@@ -143,10 +143,10 @@ func TestCompletionZshConfigGlobs(t *testing.T) {
 			t.Errorf("zsh script is missing the separate pattern %s", want)
 		}
 	}
-	// Both config-taking command groups (run|chat and validate|explain) must
-	// carry the fix, not just the first one.
-	if got := strings.Count(stdout, `_files -g '*.yaml' -g '*.yml'`); got != 2 {
-		t.Errorf("config-file completion appears %d times, want 2", got)
+	// Every config-taking command group (run|chat, validate|explain and the
+	// mcp subcommands) must carry the fix, not just the first one.
+	if got := strings.Count(stdout, `_files -g '*.yaml' -g '*.yml'`); got != 3 {
+		t.Errorf("config-file completion appears %d times, want 3", got)
 	}
 }
 

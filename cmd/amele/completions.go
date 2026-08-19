@@ -28,8 +28,9 @@ _amele_complete() {
 	cur="${COMP_WORDS[COMP_CWORD]}"
 	prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-	local commands="run chat validate explain schema init version completion help"
+	local commands="run chat validate explain schema init version completion mcp help"
 	local shells="bash zsh fish"
+	local mcp_subcommands="login status logout"
 	local agent_flags="--model --set -w --workspace -q --quiet -v --verbose -h --help"
 	local inspect_flags="--set -w --workspace -h --help"
 
@@ -71,6 +72,15 @@ _amele_complete() {
 		completion)
 			if [[ $COMP_CWORD -eq 2 ]]; then
 				COMPREPLY=( $(compgen -W "$shells" -- "$cur") )
+			fi
+			;;
+		mcp)
+			if [[ $COMP_CWORD -eq 2 ]]; then
+				COMPREPLY=( $(compgen -W "$mcp_subcommands" -- "$cur") )
+				return 0
+			fi
+			if [[ $COMP_CWORD -eq 3 ]]; then
+				COMPREPLY=( $(_amele_yaml_files "$cur") )
 			fi
 			;;
 		help)
@@ -119,6 +129,7 @@ _amele() {
 		'init:Write an annotated starter config'
 		'version:Print version, commit and build date'
 		'completion:Print a shell completion script'
+		'mcp:Log in to, inspect or log out of an MCP OAuth credential'
 		'help:Print this text, or the detailed page for one command'
 	)
 
@@ -161,6 +172,13 @@ _amele() {
 				_values 'shell' bash zsh fish
 			fi
 			;;
+		mcp)
+			if (( CURRENT == 3 )); then
+				_values 'subcommand' login status logout
+			elif (( CURRENT == 4 )); then
+				_files -g '*.yaml' -g '*.yml'
+			fi
+			;;
 		help)
 			if (( CURRENT == 3 )); then
 				_describe 'command' commands
@@ -180,7 +198,7 @@ _amele "$@"
 # Hand-written against fish's own complete builtin - no completion framework
 # required.
 
-set -l amele_commands run chat validate explain schema init version completion help
+set -l amele_commands run chat validate explain schema init version completion mcp help
 
 complete -c amele -f
 
@@ -200,6 +218,7 @@ complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a schema
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a init -d "Write an annotated starter config"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a version -d "Print version, commit and build date"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a completion -d "Print a shell completion script"
+complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a mcp -d "Log in to, inspect or log out of an MCP OAuth credential"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a help -d "Print this text, or the detailed page for one command"
 
 # Config-path slot: YAML files and directories (pack shorthand).
@@ -217,6 +236,12 @@ complete -c amele -n "__fish_seen_subcommand_from $amele_commands" -s h -l help 
 complete -c amele -n "__fish_seen_subcommand_from init" -a "(__fish_complete_suffix .yaml)"
 
 complete -c amele -n "__fish_seen_subcommand_from completion" -a "bash zsh fish" -d "Shell"
+
+# The mcp family: a subcommand first, then the config path.
+complete -c amele -n "__fish_seen_subcommand_from mcp; and not __fish_seen_subcommand_from login status logout" -a "login status logout" -d "Credential command"
+complete -c amele -n "__fish_seen_subcommand_from mcp; and __fish_seen_subcommand_from login status logout" -k -a "(__fish_complete_directories)"
+complete -c amele -n "__fish_seen_subcommand_from mcp; and __fish_seen_subcommand_from login status logout" -k -a "(__fish_complete_suffix .yaml)"
+complete -c amele -n "__fish_seen_subcommand_from mcp; and __fish_seen_subcommand_from login status logout" -k -a "(__fish_complete_suffix .yml)"
 complete -c amele -n "__fish_seen_subcommand_from help" -a "$amele_commands"
 `
 )

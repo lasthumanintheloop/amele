@@ -46,6 +46,8 @@ type fakeAuthServer struct {
 	// tokenScope is the scope string the token response carries; empty omits
 	// the field entirely.
 	tokenScope string
+	// revokeStatus is the status /revoke answers with; 0 means 200.
+	revokeStatus int
 
 	mu sync.Mutex
 	// authorizeQueries records every /authorize request's query.
@@ -54,6 +56,8 @@ type fakeAuthServer struct {
 	tokenForms []url.Values
 	// codeChallenge is the PKCE challenge the last /authorize carried.
 	codeChallenge string
+	// revokeForms records every /revoke request's posted form.
+	revokeForms []url.Values
 }
 
 // newFakeAuthServer starts the fixture and points the OAuth client seam at a
@@ -110,6 +114,8 @@ func (f *fakeAuthServer) route(w http.ResponseWriter, r *http.Request) {
 		f.authorize(w, r)
 	case "/token":
 		f.token(w, r)
+	case "/revoke":
+		f.revoke(w, r)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
@@ -184,6 +190,23 @@ func (f *fakeAuthServer) token(w http.ResponseWriter, r *http.Request) {
 		body["scope"] = scope
 	}
 	writeJSON(w, body)
+}
+
+// revoke plays the RFC 7009 revocation endpoint: it records the form and
+// answers with revokeStatus (200 by default).
+func (f *fakeAuthServer) revoke(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	f.mu.Lock()
+	f.revokeForms = append(f.revokeForms, r.PostForm)
+	status := f.revokeStatus
+	f.mu.Unlock()
+	if status == 0 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
 }
 
 // lastAuthorizeQuery returns the query of the most recent /authorize request.

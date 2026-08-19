@@ -1029,7 +1029,7 @@ func TestVersionCommandExtraArgs(t *testing.T) {
 // helpCommands is every command name that must own a detailed help page. It
 // mirrors the dispatch switch in run(), so a command added without a page
 // fails here instead of shipping undocumented.
-var helpCommands = []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "help"}
+var helpCommands = []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "mcp", "help"}
 
 // helpSections is the man-page skeleton every detailed page promises. Tests
 // assert on the section headers rather than on whole-page golden text: the

@@ -497,3 +497,30 @@ func TestWithLockAuthResourceChangePersists(t *testing.T) {
 		t.Fatalf("auth_resource not persisted: %+v", loaded)
 	}
 }
+
+// TestWithLockRevocationEndpointChangePersists guards the field-wise
+// comparison for the additive revocation_endpoint field: a record that differs
+// only there must still reach disk, or a re-login against a server that has
+// since advertised RFC 7009 would leave `amele mcp logout` unable to revoke.
+func TestWithLockRevocationEndpointChangePersists(t *testing.T) {
+	s := NewStore(t.TempDir(), fixedClock(time.Unix(1000, 0)))
+	k := testKey()
+	if err := s.Save(k, testRecord(k)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	const endpoint = "https://as.example/revoke"
+	if _, err := s.WithLock(context.Background(), k, func(current *Record) (*Record, error) {
+		next := *current
+		next.RevocationEndpoint = endpoint
+		return &next, nil
+	}); err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	loaded, err := s.Load(k)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.RevocationEndpoint != endpoint {
+		t.Fatalf("revocation_endpoint not persisted: %+v", loaded)
+	}
+}

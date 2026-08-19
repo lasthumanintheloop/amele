@@ -193,8 +193,8 @@ type asDiscovery struct {
 	resource string
 	// tokenEndpoint is recorded so a run can refresh without discovery.
 	tokenEndpoint string
-	// revocationEndpoint is captured here for `amele mcp logout` (Task 7 adds
-	// the record field that stores it); an empty value means the server
+	// revocationEndpoint reaches Record.RevocationEndpoint so `amele mcp
+	// logout` can hand the credential back; an empty value means the server
 	// advertises no RFC 7009 endpoint.
 	revocationEndpoint string
 	// codeChallengeMethods is what the PKCE refusal is decided on.
@@ -476,10 +476,14 @@ func (f *loginFlow) record(disc *asDiscovery, resource string, now time.Time) (*
 		// authorization server bound the token to, and every refresh has to
 		// send it back byte for byte.
 		AuthResource: disc.resource,
-		AccessToken:  tok.AccessToken,
-		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    expiry,
-		Scopes:       grantedScopes(tok, f.requested),
+		// Stored at login because logout cannot rediscover it: discovery
+		// starts from a 401 the protected resource may no longer be there to
+		// send. Empty means the server advertises no RFC 7009 endpoint.
+		RevocationEndpoint: disc.revocationEndpoint,
+		AccessToken:        tok.AccessToken,
+		RefreshToken:       tok.RefreshToken,
+		ExpiresAt:          expiry,
+		Scopes:             grantedScopes(tok, f.requested),
 	}, nil
 }
 

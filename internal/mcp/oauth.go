@@ -191,13 +191,7 @@ func newRunOAuthHandler(cfg config.MCPServer, deps Deps) (*runOAuthHandler, erro
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errAuthDenied, err)
 	}
-	entries, listErr := deps.TokenStore.List()
-	var matches []oauthtoken.Entry
-	for _, e := range entries {
-		if e.Key.Resource == resource {
-			matches = append(matches, e)
-		}
-	}
+	matches, listErr := MatchCredentials(deps.TokenStore, resource)
 	// listErr reports files that could not be read or decoded. It is only
 	// fatal when nothing usable was found: one stray file in the token
 	// directory must not take down a run whose credential is right there.
@@ -262,15 +256,22 @@ func pickCredential(matches []oauthtoken.Entry, clientID, resource string) (oaut
 // endpoint at all cannot be refreshed and is refused here rather than at the
 // first expiry, so the operator hears about it at connect time.
 func checkTokenEndpoint(raw string) error {
+	return checkHTTPSEndpoint(raw, "token endpoint")
+}
+
+// checkHTTPSEndpoint refuses a stored endpoint amele will not POST a
+// credential to. what names the endpoint in the error, so one rule serves the
+// token endpoint and the revocation endpoint alike.
+func checkHTTPSEndpoint(raw, what string) error {
 	if raw == "" {
-		return errors.New("no token endpoint recorded")
+		return fmt.Errorf("no %s recorded", what)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("parsing token endpoint: %w", err)
+		return fmt.Errorf("parsing %s: %w", what, err)
 	}
 	if u.Scheme != "https" || u.Host == "" {
-		return fmt.Errorf("token endpoint %q must be an absolute https url", raw)
+		return fmt.Errorf("%s %q must be an absolute https url", what, raw)
 	}
 	return nil
 }

@@ -119,6 +119,7 @@ Commands:
   explain     Dry-run report: tools, permissions, budgets, output, warnings.
   schema      Print the config JSON Schema for editors and tooling.
   init        Write an annotated starter config (an existing file is kept).
+  mcp         Log in to, inspect or log out of an MCP server's OAuth credential.
   version     Print this binary's version, commit and build date.
   completion  Print a shell completion script for bash, zsh or fish.
   help        Print this text, or the detailed page for one command.
@@ -130,6 +131,7 @@ Synopsis:
   amele explain <config.yaml|dir> [--set key=value] [-w DIR]
   amele schema
   amele init [path]
+  amele mcp login|status|logout <config.yaml|dir> [server]
   amele version
   amele completion bash|zsh|fish
   amele help [command]
@@ -157,6 +159,7 @@ const (
 	usageValidate   = "usage: amele validate <config.yaml|dir> [--set key=value] [-w DIR]"
 	usageExplain    = "usage: amele explain <config.yaml|dir> [--set key=value] [-w DIR]"
 	usageCompletion = "usage: amele completion bash|zsh|fish"
+	usageMCP        = "usage: amele mcp login|status|logout <config.yaml|dir> [server]"
 )
 
 // The detailed help pages. One raw-string const per command, all built to the
@@ -775,6 +778,79 @@ EXAMPLES
     source <(amele completion bash)
 `
 
+const helpMCP = `amele mcp - log in to, inspect and log out of MCP OAuth credentials
+
+SYNOPSIS
+  amele mcp login <config.yaml|dir> [server]
+  amele mcp status <config.yaml|dir>
+  amele mcp logout <config.yaml|dir> [server]
+
+DESCRIPTION
+  These commands manage the OAuth credentials of the MCP servers a config
+  declares with an auth block. They act on the config as written: there are no
+  --set overrides, because no mcp.* key is overridable.
+
+  A credential is stored per authorization server, per resource and per client
+  id, under ${XDG_STATE_HOME:-$HOME/.local/state}/amele/mcp - one 0600 file per
+  credential in a 0700 directory. The file format is subject to change until
+  v0.3.
+
+  login runs the browser flow, one server at a time in config order, and needs
+  a real terminal on stdin: it asks before it opens anything, and a run with a
+  pipe or /dev/null on stdin is refused rather than left waiting. With no
+  server named, every server that declares oauth is logged into. All of its
+  output - the question, the URL, the result - goes to stderr.
+
+  status is a report and never changes anything: it does not refresh, open a
+  browser or contact any server. It prints one row per stored credential, with
+  the expiry, whether a refresh token is present, the granted scopes and the
+  issuer. A token value is never printed. Its exit code is 0 even when nothing
+  is stored - "no token" is an answer, not a failure.
+
+  logout deletes the credential locally and, when the authorization server
+  advertised an RFC 7009 revocation endpoint at login, asks it to invalidate
+  the token first. The revocation is best effort: if it fails, the local delete
+  still happens and the line says "local only".
+
+FLAGS
+  -h, --help   Print this page to stdout and exit 0.
+
+  The mcp commands take no other flags.
+
+STDIN
+  login reads the y/N answers to its confirmation questions and must be a
+  terminal. status and logout do not read stdin.
+
+STDOUT
+  status writes the credential table. login and logout write nothing to
+  stdout, so they are safe to run with stdout redirected.
+
+STDERR
+  login writes the confirmation question, the authorization URL and one
+  "mcp login ok: <server> (expires <ts>)" line per server. logout writes one
+  "mcp logout: <server> (revoked|local only|no token)" line per server, plus a
+  warning when a revocation failed.
+
+EXIT CODES
+  0  the command completed (status: always, when the config loaded)
+  1  a login did not complete (declined, or the flow failed)
+  2  usage error, config error, an unknown server name, a server without an
+     auth block, or a login without an interactive terminal
+
+EXAMPLES
+  Log in to every OAuth server in a config:
+    amele mcp login agent.yaml
+
+  Log in to one of them:
+    amele mcp login agent.yaml github
+
+  See what is stored, without touching anything:
+    amele mcp status agent.yaml
+
+  Hand the token back and forget it:
+    amele mcp logout agent.yaml github
+`
+
 const helpHelp = `amele help - the command list, or a detailed page per command
 
 SYNOPSIS
@@ -843,6 +919,7 @@ var helpPages = map[string]string{
 	"explain":    helpExplain,
 	"schema":     helpSchema,
 	"init":       helpInit,
+	"mcp":        helpMCP,
 	"version":    helpVersion,
 	"completion": helpCompletion,
 	"help":       helpHelp,
@@ -933,6 +1010,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return cmdSchema(args[1:], stdout, stderr)
 	case "init":
 		return cmdInit(args[1:], stdout, stderr)
+	case "mcp":
+		return cmdMCP(ctx, args[1:], stdin, stdout, stderr, env)
 	case "version", "--version", "-V":
 		return cmdVersion(args[1:], stdout, stderr)
 	case "completion":
