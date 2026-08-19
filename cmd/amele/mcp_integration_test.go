@@ -176,3 +176,92 @@ mcp:
 		t.Error("explain leaked the Authorization token into its report")
 	}
 }
+
+// TestIntegrationMCPOAuth points `amele mcp status` and, optionally,
+// `amele explain` at a real OAuth-protected Streamable HTTP MCP server. This
+// is the one place slice 1's fake authorization server (Task 6) cannot stand
+// in: a real discovery document, a real token endpoint and a real client-id
+// metadata fetch.
+//
+// It NEVER opens a browser, in CI or anywhere else: `amele mcp login` is not
+// invoked by this test. Logging in is a manual precondition the operator
+// performs once, out of band, with:
+//
+//	amele mcp login <config> <server>
+//
+// before running this test with AMELE_MCP_OAUTH_ASSUME_LOGIN=1. Without that
+// variable the test only proves the read-only half - `status` never talks to
+// the authorization server, never refreshes and never opens anything, so it
+// is safe to run with no credential stored at all.
+//
+//	AMELE_MCP_OAUTH_URL=https://mcp.example.com/mcp \
+//	go test -tags integration ./cmd/amele -run TestIntegrationMCPOAuth -v
+//
+//	# after a one-time manual `amele mcp login`:
+//	AMELE_MCP_OAUTH_URL=https://mcp.example.com/mcp \
+//	AMELE_MCP_OAUTH_ASSUME_LOGIN=1 \
+//	go test -tags integration ./cmd/amele -run TestIntegrationMCPOAuth -v
+func TestIntegrationMCPOAuth(t *testing.T) {
+	url := os.Getenv("AMELE_MCP_OAUTH_URL")
+	if url == "" {
+		t.Skip("AMELE_MCP_OAUTH_URL not set")
+	}
+
+	dir := t.TempDir()
+	yaml := fmt.Sprintf(`model: fake
+provider:
+  base_url: https://example.invalid/v1
+  api_key: ${AMELE_MCP_OAUTH_URL}
+system_prompt: "unused: this config is only ever explained or statused."
+tools:
+  fs: false
+mcp:
+  servers:
+    - name: oauth-server
+      transport:
+        type: http
+        url: %s
+      auth:
+        type: oauth
+      required: true
+`, url)
+	cfgPath := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil { //nolint:gosec // G703: cfgPath is t.TempDir() + a constant name, not tainted input.
+		t.Fatal(err)
+	}
+
+	// `status` is the read-only half of the CLI contract (docs/mcp.md, "The
+	// three commands"): it never dials the authorization server, so this call
+	// is safe to make with or without a stored credential and proves nothing
+	// more than "the credential store and the config are both readable."
+	var stdout, stderr bytes.Buffer
+	if code := run(context.Background(), []string{"mcp", "status", cfgPath},
+		strings.NewReader(""), &stdout, &stderr, os.LookupEnv); code != ExitOK {
+		t.Fatalf("mcp status: exit %d\nstderr: %s", code, stderr.String())
+	}
+	status := stdout.String()
+	t.Logf("mcp status:\n%s", status)
+	if !strings.Contains(status, "oauth-server") {
+		t.Fatalf("mcp status did not report the configured server:\n%s", status)
+	}
+
+	if os.Getenv("AMELE_MCP_OAUTH_ASSUME_LOGIN") != "1" {
+		t.Skip("AMELE_MCP_OAUTH_ASSUME_LOGIN not set to 1: stopping after status " +
+			"(run 'amele mcp login' by hand first, then rerun with the flag set)")
+	}
+
+	// `explain` connects for real (docs/mcp.md, "amele explain connects for
+	// real") and, with a stored credential, exercises silent refresh at
+	// connect time - the thing a fake authorization server can only simulate.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run(context.Background(), []string{"explain", cfgPath},
+		strings.NewReader(""), &stdout, &stderr, os.LookupEnv); code != ExitOK {
+		t.Fatalf("explain: exit %d\nstderr: %s", code, stderr.String())
+	}
+	report := stdout.String()
+	t.Logf("explain:\n%s", report)
+	if !strings.Contains(report, "connected") {
+		t.Fatalf("explain did not report a connected server:\n%s", report)
+	}
+}
