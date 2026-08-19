@@ -1,6 +1,7 @@
 package oauthtoken
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -216,6 +218,107 @@ func (s *Store) ensureDir() error {
 		}
 	}
 	return nil
+}
+
+// WithLock serializes access to one credential across processes.
+//
+// It takes an exclusive lock on the sibling lock file, RE-READS the record
+// under that lock and passes it to fn (nil when there is no credential yet).
+// The re-read is the whole contract: a caller that waited for the lock may have
+// been waiting precisely because another process was refreshing the same
+// credential, so anything read before the wait is stale — acting on it would
+// spend a refresh token that has already been rotated away.
+//
+// If fn returns a non-nil record that differs from what was read, it is saved
+// before the lock is released; a nil or unchanged record leaves the file
+// untouched (no rewrite, no mtime change). WithLock returns the record now in
+// effect. If fn returns an error, nothing is written and the error is returned
+// wrapped, so errors.Is on the caller's own sentinel still works.
+//
+// CONTRACT: the lock is on <name>.lock, never on the record file itself. Save
+// installs a record by rename, which swaps the inode, so a lock held on the
+// record file would stop excluding anyone the moment a refresh completed.
+//
+// Waiting respects ctx: both flock(2) and LockFileEx block without a deadline,
+// so acquisition runs on its own goroutine and this call races it against
+// ctx.Done. When ctx wins, a small goroutine stays behind to release and close
+// the lock file if and when acquisition eventually succeeds — it holds no
+// caller state, cannot double-release (the acquiring goroutine reports exactly
+// once over a buffered channel) and ends as soon as the current holder lets go.
+// That is the only shutdown path a deadline-less lock allows; the alternative,
+// abandoning the descriptor, would leak the lock itself.
+func (s *Store) WithLock(ctx context.Context, k Key, fn func(current *Record) (*Record, error)) (*Record, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err // never take a lock a cancelled caller cannot use
+	}
+	if err := s.ensureDir(); err != nil {
+		return nil, err
+	}
+	path := s.lockPath(k)
+	// SECURITY: 0600 like the record itself. The lock file holds no secret, but
+	// a world-writable one in a 0700 directory would still be an odd artifact,
+	// and creating it with the same mode keeps one rule for the directory.
+	//nolint:gosec // G304: the path is derived from the store directory and a hash of the key.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("opening lock file %s: %w", path, err)
+	}
+
+	acquired := make(chan error, 1) // buffered: the goroutine must never block on a caller that walked away
+	go func() { acquired <- lockExclusive(f) }()
+
+	select {
+	case err := <-acquired:
+		if err != nil {
+			_ = f.Close()
+			return nil, err
+		}
+	case <-ctx.Done():
+		go func() {
+			if err := <-acquired; err == nil {
+				_ = unlockFile(f)
+			}
+			_ = f.Close()
+		}()
+		return nil, ctx.Err()
+	}
+	defer func() {
+		_ = unlockFile(f)
+		_ = f.Close()
+	}()
+
+	current, err := s.Load(k)
+	if err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		current = nil // an absent credential is a state fn handles, not an error
+	}
+	next, err := fn(current)
+	if err != nil {
+		return nil, fmt.Errorf("under credential lock for %s: %w", k.Resource, err)
+	}
+	if next == nil {
+		return current, nil
+	}
+	// DeepEqual rather than a field-by-field compare: Record is small, acyclic
+	// and grows over time, and a forgotten field here would mean a silently
+	// dropped write. Skipping the equal case keeps a read-only refresh check
+	// from rewriting (and re-fsyncing) the file on every run.
+	if reflect.DeepEqual(current, next) {
+		return current, nil
+	}
+	if err := s.Save(k, next); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+// lockPath returns the sibling lock file for k: the record path with .json
+// swapped for .lock. It is derived from path so the two can never drift apart,
+// and List ignores it because it only reads .json entries.
+func (s *Store) lockPath(k Key) string {
+	return strings.TrimSuffix(s.path(k), ".json") + ".lock"
 }
 
 // Delete removes the credential stored under k. It is idempotent: deleting a
