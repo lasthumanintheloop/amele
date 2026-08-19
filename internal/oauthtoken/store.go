@@ -11,7 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"time"
 )
@@ -246,7 +246,10 @@ func (s *Store) ensureDir() error {
 // caller state, cannot double-release (the acquiring goroutine reports exactly
 // once over a buffered channel) and ends as soon as the current holder lets go.
 // That is the only shutdown path a deadline-less lock allows; the alternative,
-// abandoning the descriptor, would leak the lock itself.
+// abandoning the descriptor, would leak the lock itself. Note that a blocking
+// flock(2) or LockFileEx pins an OS thread, not merely a goroutine, for as long
+// as a wedged foreign holder keeps the lock — cancelling the context frees the
+// caller, never the thread.
 func (s *Store) WithLock(ctx context.Context, k Key, fn func(current *Record) (*Record, error)) (*Record, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err // never take a lock a cancelled caller cannot use
@@ -294,6 +297,17 @@ func (s *Store) WithLock(ctx context.Context, k Key, fn func(current *Record) (*
 		}
 		current = nil // an absent credential is a state fn handles, not an error
 	}
+	// Snapshot before fn runs. fn is handed the very record it is meant to
+	// update, so mutating it in place and returning the same pointer is the
+	// idiom a refresh reaches for first; comparing the result against the live
+	// (already mutated) pointer would report "no change" and silently drop a
+	// rotated refresh token. Comparing against the snapshot makes both idioms —
+	// mutate-in-place and return-a-copy — persist identically.
+	var before *Record
+	if current != nil {
+		snapshot := *current
+		before = &snapshot
+	}
 	next, err := fn(current)
 	if err != nil {
 		return nil, fmt.Errorf("under credential lock for %s: %w", k.Resource, err)
@@ -301,17 +315,41 @@ func (s *Store) WithLock(ctx context.Context, k Key, fn func(current *Record) (*
 	if next == nil {
 		return current, nil
 	}
-	// DeepEqual rather than a field-by-field compare: Record is small, acyclic
-	// and grows over time, and a forgotten field here would mean a silently
-	// dropped write. Skipping the equal case keeps a read-only refresh check
-	// from rewriting (and re-fsyncing) the file on every run.
-	if reflect.DeepEqual(current, next) {
-		return current, nil
+	// Skipping the unchanged case keeps a read-only freshness check from
+	// rewriting (and re-fsyncing) the file on every run.
+	if recordEqual(before, next) {
+		return next, nil
 	}
 	if err := s.Save(k, next); err != nil {
 		return nil, err
 	}
 	return next, nil
+}
+
+// recordEqual reports whether two records carry the same credential.
+//
+// It is written out field by field rather than delegating to
+// reflect.DeepEqual because a time.Time read from the wall clock keeps a
+// monotonic reading that a time.Time decoded from JSON does not: DeepEqual
+// compares those hidden fields and would report an unchanged expiry as a
+// change, rewriting (and re-fsyncing) the file on every run. time.Equal
+// compares the instants, which is the question actually being asked. The cost
+// is that a new field must be added here too — hence the reminder below.
+func recordEqual(a, b *Record) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	// NOTE: every field of Record is compared here; adding one to the struct
+	// without adding it here would mean a silently dropped write.
+	return a.Version == b.Version &&
+		a.Issuer == b.Issuer &&
+		a.Resource == b.Resource &&
+		a.ClientID == b.ClientID &&
+		a.TokenEndpoint == b.TokenEndpoint &&
+		a.AccessToken == b.AccessToken &&
+		a.RefreshToken == b.RefreshToken &&
+		a.ExpiresAt.Equal(b.ExpiresAt) &&
+		slices.Equal(a.Scopes, b.Scopes)
 }
 
 // lockPath returns the sibling lock file for k: the record path with .json
@@ -323,6 +361,11 @@ func (s *Store) lockPath(k Key) string {
 
 // Delete removes the credential stored under k. It is idempotent: deleting a
 // credential that is not there succeeds, so "log out" needs no prior lookup.
+//
+// The sibling .lock file is deliberately left behind: unlinking a lock name
+// destroys the exclusion it provides (a process still holding the lock would be
+// holding an unreachable inode while a newcomer creates and locks a fresh one).
+// What stays is an empty 0600 file carrying no secret.
 func (s *Store) Delete(k Key) error {
 	if err := os.Remove(s.path(k)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("deleting token file: %w", err)

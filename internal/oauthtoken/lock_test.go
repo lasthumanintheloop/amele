@@ -377,3 +377,98 @@ func TestWithLockAcrossProcesses(t *testing.T) {
 		t.Fatalf("WithLock entered after %v, want to have waited for the helper's %v hold", waited, hold)
 	}
 }
+
+// TestWithLockPersistsInPlaceMutation pins the aliasing trap: fn is handed the
+// record it is expected to update, and mutating it in place then returning the
+// same pointer is the idiom a refresh will reach for first. Comparing the
+// returned record against that same (already mutated) pointer would report "no
+// change" and silently drop a rotated refresh token.
+func TestWithLockPersistsInPlaceMutation(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, fixedClock(time.Unix(1000, 0)))
+	k := testKey()
+	if err := s.Save(k, testRecord(k)); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := s.WithLock(context.Background(), k, func(current *Record) (*Record, error) {
+		current.AccessToken = "rotated-in-place"
+		current.RefreshToken = "new-refresh"
+		current.ExpiresAt = time.Unix(9000, 0).UTC()
+		return current, nil // same pointer, deliberately
+	})
+	if err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	if got.AccessToken != "rotated-in-place" {
+		t.Fatalf("WithLock returned %q", got.AccessToken)
+	}
+	loaded, err := s.Load(k)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if loaded.AccessToken != "rotated-in-place" || loaded.RefreshToken != "new-refresh" {
+		t.Fatalf("in-place mutation was not persisted: %+v", loaded)
+	}
+}
+
+// TestWithLockScopeChangePersists guards the field-wise comparison: a change
+// only in the scope slice still has to reach disk.
+func TestWithLockScopeChangePersists(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, fixedClock(time.Unix(1000, 0)))
+	k := testKey()
+	r := testRecord(k)
+	r.Scopes = []string{"a"}
+	if err := s.Save(k, r); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := s.WithLock(context.Background(), k, func(current *Record) (*Record, error) {
+		next := *current
+		next.Scopes = []string{"a", "b"}
+		return &next, nil
+	}); err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	loaded, err := s.Load(k)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(loaded.Scopes) != 2 {
+		t.Fatalf("scopes not persisted: %+v", loaded.Scopes)
+	}
+}
+
+// TestWithLockMonotonicTimeIsNotAChange pins that an expiry compared with
+// time.Equal (not reflect.DeepEqual) does not read as changed merely because
+// one of the two values still carries a monotonic clock reading.
+func TestWithLockMonotonicTimeIsNotAChange(t *testing.T) {
+	dir := t.TempDir()
+	s := NewStore(dir, fixedClock(time.Unix(1000, 0)))
+	k := testKey()
+	r := testRecord(k)
+	now := time.Now() // carries a monotonic reading
+	r.ExpiresAt = now
+	if err := s.Save(k, r); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	path := s.path(k)
+	old := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if _, err := s.WithLock(context.Background(), k, func(current *Record) (*Record, error) {
+		next := *current
+		next.ExpiresAt = now // same instant, but with the monotonic reading attached
+		return &next, nil
+	}); err != nil {
+		t.Fatalf("WithLock: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if !fi.ModTime().Equal(old) {
+		t.Fatal("file was rewritten for an unchanged expiry")
+	}
+}

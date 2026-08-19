@@ -17,6 +17,13 @@ const lockRegionLen = 1
 
 // lockExclusive blocks until it holds an exclusive lock on f.
 //
+// This deliberately diverges from internal/runlock, which refuses to lock on
+// Windows rather than ship a path no CI job executes. The trade differs here:
+// runlock guards a whole run and failing closed is honest, whereas this lock
+// only serializes a token refresh, so refusing would make every Windows refresh
+// fail. An untested-but-plausible lock costs at worst a lost refresh-token
+// rotation (re-login), never a leaked credential.
+//
 // LOCKFILE_EXCLUSIVE_LOCK without LOCKFILE_FAIL_IMMEDIATELY is the blocking
 // form; like flock(2) it has no deadline, so the caller races it against the
 // context on a separate goroutine. Windows file locks are mandatory and are
