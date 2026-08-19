@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -36,6 +37,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/explain"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/loop"
+	"github.com/lasthumanintheloop/amele/internal/mcp"
 	"github.com/lasthumanintheloop/amele/internal/perm"
 	"github.com/lasthumanintheloop/amele/internal/runlock"
 	"github.com/lasthumanintheloop/amele/internal/schema"
@@ -1668,7 +1670,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 
-	agent, answer, err := buildAgent(cfg, validator, newLineReader(stdin), stderr)
+	agent, answer, hints, err := buildAgent(cfg, validator, newLineReader(stdin), stderr)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
@@ -1678,12 +1680,47 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 
 	if interrupted {
+		// Nothing will run, so no MCP server is started: spending a connect
+		// attempt on a run that is already over would only add a failure to
+		// the log.
 		return reportInterruptedRead(agent, cfg, taskArgs, taskErr, validator != nil, parsed.quiet, stderr)
 	}
 
-	res, runErr := agent.Run(ctx, task)
+	// run_start is written here rather than by loop.Run because the MCP
+	// connects must land BETWEEN run_start and the first llm_response
+	// (docs/contracts/jsonl-events.md, Ordering). loop.Run's contract already
+	// hands that choice to callers driving their own history - `chat` has
+	// always done it - so the run below goes through RunMessages.
+	agent.Session.RunStart(cfg.Model, task)
+
+	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version)
+	maps.Copy(hints, set.hints)
+	// CONTRACT: mcp_disconnect precedes run_end, and run_end.mcp_errors is
+	// final. WithoutCancel so an orderly close still happens after a SIGTERM
+	// cancelled the run context.
+	finish := func() {
+		set.close(context.WithoutCancel(ctx))
+		agent.Session.SetMCPErrors(set.errors())
+	}
+	if mcpErr != nil {
+		// An interruption reaches the servers before it reaches the loop: a
+		// SIGTERM during the connect fails every attempt. CONTRACT: that is an
+		// interrupted RUN (exit 1), not a missing dependency (exit 8) - a cron
+		// job that was told to stop must not page anyone about a server that
+		// is perfectly healthy.
+		if ctx.Err() != nil {
+			mcpErr = interruptedError(ctx.Err())
+		}
+		code := exitCodeFor(mcpErr)
+		finish()
+		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr)
+		return code
+	}
+
+	res, runErr := agent.RunMessages(ctx, openingHistory(cfg, task))
 	code := exitCodeFor(runErr)
 
+	finish()
 	reportRun(agent, res, runErr, code, validator != nil, parsed.quiet, stderr)
 
 	if runErr == nil {
@@ -1693,6 +1730,36 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		_, _ = fmt.Fprintln(stdout, answer(res))
 	}
 	return code
+}
+
+// interruptedError renders an interruption of a run that had already started,
+// mapping it onto the exit code contract.
+//
+// CONTRACT (docs/contracts/cli.md "Signals"): an operator interrupt is exit 1,
+// but exit 3 is reserved for configured budgets - and limits.timeout is the
+// only thing that can produce a deadline here, the same split
+// loop.wrapContextErr makes mid-run.
+func interruptedError(cause error) error {
+	if errors.Is(cause, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", loop.ErrBudgetExceeded, cause)
+	}
+	return fmt.Errorf("run interrupted: %w", cause)
+}
+
+// openingHistory builds the one-shot conversation `run` starts from: the
+// system prompt, when there is one, then the task as the user message.
+//
+// It mirrors loop.Run, which cmdRun no longer calls: run_start has to be
+// written before the MCP servers connect (see cmdRun), and loop.Run writes its
+// own. Keeping the two lines here rather than adding a flag to the loop keeps
+// the loop's contract - "callers driving their own history log their own
+// opening event" - exactly as it was.
+func openingHistory(cfg *config.Config, task string) []llm.Message {
+	messages := make([]llm.Message, 0, 2)
+	if cfg.SystemPrompt != "" {
+		messages = append(messages, llm.Message{Role: llm.RoleSystem, Content: cfg.SystemPrompt})
+	}
+	return append(messages, llm.Message{Role: llm.RoleUser, Content: task})
 }
 
 // reportInterruptedRead closes out a run that was interrupted while its task
@@ -1710,13 +1777,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 // a session file whose only event is run_end would describe no run at all. The
 // task recorded is what the operator typed, since the piped part never arrived.
 func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string, cause error, schemaMode, quiet bool, stderr io.Writer) int {
-	err := fmt.Errorf("run interrupted: %w", cause)
-	if errors.Is(cause, context.DeadlineExceeded) {
-		// CONTRACT: exit 3 is reserved for configured budgets, and
-		// limits.timeout is the only thing that can produce a deadline here -
-		// the same split loop.wrapContextErr makes mid-run.
-		err = fmt.Errorf("%w: %v", loop.ErrBudgetExceeded, cause)
-	}
+	err := interruptedError(cause)
 	code := exitCodeFor(err)
 	agent.Session.RunStart(cfg.Model, taskArgs)
 	// Zero accounting: nothing was spent, and the summary must not invent turns.
@@ -1863,7 +1924,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	// approval read swallow the user's next chat line (or vice versa).
 	lines := newLineReader(stdin)
 
-	agent, _, err := buildAgent(cfg, nil, lines, stderr)
+	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
@@ -1872,7 +1933,25 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		agent.Progress = progressLogger(stderr, agentSecrets(cfg))
 	}
 
-	return (&chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet}).repl(ctx, lines, stdout, stderr)
+	// A chat writes ONE run_start for the whole session, and the MCP servers
+	// belong inside it like every other event (docs/contracts/jsonl-events.md).
+	agent.Session.RunStart(cfg.Model, chatTaskLabel)
+
+	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version)
+	maps.Copy(hints, set.hints)
+	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx}
+	if mcpErr != nil {
+		// The conversation never starts: a chat whose tools are missing would
+		// mislead the human at the keyboard for its whole length. A Ctrl-C
+		// during the connect is reported as the interruption it is, exactly
+		// like in `run`.
+		if ctx.Err() != nil {
+			mcpErr = interruptedError(ctx.Err())
+		}
+		return s.finish(stderr, exitCodeFor(mcpErr), mcpErr)
+	}
+
+	return s.repl(ctx, lines, stdout, stderr)
 }
 
 // maxProgressLine bounds one rendered progress line, in bytes. The loop
@@ -1920,6 +1999,11 @@ type chatSession struct {
 	// quiet drops the closing summary; the prompt, the errors and the
 	// permission questions stay, because those are the conversation itself.
 	quiet bool
+	// mcp are the session's MCP servers, closed by finish before run_end.
+	mcp *mcpSet
+	// runCtx is the session's context, kept only so finish can derive an
+	// uncancellable one for the orderly MCP shutdown after a signal.
+	runCtx context.Context //nolint:containedctx // session lifetime, not request scope
 
 	// history is the conversation the caller owns. loop.RunMessages never
 	// mutates it, so every turn is appended here explicitly.
@@ -1935,7 +2019,6 @@ type chatSession struct {
 // and returns the process exit code. It writes exactly one run_start/run_end
 // pair and one summary line for the whole session.
 func (s *chatSession) repl(ctx context.Context, lines *lineReader, stdout, stderr io.Writer) int {
-	s.agent.Session.RunStart(s.cfg.Model, chatTaskLabel)
 	if s.cfg.SystemPrompt != "" {
 		s.history = append(s.history, llm.Message{Role: llm.RoleSystem, Content: s.cfg.SystemPrompt})
 	}
@@ -2057,6 +2140,10 @@ func (s *chatSession) applyBudget() error {
 // finish closes the session log and prints the one-line cumulative summary,
 // returning the exit code it was given.
 func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
+	// CONTRACT: the mcp_disconnect events precede run_end. WithoutCancel so a
+	// Ctrl-C at the prompt still buys the servers their orderly close.
+	s.mcp.close(context.WithoutCancel(s.runCtx))
+	s.agent.Session.SetMCPErrors(s.mcp.errors())
 	status := "success"
 	if err != nil {
 		status = "error"
@@ -2162,7 +2249,12 @@ func (l *lineReader) ReadLine() (string, error) {
 // One list feeds every sink a run writes to (the session JSONL and the -v
 // progress feed), so a new sink cannot be given a shorter one by accident.
 func agentSecrets(cfg *config.Config) []string {
-	return append(cfg.InterpolatedSecrets(), cfg.Provider.APIKey)
+	secrets := append(cfg.InterpolatedSecrets(), cfg.Provider.APIKey)
+	// An MCP header is a COMPOSED value ("Bearer " + ${TOKEN}): the
+	// environment value alone is already in the list above, but the assembled
+	// header is what a server echoes back in an error, so it is registered as
+	// a secret in its own right.
+	return append(secrets, cfg.MCPHeaderSecrets()...)
 }
 
 // buildAgent assembles the loop for one run: tools, permissions, session
@@ -2175,22 +2267,27 @@ func agentSecrets(cfg *config.Config) []string {
 // the CANONICAL JSON the validator accepted, which only the validator closure
 // below ever sees. Result.FinalText is the raw model reply and may be wrapped
 // in a ```json fence or padded with prose, so it is not printable.
-func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineReader, stderr io.Writer) (*loop.Loop, func(*loop.Result) string, error) {
+func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineReader, stderr io.Writer) (*loop.Loop, func(*loop.Result) string, map[string]string, error) {
 	registry, err := buildRegistry(cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	approve, err := buildApprover(cfg, lines, stderr)
+	// The hint map is handed out EMPTY and filled later by connectMCP: the MCP
+	// servers may only be started after run_start is in the session log
+	// (docs/contracts/jsonl-events.md ordering), which is after this function
+	// returns. Nothing reads it until the first tool call, well after that.
+	hints := map[string]string{}
+	approve, err := buildApprover(cfg, lines, stderr, hints)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	var sess *session.Writer
 	if cfg.SessionDir != "" {
 		sess, err = session.New(cfg.SessionDir, session.Options{Secrets: agentSecrets(cfg)})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
@@ -2206,7 +2303,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 
 	if validator == nil {
 		// Plain-text mode: whatever the model said is the answer.
-		return agent, func(res *loop.Result) string { return res.FinalText }, nil
+		return agent, func(res *loop.Result) string { return res.FinalText }, hints, nil
 	}
 
 	// Native structured output where the provider supports it (the client
@@ -2229,7 +2326,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 	// CONTRACT: in schema mode stdout carries ONLY JSON that passed the
 	// schema. The loop returns a nil error exactly when the validator accepted
 	// an answer, so canonical is always set by the time this is called.
-	return agent, func(*loop.Result) string { return canonical }, nil
+	return agent, func(*loop.Result) string { return canonical }, hints, nil
 }
 
 // buildProvider constructs the LLM client selected by provider.type. Validate
@@ -2284,8 +2381,12 @@ const clipMarker = "... (clipped)"
 // The policy itself lives in internal/perm; everything terminal-shaped is
 // injected from here, so perm stays deterministic and testable and the TTY
 // detection has exactly one implementation (isTerminal).
-func buildApprover(cfg *config.Config, lines *lineReader, stderr io.Writer) (loop.Approver, error) {
+func buildApprover(cfg *config.Config, lines *lineReader, stderr io.Writer, hints map[string]string) (loop.Approver, error) {
 	return perm.NewApprover(cfg.Permissions, perm.Options{
+		// What an MCP server said about the tool it published (read-only,
+		// destructive). SECURITY: advisory only - it is shown to the human,
+		// never consulted by the policy (docs/threat-model.md S9).
+		Hint: func(toolName string) string { return hints[toolName] },
 		// Evaluated per call rather than once: nothing here caches a fact
 		// about the process that a caller might have changed.
 		IsTTY:  lines.IsTerminal,
@@ -2421,6 +2522,14 @@ func exitCodeFor(err error) int {
 		return ExitPermissionDenied
 	case errors.Is(err, llm.ErrProvider):
 		return ExitProviderError
+	case errors.Is(err, mcp.ErrUnavailable):
+		// CONTRACT: exit 8 - a declared dependency is missing. Checked before
+		// the default so it can never be reported as a plain task failure.
+		return ExitMCPUnavailable
+	case errors.Is(err, mcp.ErrToolset):
+		// A tool name collision is a config mistake, not a runtime failure:
+		// the same YAML would fail identically on every retry.
+		return ExitConfigError
 	case errors.Is(err, loop.ErrOutputRejected):
 		// CONTRACT: the model answered, but never within output.schema -
 		// exit 6, distinct from a task failure (1) so pipelines can tell
