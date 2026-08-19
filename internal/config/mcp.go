@@ -27,6 +27,11 @@ const (
 	MCPTransportHTTP = "http"
 )
 
+// MCPAuthOAuth is the only accepted value of mcp.servers[].auth.type. It is a
+// single-value set rather than a bool so that a second mechanism can be added
+// later without changing the shape of the block.
+const MCPAuthOAuth = "oauth"
+
 // DefaultMCPCallTimeout bounds a single tool call when a server does not set
 // call_timeout. It is applied by the consumer (internal/mcp), not at load
 // time, so `explain` can still show which value the file actually chose.
@@ -82,6 +87,29 @@ type MCPServer struct {
 	// Required decides whether a failure to connect aborts the run. nil (the
 	// field omitted) means true; see IsRequired.
 	Required *bool `yaml:"required"`
+	// Auth turns on OAuth for this server. nil (the block omitted) means the
+	// static-header path of slice 1; it is a pointer precisely so that
+	// "absent" and "present but empty" stay distinguishable.
+	Auth *MCPAuth `yaml:"auth"`
+}
+
+// MCPAuth configures OAuth for one http MCP server. nil means static headers
+// only.
+//
+// SECURITY: there is deliberately NO client_secret field. amele ships as a
+// public OAuth client (OAuth 2.1 + PKCE); a secret in a YAML recipe would be a
+// committed credential, and strict decoding turns an attempt to write one into
+// a load error naming the key.
+type MCPAuth struct {
+	// Type is the auth mechanism. The only accepted value is MCPAuthOAuth.
+	Type string `yaml:"type"`
+	// ClientID is a pre-registered OAuth client id. Optional: absent means
+	// client id metadata discovery (when the authorization server supports it).
+	ClientID string `yaml:"client_id"`
+	// Scopes are ADDED (union) to the server-driven scope selection, never a
+	// replacement for it - a recipe can ask for more access than the protected
+	// resource advertises, but cannot silently narrow what the flow needs.
+	Scopes []string `yaml:"scopes"`
 }
 
 // IsRequired reports whether a connect failure must abort the run.
@@ -181,6 +209,7 @@ func (c *Config) validateMCP(add func(format string, args ...any)) {
 		validateMCPName(add, where, s.Name, seen, subprocessNames)
 		seen[s.Name] = i
 		validateMCPTransport(add, where+".transport", s.Transport)
+		validateMCPAuth(add, where, s)
 		if s.CallTimeout < 0 {
 			add("%s.call_timeout must not be negative", where)
 		}
@@ -193,6 +222,37 @@ func (c *Config) validateMCP(add func(format string, args ...any)) {
 			if pattern == "" {
 				add("%s.tools.exclude[%d] must not be empty", where, k)
 			}
+		}
+	}
+}
+
+// validateMCPAuth checks the optional auth block of one server.
+//
+// The Authorization-header conflict is an error rather than a precedence rule:
+// with both configured, whichever one lost would fail at the remote end with an
+// opaque 401, and an operator debugging that cannot see which credential amele
+// actually sent.
+func validateMCPAuth(add func(format string, args ...any), where string, s MCPServer) {
+	if s.Auth == nil {
+		return
+	}
+	if s.Auth.Type != MCPAuthOAuth {
+		add("%s.auth.type %q is not supported (only %q)", where, s.Auth.Type, MCPAuthOAuth)
+	}
+	// OAuth is a property of an HTTP exchange: a stdio child process has no
+	// endpoint to authorize against, so the block would be dead config.
+	if s.Transport.Type != MCPTransportHTTP {
+		add("%s.auth requires transport.type %s", where, MCPTransportHTTP)
+	}
+	for _, name := range sortedHeaderNames(s.Transport.Headers) {
+		if strings.EqualFold(name, "authorization") {
+			add("%s: configure either auth: oauth or an Authorization header, not both", where)
+			break
+		}
+	}
+	for i, scope := range s.Auth.Scopes {
+		if scope == "" {
+			add("%s.auth.scopes[%d] must not be empty", where, i)
 		}
 	}
 }

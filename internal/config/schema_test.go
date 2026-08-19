@@ -218,7 +218,13 @@ func collectYAMLPaths(t reflect.Type, prefix string, out map[string]bool) {
 		path := prefix + name
 		out[path] = true
 
-		switch ft := field.Type; ft.Kind() {
+		ft := field.Type
+		// An optional block is a pointer to a struct (nil = absent, e.g.
+		// mcp.servers[].auth); its fields are still named schema properties.
+		if ft.Kind() == reflect.Pointer && ft.Elem().Kind() == reflect.Struct {
+			ft = ft.Elem()
+		}
+		switch ft.Kind() {
 		case reflect.Struct:
 			collectYAMLPaths(ft, path+".", out)
 		case reflect.Slice:
@@ -383,6 +389,32 @@ mcp:
         type: stdio
         command: ["srv"]
 `,
+		"unknown auth type": `
+    - name: github
+      transport:
+        type: http
+        url: https://mcp.example.com/mcp
+      auth:
+        type: basic
+`,
+		"auth with an unknown field": `
+    - name: github
+      transport:
+        type: http
+        url: https://mcp.example.com/mcp
+      auth:
+        type: oauth
+        client_secret: shhh
+`,
+		"empty auth scope": `
+    - name: github
+      transport:
+        type: http
+        url: https://mcp.example.com/mcp
+      auth:
+        type: oauth
+        scopes: [""]
+`,
 	}
 	for name, tail := range rejected {
 		t.Run(name, func(t *testing.T) {
@@ -405,6 +437,14 @@ mcp:
         exclude: ["issue_delete"]
       call_timeout: 90s
       required: false
+    - name: remote-oauth
+      transport:
+        type: http
+        url: https://oauth.example.com/mcp
+      auth:
+        type: oauth
+        client_id: amele-cli
+        scopes: ["repo"]
     - name: local-fs
       transport:
         type: stdio

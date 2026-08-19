@@ -278,6 +278,33 @@
               "required": {
                 "type": "boolean",
                 "description": "Whether a failure to connect aborts the run. Omitted means true: fail-fast is the default, because a headless run that silently loses half its tools produces a plausible wrong answer. Set false to let the run continue without this server."
+              },
+              "auth": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "type"
+                ],
+                "description": "OAuth for this server. Requires transport.type http, and cannot be combined with an Authorization header on the same server. Omitted means static headers only.",
+                "properties": {
+                  "type": {
+                    "const": "oauth",
+                    "description": "Auth mechanism. \"oauth\" is the only accepted value: OAuth 2.1 authorization code flow with PKCE."
+                  },
+                  "client_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Pre-registered OAuth client id. Omitted means client id metadata discovery, when the authorization server supports it. There is deliberately no client_secret: amele is a public client, and a secret in a recipe would be a committed credential."
+                  },
+                  "scopes": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "description": "Extra scopes, added (union) to the server-driven scope selection rather than replacing it."
+                  }
+                }
               }
             }
           }

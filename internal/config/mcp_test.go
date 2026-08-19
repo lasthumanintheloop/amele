@@ -343,6 +343,89 @@ mcp:
 			want: []string{`mcp.servers[0].call_timeout must not be negative`},
 		},
 		{
+			name: "oauth on http is accepted",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth: {type: oauth}
+`,
+			notWant: []string{"auth"},
+		},
+		{
+			name: "oauth with client_id and scopes is accepted",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth:
+        type: oauth
+        client_id: abc123
+        scopes: ["repo", "read:user"]
+`,
+			notWant: []string{"auth"},
+		},
+		{
+			name: "oauth on stdio rejected",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: stdio, command: ["srv"]}
+      auth: {type: oauth}
+`,
+			want: []string{`mcp.servers[0].auth requires transport.type http`},
+		},
+		{
+			name: "unknown auth type",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth: {type: basic}
+`,
+			want: []string{`mcp.servers[0].auth.type "basic" is not supported (only "oauth")`},
+		},
+		{
+			name: "empty auth type",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth: {client_id: abc}
+`,
+			want: []string{`mcp.servers[0].auth.type "" is not supported (only "oauth")`},
+		},
+		{
+			name: "oauth plus Authorization header rejected",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport:
+        type: http
+        url: "https://x.example.com/mcp"
+        headers: {authorization: "Bearer ${TOK}"}
+      auth: {type: oauth}
+`,
+			want: []string{`mcp.servers[0]: configure either auth: oauth or an Authorization header, not both`},
+		},
+		{
+			name: "empty auth scope entry",
+			fragment: `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth: {type: oauth, scopes: ["", "repo"]}
+`,
+			want: []string{`mcp.servers[0].auth.scopes[0] must not be empty`},
+		},
+		{
 			name: "empty tool filter entries",
 			fragment: `
 mcp:
@@ -782,5 +865,59 @@ func TestLiteralHeaderValueSchemes(t *testing.T) {
 		if got := literalHeaderValue(tc.raw); got != tc.literal {
 			t.Errorf("literalHeaderValue(%q) = %v, want %v", tc.raw, got, tc.literal)
 		}
+	}
+}
+
+// TestMCPAuthUnknownKeyRejected pins that yaml.v3 strict decoding reaches into
+// the nested auth block: client_secret is not a field, and amele is a public
+// OAuth client on purpose, so a file that carries one must fail to load rather
+// than have the key silently ignored.
+func TestMCPAuthUnknownKeyRejected(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), minimalYAML+`
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth: {type: oauth, client_secret: shhh}
+`)
+	_, err := Load(path, mcpEnv())
+	if err == nil {
+		t.Fatal("Load accepted an unknown key under auth")
+	}
+	if !strings.Contains(err.Error(), "client_secret") {
+		t.Errorf("error does not name the offending key: %v", err)
+	}
+}
+
+// TestMCPAuthOAuthParsed pins the decoded shape the later OAuth wiring reads.
+func TestMCPAuthOAuthParsed(t *testing.T) {
+	cfg := loadMCP(t, `
+mcp:
+  servers:
+    - name: s
+      transport: {type: http, url: "https://x.example.com/mcp"}
+      auth:
+        type: oauth
+        client_id: abc123
+        scopes: ["repo"]
+`)
+	auth := cfg.MCP.Servers[0].Auth
+	if auth == nil {
+		t.Fatal("auth block was not decoded")
+	}
+	if auth.Type != MCPAuthOAuth || auth.ClientID != "abc123" || len(auth.Scopes) != 1 || auth.Scopes[0] != "repo" {
+		t.Errorf("unexpected auth: %+v", *auth)
+	}
+	if cfg.MCP.Servers[0].Auth == nil {
+		t.Error("Auth must stay non-nil")
+	}
+}
+
+// TestMCPAuthAbsentIsNil pins that a server without an auth block keeps the
+// static-header path: nil means "no OAuth", never a zero-valued block.
+func TestMCPAuthAbsentIsNil(t *testing.T) {
+	cfg := loadMCP(t, validMCPYAML)
+	if cfg.MCP.Servers[0].Auth != nil {
+		t.Errorf("Auth = %+v, want nil when the block is absent", cfg.MCP.Servers[0].Auth)
 	}
 }
