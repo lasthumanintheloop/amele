@@ -670,3 +670,39 @@ func TestMCPTargetStripsUserinfo(t *testing.T) {
 		t.Errorf("target = %q, want https://example.com/mcp", got)
 	}
 }
+
+// TestConnectMCPSharesLiveSecretSet: the MCP set must redact through the
+// caller's registry, not a snapshot of it. A token minted after the connect
+// phase (OAuth) has to be scrubbed from the set's operator-facing lines - the
+// degradation warning and the stderr relays - without rewiring anything.
+func TestConnectMCPSharesLiveSecretSet(t *testing.T) {
+	secrets := session.NewSecretSet(nil)
+	noEnv := func(string) (string, bool) { return "", false }
+	set, err := connectMCP(context.Background(), &config.Config{}, nil, nil,
+		io.Discard, noEnv, true, "test", secrets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if set.secrets != secrets {
+		t.Errorf("connectMCP built its own secret set; the run must share exactly one")
+	}
+	secrets.Add("late-token")
+	if got := set.scrub("server said late-token"); strings.Contains(got, "late-token") {
+		t.Errorf("mid-run secret leaked through the MCP set: %q", got)
+	}
+}
+
+// TestExplainMCPHasSecretSet: `explain` is its own invocation with no session
+// log to share with, but it still owns exactly one registry so an OAuth flow
+// started for the report has somewhere to register its token.
+func TestExplainMCPHasSecretSet(t *testing.T) {
+	_, _, set := explainMCP(context.Background(), &config.Config{}, nil,
+		func(string) (string, bool) { return "", false }, "test")
+	if set.secrets == nil {
+		t.Fatal("explainMCP left the set without a secret registry")
+	}
+	set.secrets.Add("late-token")
+	if got := set.scrub("banner late-token"); strings.Contains(got, "late-token") {
+		t.Errorf("mid-report secret leaked: %q", got)
+	}
+}

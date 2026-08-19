@@ -41,9 +41,14 @@ type mcpSet struct {
 	// carry the loss, or a log line saying "0 mcp errors" would sit next to an
 	// exit code that says the opposite.
 	failed int
+	// secrets is the invocation's shared secret registry, kept so an MCP
+	// server that mints a credential (an OAuth access token) can register it
+	// on the SAME set every sink of this run already redacts through.
+	secrets *session.SecretSet
 	// redact is the run's secret scrubber, applied to every operator-facing
 	// line this set prints: a connect error may quote a header value the
-	// config interpolated.
+	// config interpolated. It is secrets.Redact, so it sees values added
+	// after the set was built.
 	redact func(string) string
 	// relays are the per-server stderr writers, kept so their last partial
 	// line can be flushed at shutdown.
@@ -176,8 +181,9 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 // w may be nil (no session_dir, or `explain` inspecting a config), in which
 // case the events are simply discarded.
 func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w *session.Writer,
-	stderr io.Writer, env config.LookupEnv, quiet bool, version string) (*mcpSet, error) {
-	set := &mcpSet{hints: map[string]string{}}
+	stderr io.Writer, env config.LookupEnv, quiet bool, version string,
+	secrets *session.SecretSet) (*mcpSet, error) {
+	set := &mcpSet{hints: map[string]string{}, secrets: secrets, redact: secrets.Redact}
 	servers := cfg.MCP.Servers
 	if len(servers) == 0 {
 		return set, nil
@@ -193,8 +199,10 @@ func connectMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry, w 
 	// the process's stderr are both single-threaded resources, and every
 	// server writes to them from its own goroutine.
 	observer := &sessionObserver{w: w}
-	redact := session.Redactor(agentSecrets(cfg))
-	set.redact = redact
+	// The registry comes from the caller: `run` and `chat` build exactly one
+	// per invocation and hand the same set to every other sink (see
+	// runSecrets), so nothing here may build a second one.
+	redact := set.redact
 	var stderrMu sync.Mutex
 
 	results := dialMCP(ctx, cfg, set, observer, redact, &stderrMu, stderr, env, existing, version)
@@ -269,8 +277,9 @@ func (m *mcpSet) connectFailed(s config.MCPServer, err error, quiet, interrupted
 	_, _ = fmt.Fprintf(stderr, "amele: warning: mcp server %q unavailable: %s\n", s.Name, m.scrub(err.Error()))
 }
 
-// scrub applies the set's redactor when it has one. A set built without one
-// (explain's, or a zero value in a test) passes text through.
+// scrub applies the set's redactor when it has one. Every set built by
+// connectMCP or explainMCP has one; only a zero value in a test does not, and
+// that passes text through.
 func (m *mcpSet) scrub(text string) string {
 	if m == nil || m.redact == nil {
 		return text
@@ -386,9 +395,10 @@ func annotationMap(a mcp.Annotations) map[string]bool {
 // SECURITY, three properties in one writer:
 //
 //   - Redaction. A server started with an ${ENV} credential in its environment
-//     routinely echoes it into a startup banner or an error. The same
-//     session.Redactor the session log and the -v feed use runs here, so
-//     adding an output channel did not add a leak channel.
+//     routinely echoes it into a startup banner or an error. The same live
+//     secret registry the session log and the -v feed use runs here, so
+//     adding an output channel did not add a leak channel - including for a
+//     credential that only came into existence mid-run.
 //   - Terminal safety. Server output is remote text; it goes through
 //     safeForTerminal for the same reason the approval question does - an
 //     escape sequence could otherwise repaint the operator's screen.
@@ -479,7 +489,10 @@ func (s *mcpStderr) emit(line string) {
 // and an empty stderr.
 func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 	env config.LookupEnv, version string) ([]explain.MCPServerReport, []string, *mcpSet) {
-	set := &mcpSet{hints: map[string]string{}}
+	// `explain` is its own invocation with no other sink to share with, so it
+	// builds the one registry it needs here.
+	secrets := runSecrets(cfg)
+	set := &mcpSet{hints: map[string]string{}, secrets: secrets, redact: secrets.Redact}
 	if len(cfg.MCP.Servers) == 0 {
 		return nil, nil, set
 	}
@@ -487,7 +500,7 @@ func explainMCP(ctx context.Context, cfg *config.Config, reg *tools.Registry,
 	// A nil session.Writer discards every event: explain writes no session
 	// log, and its connects must not land in the one a `run` is keeping.
 	observer := &sessionObserver{w: nil}
-	redact := session.Redactor(agentSecrets(cfg))
+	redact := set.redact
 	var stderrMu sync.Mutex
 	// CONTRACT (docs/contracts/cli.md): `explain` writes the report to stdout
 	// and NOTHING to stderr when it printed one. A stdio server's startup

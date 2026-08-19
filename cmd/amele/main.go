@@ -1690,20 +1690,24 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 
-	agent, answer, hints, err := buildAgent(cfg, validator, newLineReader(stdin), stderr)
+	// ONE registry for this run, built before the first sink exists so every
+	// sink below shares it (see runSecrets).
+	secrets := runSecrets(cfg)
+
+	agent, answer, hints, err := buildAgent(cfg, validator, newLineReader(stdin), stderr, secrets)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
 	}
 	if parsed.verbose {
-		agent.Progress = progressLogger(stderr, agentSecrets(cfg))
+		agent.Progress = progressLogger(stderr, secrets)
 	}
 
 	if interrupted {
 		// Nothing will run, so no MCP server is started: spending a connect
 		// attempt on a run that is already over would only add a failure to
 		// the log.
-		return reportInterruptedRead(agent, cfg, taskArgs, taskErr, validator != nil, parsed.quiet, stderr)
+		return reportInterruptedRead(agent, cfg, taskArgs, taskErr, validator != nil, parsed.quiet, stderr, secrets)
 	}
 
 	// run_start is written here rather than by loop.Run because the MCP
@@ -1713,7 +1717,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// always done it - so the run below goes through RunMessages.
 	agent.Session.RunStart(cfg.Model, task)
 
-	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version)
+	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
 	// CONTRACT: mcp_disconnect precedes run_end, and run_end.mcp_errors is
 	// final. WithoutCancel so an orderly close still happens after a SIGTERM
@@ -1733,7 +1737,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		}
 		code := exitCodeFor(mcpErr)
 		finish()
-		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr, session.Redactor(agentSecrets(cfg)))
+		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr, secrets.Redact)
 		return code
 	}
 
@@ -1741,7 +1745,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	code := exitCodeFor(runErr)
 
 	finish()
-	reportRun(agent, res, runErr, code, validator != nil, parsed.quiet, stderr, session.Redactor(agentSecrets(cfg)))
+	reportRun(agent, res, runErr, code, validator != nil, parsed.quiet, stderr, secrets.Redact)
 
 	if runErr == nil {
 		// CONTRACT: stdout carries only the agent's final answer, so runs
@@ -1796,12 +1800,13 @@ func openingHistory(cfg *config.Config, task string) []llm.Message {
 // run_start is written here rather than by loop.Run, which is never reached:
 // a session file whose only event is run_end would describe no run at all. The
 // task recorded is what the operator typed, since the piped part never arrived.
-func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string, cause error, schemaMode, quiet bool, stderr io.Writer) int {
+func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string, cause error, schemaMode, quiet bool,
+	stderr io.Writer, secrets *session.SecretSet) int {
 	err := interruptedError(cause)
 	code := exitCodeFor(err)
 	agent.Session.RunStart(cfg.Model, taskArgs)
 	// Zero accounting: nothing was spent, and the summary must not invent turns.
-	reportRun(agent, &loop.Result{}, err, code, schemaMode, quiet, stderr, session.Redactor(agentSecrets(cfg)))
+	reportRun(agent, &loop.Result{}, err, code, schemaMode, quiet, stderr, secrets.Redact)
 	return code
 }
 
@@ -1948,22 +1953,25 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	// approval read swallow the user's next chat line (or vice versa).
 	lines := newLineReader(stdin)
 
-	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr)
+	// ONE registry for the whole conversation (see runSecrets).
+	secrets := runSecrets(cfg)
+
+	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr, secrets)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
 	}
 	if parsed.verbose {
-		agent.Progress = progressLogger(stderr, agentSecrets(cfg))
+		agent.Progress = progressLogger(stderr, secrets)
 	}
 
 	// A chat writes ONE run_start for the whole session, and the MCP servers
 	// belong inside it like every other event (docs/contracts/jsonl-events.md).
 	agent.Session.RunStart(cfg.Model, chatTaskLabel)
 
-	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version)
+	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
-	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx}
+	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx, secrets: secrets}
 	if mcpErr != nil {
 		// The conversation never starts: a chat whose tools are missing would
 		// mislead the human at the keyboard for its whole length. A Ctrl-C
@@ -1990,15 +1998,15 @@ const maxProgressLine = 600
 
 // progressLogger renders loop progress events to stderr for -v: one line per
 // event, prefixed like every other note this binary writes. secrets is the
-// run's redaction list (agentSecrets).
+// run's shared secret registry (runSecrets).
 //
 // SECURITY, two independent hazards in the same model-chosen text:
 //
 //   - Secrets. -v is a persisted sink - a cron job's stderr lands in journald
 //     or a mail spool - carrying tool arguments the model may have filled with
 //     a credential it read. The session log redacts by value before writing;
-//     this writer applies the SAME function (session.Redactor) so adding an
-//     output channel did not quietly add a leak channel. Redaction runs first,
+//     this writer redacts through the SAME live registry, so adding an output
+//     channel did not quietly add a leak channel. Redaction runs first,
 //     before any clipping, so a secret cannot survive by being cut in two.
 //   - Terminal control bytes. The event is routed through safeForTerminal
 //     exactly like the approval question - an escape sequence in a tool
@@ -2007,8 +2015,8 @@ const maxProgressLine = 600
 //
 // stderr only: stdout is the answer channel, and -v must never change what a
 // pipe receives.
-func progressLogger(stderr io.Writer, secrets []string) func(string) {
-	redact := session.Redactor(secrets)
+func progressLogger(stderr io.Writer, secrets *session.SecretSet) func(string) {
+	redact := secrets.Redact
 	return func(event string) {
 		_, _ = fmt.Fprintf(stderr, "amele: %s\n", safeForTerminal(redact(event), maxProgressLine))
 	}
@@ -2025,6 +2033,9 @@ type chatSession struct {
 	quiet bool
 	// mcp are the session's MCP servers, closed by finish before run_end.
 	mcp *mcpSet
+	// secrets is the conversation's shared secret registry - the same live set
+	// the session log, the -v feed and the MCP relays redact through.
+	secrets *session.SecretSet
 	// runCtx is the session's context, kept only so finish can derive an
 	// uncancellable one for the orderly MCP shutdown after a signal.
 	runCtx context.Context //nolint:containedctx // session lifetime, not request scope
@@ -2172,7 +2183,7 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 	if err != nil {
 		status = "error"
 		// SECURITY: same rule as reportRun - the error may quote remote text.
-		_, _ = fmt.Fprintln(stderr, session.Redactor(agentSecrets(s.cfg))(err.Error()))
+		_, _ = fmt.Fprintln(stderr, s.secrets.Redact(err.Error()))
 	}
 	s.agent.Session.RunEnd(status, code, s.turns, s.toolCalls, s.tokens, s.duration)
 	if !s.quiet {
@@ -2271,8 +2282,8 @@ func (l *lineReader) ReadLine() (string, error) {
 // interpolating a non-secret like ${HOME} redacts every path in the log -
 // documented in docs/session-logging.md.
 //
-// One list feeds every sink a run writes to (the session JSONL and the -v
-// progress feed), so a new sink cannot be given a shorter one by accident.
+// It is the run's STARTING list; values a run mints later (an OAuth access
+// token) are registered on the same live set through runSecrets below.
 func agentSecrets(cfg *config.Config) []string {
 	secrets := append(cfg.InterpolatedSecrets(), cfg.Provider.APIKey)
 	// An MCP header is a COMPOSED value ("Bearer " + ${TOKEN}): the
@@ -2280,6 +2291,19 @@ func agentSecrets(cfg *config.Config) []string {
 	// header is what a server echoes back in an error, so it is registered as
 	// a secret in its own right.
 	return append(secrets, cfg.MCPHeaderSecrets()...)
+}
+
+// runSecrets builds the one secret registry a single `run`, `chat` or
+// `explain` invocation uses.
+//
+// SECURITY: exactly one *session.SecretSet per invocation, seeded with
+// agentSecrets and shared by every sink (session JSONL, the -v progress feed,
+// the MCP stderr relays, the error lines). Two sets would mean two answers to
+// "is this value a secret", and the sink holding the shorter one prints the
+// credential. Because the set is live rather than a snapshot, a token minted
+// mid-run is scrubbed from every sink the moment it is registered.
+func runSecrets(cfg *config.Config) *session.SecretSet {
+	return session.NewSecretSet(agentSecrets(cfg))
 }
 
 // buildAgent assembles the loop for one run: tools, permissions, session
@@ -2292,7 +2316,8 @@ func agentSecrets(cfg *config.Config) []string {
 // the CANONICAL JSON the validator accepted, which only the validator closure
 // below ever sees. Result.FinalText is the raw model reply and may be wrapped
 // in a ```json fence or padded with prose, so it is not printable.
-func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineReader, stderr io.Writer) (*loop.Loop, func(*loop.Result) string, map[string]string, error) {
+func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineReader, stderr io.Writer,
+	secrets *session.SecretSet) (*loop.Loop, func(*loop.Result) string, map[string]string, error) {
 	registry, err := buildRegistry(cfg)
 	if err != nil {
 		return nil, nil, nil, err
@@ -2310,7 +2335,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 
 	var sess *session.Writer
 	if cfg.SessionDir != "" {
-		sess, err = session.New(cfg.SessionDir, session.Options{Secrets: agentSecrets(cfg)})
+		sess, err = session.New(cfg.SessionDir, session.Options{SecretSource: secrets})
 		if err != nil {
 			return nil, nil, nil, err
 		}

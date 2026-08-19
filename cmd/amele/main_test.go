@@ -4078,3 +4078,26 @@ func TestPrompterHint(t *testing.T) {
 		}
 	})
 }
+
+// TestProgressLoggerRedactsLateSecret: -v is a persisted sink wired once, at
+// startup. It holds the run's live registry, so a credential registered later
+// is scrubbed from the very next progress line.
+func TestProgressLoggerRedactsLateSecret(t *testing.T) {
+	var buf bytes.Buffer
+	secrets := session.NewSecretSet([]string{"sk-initial"})
+	log := progressLogger(&buf, secrets)
+
+	log("tool fs_read {\"path\":\"sk-initial\"}")
+	secrets.Add("oauth-access-token")
+	log("tool mcp__gh__issues {\"auth\":\"oauth-access-token\"}")
+
+	out := buf.String()
+	for _, leak := range []string{"sk-initial", "oauth-access-token"} {
+		if strings.Contains(out, leak) {
+			t.Errorf("-v leaked %q: %q", leak, out)
+		}
+	}
+	if want := 2; strings.Count(out, "[REDACTED]") != want {
+		t.Errorf("[REDACTED] count = %d, want %d: %q", strings.Count(out, "[REDACTED]"), want, out)
+	}
+}

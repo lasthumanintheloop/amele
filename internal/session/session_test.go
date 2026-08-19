@@ -581,3 +581,93 @@ func TestWriterConcurrentUse(t *testing.T) {
 		}
 	}
 }
+
+// TestSecretSetAddMidRun: the whole reason SecretSet exists. OAuth mints an
+// access token AFTER the run started, and the sinks were wired at startup;
+// a secret added later must be scrubbed by the same set every sink already
+// holds.
+func TestSecretSetAddMidRun(t *testing.T) {
+	set := NewSecretSet([]string{"first"})
+	if got := set.Redact("x first y late z"); strings.Contains(got, "first") {
+		t.Fatalf("initial secret leaked: %q", got)
+	}
+	set.Add("late")
+	if got := set.Redact("x late z"); strings.Contains(got, "late") {
+		t.Fatalf("added secret leaked: %q", got)
+	}
+}
+
+// TestSecretSetLongestFirstAfterAdd: the longest-first rule Redactor pins for
+// a frozen slice must survive incremental Add - a refreshed token registered
+// after a short one must still be replaced whole, not left with its tail in
+// the log.
+func TestSecretSetLongestFirstAfterAdd(t *testing.T) {
+	set := NewSecretSet(nil)
+	set.Add("sk-")
+	set.Add("sk-longer-token")
+	got := set.Redact("token=sk-longer-token end")
+	if strings.Contains(got, "longer-token") {
+		t.Fatalf("secret leaked: %q", got)
+	}
+	if want := "token=[REDACTED] end"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestSecretSetEmptyValuesIgnored: replacing "" would corrupt every event, so
+// empty values are dropped exactly as Redactor drops them.
+func TestSecretSetEmptyValuesIgnored(t *testing.T) {
+	set := NewSecretSet([]string{"", "tok"})
+	set.Add("")
+	if got, want := set.Redact("a tok b"), "a [REDACTED] b"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestSecretSetConcurrent: the registry is shared by sinks running on
+// different goroutines (the MCP stderr relays) while a token refresh adds to
+// it, so Add and Redact must be safe together under -race.
+func TestSecretSetConcurrent(t *testing.T) {
+	set := NewSecretSet([]string{"seed"})
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range 50 {
+				set.Add(strings.Repeat("t", i+1) + string(rune('a'+j%26)))
+				if got := set.Redact("line with seed in it"); strings.Contains(got, "seed") {
+					t.Errorf("seed leaked under concurrency: %q", got)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestWriterRedactsSecretAddedAfterNew: the Writer must redact through the
+// LIVE set, not through a copy frozen at New - that copy is the bug this task
+// removes.
+func TestWriterRedactsSecretAddedAfterNew(t *testing.T) {
+	dir := t.TempDir()
+	secrets := NewSecretSet(nil)
+	w, err := New(dir, Options{Clock: fixedClock(), SecretSource: secrets})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secrets.Add("tok-123")
+	w.ToolResult(ToolResult{CallID: "c1", Tool: "mcp__x__y", Result: "auth used tok-123", Outcome: OutcomeOK})
+	w.RunEnd("success", 0, 1, 1, 10, time.Second)
+
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "tok-123") {
+		t.Errorf("mid-run secret leaked into the session log:\n%s", data)
+	}
+	if !strings.Contains(string(data), "[REDACTED]") {
+		t.Errorf("session log lost the redaction marker:\n%s", data)
+	}
+}

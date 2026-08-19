@@ -125,7 +125,17 @@ type Options struct {
 	// Secrets lists values (e.g. the API key) that must never appear in
 	// the log. SECURITY: redaction is by value because secrets reach the
 	// log through arbitrary channels (tool output, model echoes).
+	//
+	// It is a snapshot: values added to the run afterwards are not covered.
+	// Ignored when SecretSource is set.
 	Secrets []string
+	// SecretSource is the run's live secret registry. When set, the Writer
+	// redacts through it on every write, so a secret registered after New
+	// (an OAuth token minted mid-run) is scrubbed from that moment on.
+	// SECURITY: prefer this over Secrets whenever the run can mint a
+	// credential; the two exist together only so callers with a fixed list
+	// need not build a set.
+	SecretSource *SecretSet
 }
 
 // New creates the session file inside dir. The filename embeds the UTC
@@ -157,7 +167,13 @@ func New(dir string, opts Options) (*Writer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating session file: %w", err)
 	}
-	return &Writer{w: f, clock: clock, redact: Redactor(opts.Secrets), path: path}, nil
+	// The live registry wins; a caller that passed only a fixed list gets an
+	// equivalent one-off set, so there is a single redaction path below.
+	secrets := opts.SecretSource
+	if secrets == nil {
+		secrets = NewSecretSet(opts.Secrets)
+	}
+	return &Writer{w: f, clock: clock, redact: secrets.Redact, path: path}, nil
 }
 
 // Path returns the session file location ("" for a nil writer).
@@ -168,40 +184,95 @@ func (w *Writer) Path() string {
 	return w.path
 }
 
-// Redactor builds the value-replacement function this package applies to
-// every event it writes: each registered secret becomes "[REDACTED]". The
-// returned function is stateless and safe for concurrent use.
+// SecretSet is a concurrent, add-only set of secret values shared by every
+// sink of one run (session log, -v progress feed, MCP stderr relay, error
+// lines).
 //
-// It is exported because the session log is not the only sink a run's text
-// reaches - `amele run -v` streams the same model-chosen tool arguments to
-// stderr, which a cron job persists just as durably. SECURITY: any such sink
-// must redact through THIS function, so there is one definition of what
-// redaction means rather than a second one that drifts.
+// SECURITY: it exists because redaction used to be frozen when the run
+// started. OAuth mints an access token in the middle of a run, and a sink
+// holding a snapshot taken before that would print the token verbatim. One
+// live set, handed to every sink at startup, means a value registered at any
+// later moment is scrubbed everywhere from the moment it exists.
 //
-// SECURITY: every registered non-empty secret is redacted unconditionally -
-// a short DB password is still a credential, and a noisy log is strictly
-// better than a leaked secret (empty strings are skipped because replacing
-// "" would corrupt every event).
-// SECURITY: replacement runs longest-secret-first. Registration order must not
-// decide how much leaks: with the raw slice order, a short secret that is a
-// substring of a longer one ("sk-" registered before "sk-secret-value")
-// consumes its prefix and the longer secret's tail survives into the log.
-func Redactor(secrets []string) func(string) string {
-	var meaningful []string
-	for _, s := range secrets {
-		if s != "" {
-			meaningful = append(meaningful, s)
+// It is add-only on purpose: a credential that has been rotated away is still
+// a credential in the transcript above, so nothing ever leaves the set.
+// A nil *SecretSet is valid and redacts nothing, so callers with no secrets do
+// not branch.
+type SecretSet struct {
+	// mu guards secrets. RWMutex because Redact is the hot, concurrent
+	// operation (several MCP relays plus the loop) and Add is rare.
+	mu sync.RWMutex
+	// secrets holds the non-empty values, kept sorted longest-first (see
+	// Redact for why the order is load-bearing).
+	secrets []string
+}
+
+// NewSecretSet returns a set seeded with initial. Empty strings in initial are
+// ignored.
+func NewSecretSet(initial []string) *SecretSet {
+	s := &SecretSet{}
+	s.Add(initial...)
+	return s
+}
+
+// Add registers more secrets. Empty values are ignored (replacing "" would
+// corrupt every event), duplicates are harmless, and the set is re-sorted so
+// the longest-first guarantee holds for values added later too. Safe for
+// concurrent use; a nil receiver is a no-op.
+func (s *SecretSet) Add(values ...string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, v := range values {
+		if v != "" {
+			s.secrets = append(s.secrets, v)
 		}
 	}
 	// Stable so equal-length secrets keep a deterministic (registration)
 	// order - golden files must not depend on sort tie-breaking.
-	slices.SortStableFunc(meaningful, func(a, b string) int { return len(b) - len(a) })
-	return func(text string) string {
-		for _, s := range meaningful {
-			text = strings.ReplaceAll(text, s, "[REDACTED]")
-		}
+	slices.SortStableFunc(s.secrets, func(a, b string) int { return len(b) - len(a) })
+}
+
+// Redact replaces every registered secret in text with "[REDACTED]". Safe for
+// concurrent use with Add; a nil receiver returns text unchanged.
+//
+// SECURITY: every registered non-empty secret is redacted unconditionally - a
+// short DB password is still a credential, and a noisy log is strictly better
+// than a leaked secret.
+// SECURITY: replacement runs longest-secret-first. Registration order must not
+// decide how much leaks: in raw order, a short secret that is a substring of a
+// longer one ("sk-" registered before "sk-secret-value") consumes its prefix
+// and the longer secret's tail survives into the log.
+func (s *SecretSet) Redact(text string) string {
+	if s == nil {
 		return text
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, secret := range s.secrets {
+		text = strings.ReplaceAll(text, secret, "[REDACTED]")
+	}
+	return text
+}
+
+// Redactor builds the value-replacement function this package applies to
+// every event it writes: each registered secret becomes "[REDACTED]". The
+// returned function closes over a frozen set and is safe for concurrent use.
+//
+// It is exported because the session log is not the only sink a run's text
+// reaches - `amele run -v` streams the same model-chosen tool arguments to
+// stderr, which a cron job persists just as durably. SECURITY: any such sink
+// must redact through THIS definition, so there is one meaning of redaction
+// rather than a second one that drifts.
+//
+// It is kept for callers whose secret list cannot change after startup; a
+// caller that must see secrets registered later (OAuth tokens) holds a
+// *SecretSet and calls its Redact method instead. Both paths run the exact
+// same code - this is NewSecretSet(secrets).Redact.
+func Redactor(secrets []string) func(string) string {
+	return NewSecretSet(secrets).Redact
 }
 
 // emit writes one event line. Write errors are deliberately swallowed after
