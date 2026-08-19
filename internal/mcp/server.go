@@ -293,7 +293,14 @@ func (s *Server) connectOnce(procCtx, ctx context.Context, discover bool) error 
 			return err
 		}
 	}
-	s.adopt(sess, kill)
+	if !s.adopt(sess, kill) {
+		// Close won the race: release what this attempt built. WithoutCancel so
+		// the orderly close still gets its grace period even when the caller's
+		// context is already done.
+		closeSession(context.WithoutCancel(ctx), sess)
+		kill()
+		return errClosed
+	}
 	return nil
 }
 
@@ -313,9 +320,17 @@ func clientOptions() *sdk.ClientOptions {
 // adopt installs a fresh session together with its transport-release function
 // and records what initialize reported. Both are published under one lock, so
 // no caller can ever see a new session paired with the previous kill.
-func (s *Server) adopt(sess *sdk.ClientSession, kill func()) {
+//
+// It reports false when the server was closed while this connection was being
+// built - a reconnect racing shutdown. The caller must then tear the new
+// session down: installing it would leave a session nobody ever closes and, for
+// stdio, a child process alive until the run context is cancelled.
+func (s *Server) adopt(sess *sdk.ClientSession, kill func()) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	s.sess = sess
 	s.kill = kill
 	s.dead = false
@@ -335,6 +350,7 @@ func (s *Server) adopt(sess *sdk.ClientSession, kill func()) {
 		// the server operator. It is deliberately never forwarded to the model
 		// and never logged (docs/threat-model.md S9).
 	}
+	return true
 }
 
 // setDuration records how long the connect took and returns the finished
@@ -363,6 +379,12 @@ type discoverState struct {
 // name, too many tools and too many bytes are protocol errors, because they
 // make the whole listing untrustworthy rather than one entry unusable.
 func (s *Server) discover(seq iter.Seq2[*sdk.Tool, error]) error {
+	// Start from empty on every pass. Connect retries after a failure, and a
+	// listing that died halfway through the pages has already appended part of
+	// a toolset; without this reset the second attempt would hand the model
+	// every surviving tool twice (the per-pass seen/effective maps cannot catch
+	// it - they are fresh too).
+	s.tools, s.listed, s.skipped, s.totalBytes = nil, nil, nil, 0
 	st := &discoverState{seen: map[string]bool{}, effective: map[string]bool{}}
 	for t, err := range seq {
 		if err != nil {
@@ -662,7 +684,11 @@ func (s *Server) reconnect(ctx context.Context) error {
 	actx, cancel := context.WithTimeout(ctx, ConnectTimeout)
 	defer cancel()
 	if err := s.connectOnce(s.runCtx, actx, false); err != nil {
-		s.countError()
+		// A reconnect that lost the race with Close is a shutdown, not a
+		// failure of the server: it must not inflate the error count.
+		if !errors.Is(err, errClosed) {
+			s.countError()
+		}
 		return err
 	}
 	s.deps.Observer.Connected(s.setDuration(s.deps.Clock().Sub(start)))

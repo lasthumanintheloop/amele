@@ -12,8 +12,10 @@ import (
 	"net"
 	"net/url"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,6 +61,15 @@ type fakeConn struct {
 	release chan struct{} // if non-nil, the factory waits for it
 
 	session *sdk.ServerSession // the server side of the newest connection
+	kills   atomic.Int64       // how many times a returned kill func ran
+	killed  atomic.Int64       // index of the newest connection whose kill ran
+}
+
+// currentSession reports the server side of the newest connection.
+func (f *fakeConn) currentSession() *sdk.ServerSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.session
 }
 
 // drop closes the server side of the current connection, which is how these
@@ -122,8 +133,16 @@ func (f *fakeConn) factory() transportFactory {
 		}
 		f.mu.Lock()
 		f.session = ss
+		idx := int64(f.calls)
 		f.mu.Unlock()
-		return clientT, func() { _ = ss.Close() }, nil
+		return clientT, func() {
+			f.kills.Add(1)
+			// Record the newest connection released, so a test can tell "the
+			// old transport was torn down" from "the new one was too".
+			for prev := f.killed.Load(); idx > prev && !f.killed.CompareAndSwap(prev, idx); prev = f.killed.Load() {
+			}
+			_ = ss.Close()
+		}, nil
 	}
 }
 
@@ -651,5 +670,135 @@ func TestConnectErrorUnwrap(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "s") || !strings.Contains(err.Error(), "refused") {
 		t.Errorf("Error() = %q", err.Error())
+	}
+}
+
+// flakyLister serves the tools list one page at a time and fails the nth
+// tools/list request, which is how a server that dies while the client is
+// paginating looks from amele's side.
+func flakyLister(failOn int) sdk.Middleware {
+	var seen atomic.Int64
+	return func(next sdk.MethodHandler) sdk.MethodHandler {
+		return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+			if method == "tools/list" && seen.Add(1) == int64(failOn) {
+				return nil, errors.New("listing died mid-page")
+			}
+			return next(ctx, method, req)
+		}
+	}
+}
+
+// pagedFactory serves defs one tool per page; the first connection fails its
+// second tools/list, every later one is healthy.
+func pagedFactory(t *testing.T, defs []fakeTool, calls *atomic.Int64) transportFactory {
+	t.Helper()
+	return func(ctx context.Context, _ config.MCPServer, _ Deps) (sdk.Transport, func(), error) {
+		first := calls.Add(1) == 1
+		srv := sdk.NewServer(&sdk.Implementation{Name: "fake", Version: "1.2.3"},
+			&sdk.ServerOptions{Logger: discardLogger(), PageSize: 1})
+		for _, ft := range defs {
+			srv.AddTool(ft.def, ft.handler)
+		}
+		if first {
+			srv.AddReceivingMiddleware(flakyLister(2))
+		}
+		clientT, serverT := sdk.NewInMemoryTransports()
+		ss, err := srv.Connect(context.WithoutCancel(ctx), serverT, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return clientT, func() { _ = ss.Close() }, nil
+	}
+}
+
+// A retry must not append a second copy of a partially discovered toolset:
+// discovery starts from empty on every attempt.
+func TestConnectRetryDoesNotDuplicateTools(t *testing.T) {
+	var calls atomic.Int64
+	useTransport(t, pagedFactory(t, []fakeTool{
+		textTool("a", "tool a", "A"),
+		textTool("b", "tool b", "B"),
+		textTool("c", "tool c", "C"),
+	}, &calls))
+	obs := &recObserver{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	srv, err := Connect(ctx, testCfg("s", config.MCPToolFilter{}), testDeps(obs))
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer func() { _ = srv.Close(ctx) }()
+	if calls.Load() != 2 {
+		t.Fatalf("factory calls = %d, want 2 (the first listing died mid-page)", calls.Load())
+	}
+
+	var names []string
+	for _, tl := range srv.Tools() {
+		names = append(names, tl.Def().Name)
+	}
+	want := []string{"s__a", "s__b", "s__c"}
+	if !slices.Equal(names, want) {
+		t.Errorf("Tools() = %v, want exactly %v", names, want)
+	}
+	if len(srv.Listed()) != len(want) {
+		t.Errorf("Listed() = %d entries, want %d", len(srv.Listed()), len(want))
+	}
+
+	snap := obs.snapshot()
+	if len(snap.listed) != 1 {
+		t.Fatalf("ToolsListed calls = %d, want 1", len(snap.listed))
+	}
+	if len(snap.listed[0].tools) != len(want) {
+		t.Errorf("ToolsListed carried %d tools, want %d", len(snap.listed[0].tools), len(want))
+	}
+	if snap.connected[0].ToolCount != len(want) {
+		t.Errorf("ConnectInfo.ToolCount = %d, want %d", snap.connected[0].ToolCount, len(want))
+	}
+}
+
+// A reconnect that finishes after Close must release what it built instead of
+// installing a session nobody will ever close (and, for stdio, a child process
+// that would outlive the run).
+func TestCloseDuringReconnectReleasesNewSession(t *testing.T) {
+	fc := &fakeConn{defs: callToolset()}
+	srv := connectFake(t, fc, testCfg("s", config.MCPToolFilter{}), testDeps(&recObserver{}))
+	ctx := context.Background()
+
+	loseSession(t, srv, fc)
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fc.mu.Lock()
+	fc.entered, fc.release = entered, release
+	killsBefore := fc.kills.Load()
+	fc.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = toolNamed(t, srv, "s__echo").InvokeOutcome(ctx, `{"text":"x"}`)
+	}()
+
+	<-entered // the reconnect is inside the factory
+	if err := srv.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	close(release)
+	<-done
+
+	// Two releases: the dead transport at the start of the reconnect, and the
+	// fresh one that Close refused to adopt.
+	if got := fc.kills.Load() - killsBefore; got != 2 {
+		t.Errorf("transports released = %d, want 2", got)
+	}
+	if got, want := fc.killed.Load(), int64(fc.count()); got != want {
+		t.Errorf("newest released connection = %d, want %d (the session built after Close must not leak)", got, want)
+	}
+	if fc.currentSession() == nil {
+		t.Error("the factory never built the racing session")
+	}
+	if _, err := srv.session(ctx); !errors.Is(err, errClosed) {
+		t.Errorf("session() = %v, want the closed error", err)
 	}
 }
