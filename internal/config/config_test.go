@@ -1453,6 +1453,21 @@ func TestValidateProviderTuning(t *testing.T) {
 			"kimi K-series models fix sampling; remove temperature/top_p",
 		},
 		{"kimi without sampling", func(c *Config) { c.Provider.Dialect = "kimi" }, ""},
+		{
+			// The dialect describes an openai-wire variation and is documented
+			// as ignored when type is anthropic (config.schema.json), so a
+			// leftover dialect must not refuse a config for a provider it is
+			// not talking to.
+			"kimi dialect is inert on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Dialect = "kimi"
+				c.Provider.Temperature = ptrFloat(0.5)
+				c.Provider.TopP = ptrFloat(0.9)
+			},
+			"",
+		},
 
 		// Rule 5: Kimi's thinking models cannot be switched off.
 		{
@@ -1468,6 +1483,19 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Dialect = "kimi"
 				c.Provider.Reasoning = &ReasoningConfig{Effort: "high"}
+			},
+			"",
+		},
+		{
+			// Same reason as the sampling case above: on the anthropic wire the
+			// dialect is not consulted, and "none" is a legal thinking setting
+			// there.
+			"kimi dialect does not block effort none on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Dialect = "kimi"
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "none"}
 			},
 			"",
 		},
@@ -1517,6 +1545,37 @@ func TestValidateProviderTuning(t *testing.T) {
 			},
 			"",
 		},
+		{
+			// The Anthropic Messages API documents temperature as 0..1 for
+			// every model it serves - a WIRE-total limit, so it belongs here
+			// exactly as the glm dialect's does.
+			"anthropic wire narrows temperature",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Temperature = ptrFloat(1.5)
+			},
+			"provider.temperature",
+		},
+		{
+			"anthropic temperature at its ceiling",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Temperature = ptrFloat(1)
+			},
+			"",
+		},
+		{
+			"glm dialect keeps the anthropic ceiling on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Dialect = "glm"
+				c.Provider.Temperature = ptrFloat(0.8)
+			},
+			"",
+		},
 		// NaN is reachable from both directions (YAML ".nan", --set "NaN")
 		// and every comparison against it is false, so a range check written
 		// the natural way would let it through to a request body JSON cannot
@@ -1563,6 +1622,30 @@ func TestValidateProviderTuning(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tt.wantSub)
 			}
 		})
+	}
+}
+
+// TestValidateSamplingWireBeatsDialect pins WHICH rule answers when both could
+// narrow the temperature range. The wire wins: with type anthropic the dialect
+// is documented as ignored (config.schema.json), so an operator who left a
+// dialect behind while switching wires must be told about the wire they are
+// actually talking to, not about a provider that is out of the picture.
+func TestValidateSamplingWireBeatsDialect(t *testing.T) {
+	cfg := tuningBase(t.TempDir())
+	cfg.Provider.Type = ProviderTypeAnthropic
+	cfg.Provider.BaseURL = ""
+	cfg.Provider.Dialect = "glm"
+	cfg.Provider.Temperature = ptrFloat(1.5)
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("temperature 1.5 must be refused on the anthropic wire")
+	}
+	if !strings.Contains(err.Error(), "anthropic wire") {
+		t.Errorf("error %q does not name the wire that set the ceiling", err)
+	}
+	if strings.Contains(err.Error(), "glm dialect") {
+		t.Errorf("error %q blames the dialect, which the anthropic wire ignores", err)
 	}
 }
 

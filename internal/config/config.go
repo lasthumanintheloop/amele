@@ -145,10 +145,11 @@ type ProviderConfig struct {
 	// config never asks, which is NOT the same as asking for none: most
 	// reasoning models think by default and several cannot be switched off.
 	Reasoning *ReasoningConfig `yaml:"reasoning"`
-	// Temperature is the sampling temperature, in [0, 2] (the glm dialect
-	// narrows it to [0, 1]). It is a pointer because 0 is a legal, useful
-	// value - the usual choice for a judge agent - so "unset" must stay
-	// distinguishable from "zero".
+	// Temperature is the sampling temperature, in [0, 2]. The target can
+	// narrow that: the anthropic wire and the glm dialect both accept only
+	// [0, 1]. It is a pointer because 0 is a legal, useful value - the usual
+	// choice for a judge agent - so "unset" must stay distinguishable from
+	// "zero".
 	Temperature *float64 `yaml:"temperature"`
 	// TopP is nucleus sampling, in (0, 1]. Pointer for the same reason as
 	// Temperature: absent means "the provider decides".
@@ -1009,26 +1010,45 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 		add("provider.reasoning.budget_tokens is only mapped for anthropic wire or openrouter dialect (use provider.reasoning.effort instead)")
 	}
 	// Kimi's K-series thinks unconditionally; "none" has nothing to map to.
-	if dialect == llm.DialectKimi && r.Effort == "none" {
+	// Gated on the openai wire: the dialect describes an openai-wire variation
+	// and is ignored when type is anthropic (documented in the published
+	// schema), where "none" is a legal thinking setting.
+	if c.dialectApplies(known) && dialect == llm.DialectKimi && r.Effort == "none" {
 		add("provider.reasoning.effort %q: kimi models cannot disable thinking", r.Effort)
 	}
 }
 
-// validateSampling checks temperature/top_p against the range the dialect
+// dialectApplies reports whether the dialect-DEPENDENT rules may speak. They
+// may not on the anthropic wire: the dialect names a variation of the
+// OpenAI-compatible format, and the published schema documents it as ignored
+// when type is anthropic. Refusing `type: anthropic` + a leftover
+// `dialect: kimi` would blame a provider the config is not talking to. known
+// carries whether the dialect parsed at all.
+func (c *Config) dialectApplies(known bool) bool {
+	return known && c.Provider.Type != ProviderTypeAnthropic
+}
+
+// validateSampling checks temperature/top_p against the range the target
 // accepts for every model it serves.
 func (c *Config) validateSampling(add func(format string, args ...any), dialect llm.Dialect, known bool) {
 	temperature, topP := c.Provider.Temperature, c.Provider.TopP
 	// The K-series pins temperature and top_p to fixed values and answers any
 	// other value with a 400, so this is a config error, not a preference.
-	if known && dialect == llm.DialectKimi && (temperature != nil || topP != nil) {
+	if c.dialectApplies(known) && dialect == llm.DialectKimi && (temperature != nil || topP != nil) {
 		add("provider: kimi K-series models fix sampling; remove temperature/top_p")
 	}
 
-	// The ceiling is dialect-total, so it belongs here rather than in a
-	// runtime error: GLM accepts 0..1 for every model it serves.
-	maxTemperature, dialectNote := 2.0, ""
-	if known && dialect == llm.DialectGLM {
-		maxTemperature, dialectNote = 1.0, " for the glm dialect"
+	// Both ceilings below are TOTAL for their target, so they belong here
+	// rather than in a runtime error: the Anthropic Messages API documents
+	// temperature as 0..1 for every model, and so does GLM. The wire is
+	// checked first because it wins - on the anthropic path the dialect is not
+	// consulted at all, so naming it in the message would misdirect the fix.
+	maxTemperature, ceilingNote := 2.0, ""
+	switch {
+	case c.Provider.Type == ProviderTypeAnthropic:
+		maxTemperature, ceilingNote = 1.0, " on the anthropic wire"
+	case c.dialectApplies(known) && dialect == llm.DialectGLM:
+		maxTemperature, ceilingNote = 1.0, " for the glm dialect"
 	}
 	// Both checks are written as a NEGATED positive test, deliberately: every
 	// comparison against NaN is false, so the natural "v < 0 || v > max" form
@@ -1036,7 +1056,7 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 	// from --set, and YAML spells it ".nan") only for it to die as an
 	// unserializable request body at run time.
 	if temperature != nil && !(*temperature >= 0 && *temperature <= maxTemperature) {
-		add("provider.temperature %g is out of range: must be between 0 and %g%s", *temperature, maxTemperature, dialectNote)
+		add("provider.temperature %g is out of range: must be between 0 and %g%s", *temperature, maxTemperature, ceilingNote)
 	}
 	// Zero is excluded rather than clamped: top_p 0 asks for an empty nucleus,
 	// which providers answer with a 400 rather than with greedy decoding.
