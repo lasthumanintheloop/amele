@@ -58,7 +58,7 @@ func anOKBody(text string) string {
 
 // TestAnthropicChatBasics pins the request shape: system prompt hoisted to the
 // top-level "system" field (Anthropic rejects a system role inside messages),
-// the required max_tokens defaulting to defaultAnthropicMaxOutput, tool
+// the required max_tokens defaulting to DefaultAnthropicMaxOutput, tool
 // definitions with input_schema passed through verbatim, and the x-api-key
 // auth header. The BaseURL carries a trailing slash to pin the trim.
 func TestAnthropicChatBasics(t *testing.T) {
@@ -110,8 +110,8 @@ func assertBasicRequestShape(t *testing.T, req map[string]any) {
 	if req["model"] != "claude-test" {
 		t.Errorf("model: got %v", req["model"])
 	}
-	if req["max_tokens"] != float64(defaultAnthropicMaxOutput) {
-		t.Errorf("max_tokens: got %v, want %d", req["max_tokens"], defaultAnthropicMaxOutput)
+	if req["max_tokens"] != float64(DefaultAnthropicMaxOutput) {
+		t.Errorf("max_tokens: got %v, want %d", req["max_tokens"], DefaultAnthropicMaxOutput)
 	}
 	if req["system"] != "sys" {
 		t.Errorf("system: got %v", req["system"])

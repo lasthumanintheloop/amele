@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/lasthumanintheloop/amele/internal/llm"
 )
 
 // envMap builds a LookupEnv from a plain map, keeping tests hermetic (no
@@ -1429,7 +1431,9 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeAnthropic
 				c.Provider.BaseURL = ""
-				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+				// Below the cap the client sends when max_output_tokens is
+				// unset - see the implicit-cap cases under Rule 9.
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 4096}
 			},
 			"",
 		},
@@ -1651,13 +1655,24 @@ func TestValidateProviderTuning(t *testing.T) {
 			"",
 		},
 		{
-			// No cap set means no relation to check: the model's own default
-			// ceiling is not a number this file knows.
-			"budget_tokens without an output cap",
+			// An unset cap is NOT an absent one on this wire: max_tokens is
+			// required, so the client sends its own default and the API
+			// measures the budget against that number. Same relation, same
+			// 400, and the config still contains everything needed to know it.
+			"budget_tokens at the implicit anthropic cap",
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeAnthropic
 				c.Provider.BaseURL = ""
-				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: llm.DefaultAnthropicMaxOutput}
+			},
+			"reasoning.budget_tokens must be below provider.max_output_tokens",
+		},
+		{
+			"budget_tokens below the implicit anthropic cap",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: llm.DefaultAnthropicMaxOutput - 1}
 			},
 			"",
 		},

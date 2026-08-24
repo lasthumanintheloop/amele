@@ -158,8 +158,10 @@ error), and the reasoning knob takes a different shape:
   low/medium/high/xhigh/max, which is the neutral union minus `none`.
 - `max_output_tokens` is required on every request; without one amele sends
   **8192**. On this wire a `budget_tokens` is drawn from the same ceiling, so a
-  budget at or above `max_output_tokens` leaves nothing for the answer and is a
-  config error (exit 2) rather than a 400 on your first unattended run.
+  budget at or above the ceiling leaves nothing for the answer and is a config
+  error (exit 2) rather than a 400 on your first unattended run. Leaving
+  `max_output_tokens` out does not lift the ceiling - the check then runs
+  against that 8192 default, because that is the number the request will carry.
 - `output.schema` is enforced natively (`output_config.format`), with the
   validate+retry layer still behind it.
 - `temperature` above 1 is a config error; current models reject any

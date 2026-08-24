@@ -1119,24 +1119,32 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 // so a budget that meets or exceeds provider.max_output_tokens leaves no room
 // for the answer and the Messages API refuses the request.
 //
-// CONTRACT: this is a total rule of that wire, and both numbers are literals in
-// the same file - exactly the mistake validate exists to catch (exit 2) instead
-// of letting it surface as a provider error (exit 5) on the first unattended
-// run. It is scoped to the anthropic wire deliberately: the openrouter gateway,
-// the only other target that maps a budget, carves it out of max_tokens itself.
+// CONTRACT: this is a total rule of that wire, and both numbers are knowable
+// before the run - exactly the mistake validate exists to catch (exit 2)
+// instead of letting it surface as a provider error (exit 5) on the first
+// unattended run. It is scoped to the anthropic wire deliberately: the
+// openrouter gateway, the only other target that maps a budget, carves it out
+// of max_tokens itself.
+//
+// CONTRACT: an unset provider.max_output_tokens is NOT an absent ceiling here.
+// max_tokens is required on every Messages API request, so the client sends
+// llm.DefaultAnthropicMaxOutput and the API measures the budget against that
+// number. Checking only the explicit case let `budget_tokens: 8192` with no cap
+// pass validate and 400 at the API - the exact split this function exists to
+// close.
 func (c *Config) validateThinkingBudgetFitsCap(add func(format string, args ...any), r *ReasoningConfig) {
-	if c.Provider.Type != ProviderTypeAnthropic {
+	// Zero budget means "unset": there is no relation to check.
+	if c.Provider.Type != ProviderTypeAnthropic || r.BudgetTokens <= 0 {
 		return
 	}
-	// Zero on either side means "unset": with no cap in the file there is no
-	// relation to check, and the model's own default ceiling is not a number
-	// this config knows.
-	if r.BudgetTokens <= 0 || c.Provider.MaxOutputTokens <= 0 {
-		return
+	capTokens, capNote := c.Provider.MaxOutputTokens, ""
+	if capTokens <= 0 {
+		capTokens = llm.DefaultAnthropicMaxOutput
+		capNote = ", the default amele sends when provider.max_output_tokens is unset"
 	}
-	if r.BudgetTokens >= c.Provider.MaxOutputTokens {
-		add("provider.reasoning.budget_tokens must be below provider.max_output_tokens (%d >= %d): on the anthropic wire the thinking budget is drawn from the same output ceiling, so nothing is left for the answer",
-			r.BudgetTokens, c.Provider.MaxOutputTokens)
+	if r.BudgetTokens >= capTokens {
+		add("provider.reasoning.budget_tokens must be below provider.max_output_tokens (%d >= %d%s): on the anthropic wire the thinking budget is drawn from the same output ceiling, so nothing is left for the answer",
+			r.BudgetTokens, capTokens, capNote)
 	}
 }
 

@@ -22,11 +22,16 @@ const defaultAnthropicBaseURL = "https://api.anthropic.com"
 // request shape stable regardless of server-side default changes.
 const anthropicVersion = "2023-06-01"
 
-// defaultAnthropicMaxOutput is the max_tokens sent when the config does not
+// DefaultAnthropicMaxOutput is the max_tokens sent when the config does not
 // set one. Anthropic requires max_tokens on every request (there is no
 // server-side default), so the client must always choose a number; 8192 is
 // large enough for tool-calling agent turns without inviting runaway output.
-const defaultAnthropicMaxOutput = 8192
+//
+// It is exported because an unset provider.max_output_tokens does not mean
+// "no ceiling" on this wire: config validation measures a thinking budget
+// against the number the request will REALLY carry (validateThinkingBudget-
+// FitsCap), and a second copy of it there would rot the day this one changes.
+const DefaultAnthropicMaxOutput = 8192
 
 // AnthropicClient talks to the Anthropic Messages API natively
 // (POST /v1/messages). It implements Provider.
@@ -70,7 +75,7 @@ type AnthropicClient struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 	// MaxOutputTokens is the per-request max_tokens value. Anthropic
 	// requires the field on every request; 0 means
-	// defaultAnthropicMaxOutput.
+	// DefaultAnthropicMaxOutput.
 	MaxOutputTokens int
 }
 
@@ -609,7 +614,7 @@ func (c *AnthropicClient) toWire(req Request) (anRequest, map[string]json.RawMes
 		maxTokens = c.MaxOutputTokens
 	}
 	if maxTokens <= 0 {
-		maxTokens = defaultAnthropicMaxOutput
+		maxTokens = DefaultAnthropicMaxOutput
 	}
 	out := anRequest{Model: req.Model, MaxTokens: maxTokens}
 
