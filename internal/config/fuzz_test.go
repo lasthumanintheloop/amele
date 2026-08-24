@@ -18,6 +18,10 @@ func FuzzLoad(f *testing.F) {
 	// The optional auth block: a pointer field whose nested keys are strict-
 	// decoded, so it is its own parser shape worth mutating.
 	f.Add([]byte("mcp:\n  servers:\n    - name: s\n      transport: {type: http, url: 'https://x/mcp'}\n      auth: {type: oauth, client_id: c, scopes: ['a']}\n"))
+	// The provider tuning surface: an optional nested block, two pointer
+	// floats and a free-form map whose values reach json.Marshal during
+	// validation - four parser shapes the other seeds do not exercise.
+	f.Add([]byte("model: m\nprovider:\n  base_url: 'https://x'\n  dialect: openrouter\n  max_output_tokens: 65536\n  reasoning: {effort: high, budget_tokens: 8192}\n  temperature: 0.2\n  top_p: 0.9\n  params: {verbosity: low, provider: {require_parameters: true}}\n"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dir := t.TempDir()

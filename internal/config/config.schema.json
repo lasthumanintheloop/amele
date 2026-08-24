@@ -34,7 +34,46 @@
           "type": ["integer", "string"],
           "minimum": 0,
           "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
-          "description": "Per-request output token ceiling sent as max_tokens on the Anthropic path (that API requires the field; 0 means the client default). Ignored by the OpenAI path, where the server-side default applies. May also be a whole-value ${VAR} environment reference resolved at load time."
+          "description": "Per-request output token ceiling. 0 (or omitted) sends no cap and leaves the provider default in force. Honored on both paths: the Anthropic API requires the field, and on the OpenAI wire the dialect picks the field name (max_completion_tokens or max_tokens). Reasoning tokens count against this ceiling wherever a provider reports them, so leave room for the thinking as well as the answer. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "dialect": {
+          "enum": ["openai", "deepseek", "glm", "kimi", "groq", "openrouter"],
+          "description": "Variation of the OpenAI-compatible wire format this endpoint speaks, which decides how reasoning, sampling and the output cap are mapped onto the request. Omitted means \"openai\", the baseline. It is explicit rather than guessed from base_url: a wrong guess would send a knob to the wrong field name and surface only as a provider error later. Ignored when type is \"anthropic\"."
+        },
+        "reasoning": {
+          "type": "object",
+          "description": "Provider-neutral thinking knob. An absent block means the config never asks - which is NOT the same as asking for \"none\": most reasoning models think by default and several cannot be switched off. `amele explain` reports how the values map onto the chosen dialect, including any rounding.",
+          "additionalProperties": false,
+          "properties": {
+            "effort": {
+              "enum": ["none", "low", "medium", "high", "xhigh", "max"],
+              "description": "Reasoning depth - the union of the vocabularies the supported providers accept; no single provider accepts all six, so a dialect without an equivalent rounds the value to the nearest one it has (visibly, in explain). Omitted sends no knob and the provider default applies."
+            },
+            "budget_tokens": {
+              "type": ["integer", "string"],
+              "minimum": 0,
+              "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+              "description": "Caps the thinking with a token count instead of a level. 0 (or omitted) means unset. Only budget-based targets can carry it: type \"anthropic\", or dialect \"openrouter\" (which converts it). Anywhere else it is a config error rather than a silently dropped field. May also be a whole-value ${VAR} environment reference resolved at load time."
+            }
+          }
+        },
+        "temperature": {
+          "type": ["number", "string"],
+          "minimum": 0,
+          "maximum": 2,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Sampling temperature. Omitted means the provider decides; 0 is a value, not \"unset\". The dialect can narrow the range - glm accepts only 0..1, and kimi rejects temperature and top_p outright because its K-series models fix them - both enforced at load time. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "top_p": {
+          "type": ["number", "string"],
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Nucleus sampling, greater than 0 and at most 1. Omitted means the provider decides. Rejected outright on the kimi dialect, whose K-series models fix sampling. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "params": {
+          "type": "object",
+          "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself - model, messages, tools, tool_choice, response_format, max_tokens, max_completion_tokens, reasoning, reasoning_effort, thinking, temperature, top_p, stream, output_config, system - are rejected at load time, so params can extend a request but never rewrite one. Values must be JSON-serializable."
         }
       }
     },

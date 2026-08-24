@@ -59,9 +59,14 @@ Three boundaries matter:
    override allowlist is designed for exactly this split: CLI overrides can
    retune *where and how much* (workspace, session_dir, budgets, model,
    prompt), but can never reach the capability-granting fields -
-   `tools.*`, `permissions.*`, `provider.*` are rejected - so a hostile
+   `tools.*`, `permissions.*`, `mcp.*` and the provider's identity
+   (`provider.type`, `provider.base_url`, `provider.api_key`) are rejected -
+   so a hostile
    invocation of an audited YAML still cannot grant the agent anything the
-   YAML did not. `lock` is rejected too (since 2026-08-12): it granted no
+   YAML did not. The four provider *tuning* keys settable since 2026-08-24
+   (`provider.max_output_tokens`, `provider.reasoning.effort`,
+   `provider.temperature`, `provider.top_p`) sit with the budgets: they change
+   what a run spends, never what it may do or where its credentials go. `lock` is rejected too (since 2026-08-12): it granted no
    capability, but `--set lock=false` could *disarm* the single-flight guard
    an audited config had armed, which is the same promise read in the other
    direction.

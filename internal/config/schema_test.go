@@ -456,3 +456,71 @@ mcp:
 		}
 	})
 }
+
+// TestSchemaProviderTuningAgreesWithRuntime pins runtime/schema agreement for
+// the tuning surface: an editor must red-squiggle exactly what `amele validate`
+// refuses (an unknown dialect or effort, an out-of-range sampling value, a
+// misspelled key), and must leave the canonical block - including the free-form
+// params escape hatch - alone.
+func TestSchemaProviderTuningAgreesWithRuntime(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const head = `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+`
+	rejected := map[string]string{
+		"unknown dialect":       "  dialect: gemini\n",
+		"dialect case":          "  dialect: DeepSeek\n",
+		"unknown effort":        "  reasoning:\n    effort: insane\n",
+		"negative budget":       "  reasoning:\n    budget_tokens: -1\n",
+		"unknown reasoning key": "  reasoning:\n    depth: high\n",
+		"temperature too high":  "  temperature: 2.5\n",
+		"temperature negative":  "  temperature: -0.5\n",
+		"top_p zero":            "  top_p: 0\n",
+		"top_p above one":       "  top_p: 1.5\n",
+		"misspelled key":        "  temprature: 0.5\n",
+	}
+	for name, tail := range rejected {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := validator.Validate(yamlToJSON(t, []byte(head+tail))); ok {
+				t.Error("schema accepts a config the runtime rejects")
+			}
+		})
+	}
+
+	t.Run("canonical tuning block", func(t *testing.T) {
+		const doc = head + `  dialect: openrouter
+  max_output_tokens: 65536
+  reasoning:
+    effort: high
+    budget_tokens: 8192
+  temperature: 0.2
+  top_p: 0.9
+  params:
+    verbosity: low
+    provider:
+      require_parameters: true
+`
+		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+			t.Errorf("canonical provider tuning does not validate:\n%s", feedback)
+		}
+	})
+
+	// The headless idiom: budgets and sampling filled from the environment.
+	// The schema must not flag the exact form the project pushes.
+	t.Run("env references in numeric tuning fields", func(t *testing.T) {
+		const doc = head + `  reasoning:
+    budget_tokens: ${BUDGET}
+  temperature: ${TEMP}
+  top_p: ${TOPP}
+`
+		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+			t.Errorf("config with ${VAR} in tuning fields does not validate:\n%s", feedback)
+		}
+	})
+}

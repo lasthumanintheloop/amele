@@ -80,6 +80,23 @@ Within a frozen version, changes must be additive and backwards-compatible:
   report line changed. The `status` table's layout is explicitly
   informational and NOT frozen; the streams and exit codes are.
 
+- **2026-08-24 - config schema: the provider tuning surface.** `provider` gains
+  five optional keys - `dialect` (enum: openai, deepseek, glm, kimi, groq,
+  openrouter; omitted means openai), `reasoning` (`effort` enum + optional
+  `budget_tokens`), `temperature`, `top_p` and the free-form `params` mapping.
+  Additive: every key is optional, `additionalProperties: false` still holds,
+  and a config that sets none of them behaves exactly as before.
+  **One meaning changed:** `provider.max_output_tokens` was documented as
+  "ignored by the OpenAI path" and is now honored there too, with the dialect
+  picking the field name (`max_completion_tokens` or `max_tokens`). Migration:
+  a config that set `max_output_tokens` while using the OpenAI path got the
+  provider's server-side default and now gets the cap it asked for - review the
+  value before upgrading, and remember that reasoning tokens are billed against
+  it. Setting nothing keeps the old behavior (no cap is sent).
+  The `--set` allowlist gains `provider.max_output_tokens`,
+  `provider.reasoning.effort`, `provider.temperature` and `provider.top_p`
+  (cli.md); no key was removed.
+
 ## Schema versioning note (`$id`)
 
 `config.schema.json` is **v1** even though it does not yet embed a `$id` /

@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +24,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/lasthumanintheloop/amele/internal/llm"
 )
 
 // ErrInvalid is the sentinel wrapped by every validation failure produced by
@@ -122,12 +125,80 @@ type ProviderConfig struct {
 	// bounds the whole run: slow reasoning models can need several minutes
 	// for one generation.
 	RequestTimeout Duration `yaml:"request_timeout"`
-	// MaxOutputTokens is the per-request output ceiling sent as max_tokens
-	// on the Anthropic path (that API requires the field on every request;
-	// zero means the client's default). It is IGNORED by the OpenAI path:
-	// OpenAI-compatible endpoints have a server-side default, and sending an
-	// uninvited cap there would silently truncate answers.
+	// MaxOutputTokens is the per-request output ceiling. Zero means "send no
+	// cap", leaving the provider default in force. It is honored on both
+	// paths: the Anthropic API requires the field on every request, and on
+	// the OpenAI wire the Dialect picks the field name (max_completion_tokens
+	// or max_tokens). Reasoning tokens are billed against this ceiling on
+	// every provider that reports them, so a reasoning agent that needs a cap
+	// must leave room for the thinking as well as the answer.
 	MaxOutputTokens int `yaml:"max_output_tokens"`
+	// Dialect names the variation of the OpenAI-compatible wire format this
+	// endpoint speaks ("deepseek", "glm", "kimi", "groq", "openrouter"), which
+	// decides how the fields below are mapped onto the request. Empty means
+	// the OpenAI baseline, so configs written before dialects existed keep
+	// their behavior. It is explicit rather than sniffed from BaseURL:
+	// guessing wrong would send a knob to the wrong field name and the
+	// consequence would surface as a provider error much later.
+	Dialect string `yaml:"dialect"`
+	// Reasoning is the provider-neutral thinking knob. A nil block means the
+	// config never asks, which is NOT the same as asking for none: most
+	// reasoning models think by default and several cannot be switched off.
+	Reasoning *ReasoningConfig `yaml:"reasoning"`
+	// Temperature is the sampling temperature, in [0, 2] (the glm dialect
+	// narrows it to [0, 1]). It is a pointer because 0 is a legal, useful
+	// value - the usual choice for a judge agent - so "unset" must stay
+	// distinguishable from "zero".
+	Temperature *float64 `yaml:"temperature"`
+	// TopP is nucleus sampling, in (0, 1]. Pointer for the same reason as
+	// Temperature: absent means "the provider decides".
+	TopP *float64 `yaml:"top_p"`
+	// Params is the escape hatch: arbitrary keys merged verbatim into the
+	// request body root, for provider extras amele has no neutral field for.
+	// Keys amele writes itself are rejected at validation time (see
+	// ownedWireFields), so this can extend a request but never rewrite one.
+	Params map[string]any `yaml:"params"`
+}
+
+// ReasoningConfig is the provider-neutral reasoning knob. Both fields are
+// optional; the dialect decides how they are mapped onto the wire, and
+// `amele explain` reports the mapping (including any rounding) before a run.
+type ReasoningConfig struct {
+	// Effort is the reasoning depth: none, low, medium, high, xhigh or max -
+	// the union of what the supported providers accept. Empty means the
+	// config sends no knob at all and the provider default applies. A dialect
+	// that has no equivalent for a value rounds it to the nearest one it
+	// does have, visibly.
+	Effort string `yaml:"effort"`
+	// BudgetTokens caps the thinking with a token count instead of a level.
+	// Zero means unset. Only budget-based targets can carry it (the Anthropic
+	// wire, or the openrouter gateway which converts it); elsewhere it is a
+	// validation error rather than a silently dropped field.
+	BudgetTokens int `yaml:"budget_tokens"`
+}
+
+// effortValues lists the accepted provider.reasoning.effort spellings, in
+// increasing depth, for validation and for error messages.
+//
+// CONTRACT: this is the UNION of the vocabularies of the supported providers -
+// no single provider accepts all six. Values a dialect cannot express are
+// rounded by the wire mapping, not rejected here, so one config can move
+// between providers without being rewritten.
+var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
+
+// ownedWireFields are the request-body keys amele writes itself, and therefore
+// the keys provider.params must not carry.
+//
+// CONTRACT: params is merged verbatim into the request body root, so a
+// collision would either clobber an amele contract (tools, response_format) or
+// be clobbered by it - both silently. The list is deliberately the union across
+// every supported wire (openai and anthropic spellings together): params is not
+// dialect-scoped, and a key that is inert on today's dialect must not become a
+// live collision when the dialect changes.
+var ownedWireFields = []string{
+	"model", "messages", "tools", "tool_choice", "response_format",
+	"max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
+	"thinking", "temperature", "top_p", "stream", "output_config", "system",
 }
 
 // SubprocessTool declares an external executable the model may invoke as a
@@ -885,6 +956,113 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 	}
 	if c.Provider.MaxOutputTokens < 0 {
 		add("provider.max_output_tokens must not be negative")
+	}
+	c.validateProviderTuning(add)
+}
+
+// validateProviderTuning checks the dialect and the knobs whose legality
+// depends on it (reasoning, sampling, raw params).
+//
+// CONTRACT: only rules that are TOTAL for a dialect live here - what the
+// provider rejects for every model it serves. Model-dependent rules (a model
+// that refuses a temperature its siblings accept) stay runtime errors with
+// mapped messages: a config that passes validate must not be rejected for its
+// CONFIGURATION at run time, but validate must not refuse a combination that
+// works either.
+func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
+	dialect, err := llm.ParseDialect(c.Provider.Dialect)
+	// A dialect that does not parse makes every dialect-dependent rule below
+	// unanswerable, so they are skipped rather than guessed at: reporting
+	// "kimi fixes sampling" for a config that says "kimi-k3" would send the
+	// operator to the wrong line. The dialect-independent rules still run, so
+	// one pass still reports everything actionable.
+	known := err == nil
+	if !known {
+		add("provider.dialect: %v", err)
+	}
+	c.validateReasoning(add, dialect, known)
+	c.validateSampling(add, dialect, known)
+	validateParams(add, c.Provider.Params)
+}
+
+// validateReasoning checks the thinking knob against the effort vocabulary and
+// against the dialects that can actually carry a token budget.
+func (c *Config) validateReasoning(add func(format string, args ...any), dialect llm.Dialect, known bool) {
+	r := c.Provider.Reasoning
+	if r == nil {
+		return
+	}
+	if r.Effort != "" && !slices.Contains(effortValues, r.Effort) {
+		add("provider.reasoning.effort %q is not a valid effort (%s, or omit for the provider default)",
+			r.Effort, strings.Join(effortValues, ", "))
+	}
+	if r.BudgetTokens < 0 {
+		add("provider.reasoning.budget_tokens must not be negative")
+	}
+	if !known {
+		return
+	}
+	// Everything else on the openai wire takes a LEVEL, not a count. Sending
+	// the budget anyway would be dropped by the endpoint (or 400 on the strict
+	// ones) while the config claims a bounded thinking cost.
+	if r.BudgetTokens > 0 && c.Provider.Type != ProviderTypeAnthropic && dialect != llm.DialectOpenRouter {
+		add("provider.reasoning.budget_tokens is only mapped for anthropic wire or openrouter dialect (use provider.reasoning.effort instead)")
+	}
+	// Kimi's K-series thinks unconditionally; "none" has nothing to map to.
+	if dialect == llm.DialectKimi && r.Effort == "none" {
+		add("provider.reasoning.effort %q: kimi models cannot disable thinking", r.Effort)
+	}
+}
+
+// validateSampling checks temperature/top_p against the range the dialect
+// accepts for every model it serves.
+func (c *Config) validateSampling(add func(format string, args ...any), dialect llm.Dialect, known bool) {
+	temperature, topP := c.Provider.Temperature, c.Provider.TopP
+	// The K-series pins temperature and top_p to fixed values and answers any
+	// other value with a 400, so this is a config error, not a preference.
+	if known && dialect == llm.DialectKimi && (temperature != nil || topP != nil) {
+		add("provider: kimi K-series models fix sampling; remove temperature/top_p")
+	}
+
+	// The ceiling is dialect-total, so it belongs here rather than in a
+	// runtime error: GLM accepts 0..1 for every model it serves.
+	maxTemperature, dialectNote := 2.0, ""
+	if known && dialect == llm.DialectGLM {
+		maxTemperature, dialectNote = 1.0, " for the glm dialect"
+	}
+	// Both checks are written as a NEGATED positive test, deliberately: every
+	// comparison against NaN is false, so the natural "v < 0 || v > max" form
+	// would wave a NaN through validation (strconv.ParseFloat accepts "NaN"
+	// from --set, and YAML spells it ".nan") only for it to die as an
+	// unserializable request body at run time.
+	if temperature != nil && !(*temperature >= 0 && *temperature <= maxTemperature) {
+		add("provider.temperature %g is out of range: must be between 0 and %g%s", *temperature, maxTemperature, dialectNote)
+	}
+	// Zero is excluded rather than clamped: top_p 0 asks for an empty nucleus,
+	// which providers answer with a 400 rather than with greedy decoding.
+	if topP != nil && !(*topP > 0 && *topP <= 1) {
+		add("provider.top_p %g is out of range: must be greater than 0 and at most 1", *topP)
+	}
+}
+
+// validateParams checks the raw escape hatch: no collision with a field amele
+// owns, and nothing JSON cannot express.
+func validateParams(add func(format string, args ...any), params map[string]any) {
+	if len(params) == 0 {
+		return
+	}
+	// Sorted so the joined message is deterministic; Go map iteration order
+	// would otherwise shuffle violations between runs.
+	for _, key := range slices.Sorted(maps.Keys(params)) {
+		if slices.Contains(ownedWireFields, key) {
+			add("provider.params key %q is a request field amele sets itself; remove it (params carries provider-specific extras only)", key)
+		}
+	}
+	// The values are serialized into the request body verbatim, so a value
+	// JSON cannot express (a non-string mapping key, a NaN) must fail here
+	// rather than on the first request of an unattended run.
+	if _, err := json.Marshal(params); err != nil {
+		add("provider.params is not JSON-serializable: %v", err)
 	}
 }
 

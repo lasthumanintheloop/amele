@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1272,5 +1273,345 @@ func TestLoadResolvesPathLikeCommands(t *testing.T) {
 				t.Errorf("Command[0] = %q, want %q", got, tc.want(configDir))
 			}
 		})
+	}
+}
+
+// ptrFloat is the literal-to-pointer helper the sampling tests need:
+// temperature and top_p are *float64 so that "unset" and "0" stay
+// distinguishable (0 is a legal temperature and the usual choice for a judge
+// agent).
+func ptrFloat(v float64) *float64 { return &v }
+
+// hasFloat reports whether p is set and points at want. It keeps the sampling
+// assertions to one comparison each: the two questions ("is it set?" and "is it
+// right?") have the same answer for a test that expects a value.
+func hasFloat(p *float64, want float64) bool { return p != nil && *p == want }
+
+// tuningBase is a valid config carrying no tuning at all - the starting point
+// for every provider-tuning case, so a case's mutation is the only reason it
+// can fail.
+func tuningBase(dir string) *Config {
+	return &Config{
+		Model:     "m",
+		Provider:  ProviderConfig{BaseURL: "https://api.example.com/v1"},
+		Workspace: dir,
+		Limits:    Limits{MaxTurns: 20},
+	}
+}
+
+// TestLoadProviderTuning pins the YAML surface: dialect, reasoning, sampling
+// and the raw params escape hatch all round-trip from the file into the
+// struct, and a config that sets all of them validates.
+func TestLoadProviderTuning(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, `
+model: test-model
+provider:
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${API_KEY}
+  dialect: openrouter
+  max_output_tokens: 65536
+  reasoning:
+    effort: high
+    budget_tokens: 8192
+  temperature: 0.2
+  top_p: 0.9
+  params:
+    verbosity: low
+    provider:
+      require_parameters: true
+`)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.Dialect != "openrouter" {
+		t.Errorf("dialect = %q, want openrouter", cfg.Provider.Dialect)
+	}
+	if cfg.Provider.MaxOutputTokens != 65536 {
+		t.Errorf("max_output_tokens = %d", cfg.Provider.MaxOutputTokens)
+	}
+	if cfg.Provider.Reasoning == nil {
+		t.Fatal("reasoning block was dropped")
+	}
+	if cfg.Provider.Reasoning.Effort != "high" || cfg.Provider.Reasoning.BudgetTokens != 8192 {
+		t.Errorf("reasoning = %+v", *cfg.Provider.Reasoning)
+	}
+	if !hasFloat(cfg.Provider.Temperature, 0.2) {
+		t.Errorf("temperature = %v", cfg.Provider.Temperature)
+	}
+	if !hasFloat(cfg.Provider.TopP, 0.9) {
+		t.Errorf("top_p = %v", cfg.Provider.TopP)
+	}
+	if got := cfg.Provider.Params["verbosity"]; got != "low" {
+		t.Errorf("params.verbosity = %v", got)
+	}
+	if _, ok := cfg.Provider.Params["provider"].(map[string]any); !ok {
+		t.Errorf("params.provider = %#v, want a nested mapping preserved verbatim", cfg.Provider.Params["provider"])
+	}
+	cfg.Workspace = dir
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a fully tuned config must validate: %v", err)
+	}
+}
+
+// TestLoadWithoutProviderTuning is the compatibility half of the surface: a
+// file that mentions none of the tuning keys leaves every one of them absent.
+// That is what keeps "the provider decides" distinguishable from "the config
+// asked for the zero value", and what makes the whole addition invisible to
+// configs written before it existed.
+func TestLoadWithoutProviderTuning(t *testing.T) {
+	cfg, err := Load(writeConfig(t, t.TempDir(), minimalYAML), envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.Dialect != "" || cfg.Provider.Reasoning != nil ||
+		cfg.Provider.Temperature != nil || cfg.Provider.TopP != nil || cfg.Provider.Params != nil {
+		t.Errorf("a config without a tuning block gained values: %+v", cfg.Provider)
+	}
+}
+
+// TestValidateProviderTuning is the rule-by-rule table for the tuning surface.
+// Every case is a rule an operator can only learn about at exit 2, so each
+// message must name the field and say what to do instead.
+func TestValidateProviderTuning(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantSub string // "" means the config must validate
+	}{
+		// Rule 1: the dialect must parse, and the message must list the
+		// alternatives so a typo is fixable without the docs.
+		{"unknown dialect", func(c *Config) { c.Provider.Dialect = "gemini" }, "openrouter"},
+		{"dialect is case sensitive", func(c *Config) { c.Provider.Dialect = "DeepSeek" }, "provider.dialect"},
+		{"known dialect", func(c *Config) { c.Provider.Dialect = "deepseek" }, ""},
+		{"omitted dialect", func(c *Config) { c.Provider.Dialect = "" }, ""},
+
+		// Rule 2: the effort vocabulary is the union of what the providers
+		// accept; anything else would be dropped or 400 at run time.
+		{"unknown effort", func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{Effort: "insane"} }, "provider.reasoning.effort"},
+		{"effort none", func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{Effort: "none"} }, ""},
+		{"effort xhigh", func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{Effort: "xhigh"} }, ""},
+		{"empty effort", func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{} }, ""},
+
+		// Rule 3: budget_tokens is only mapped on the anthropic wire or by
+		// the openrouter gateway; anywhere else it would be silently dropped.
+		{
+			"negative budget_tokens",
+			func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: -1} },
+			"provider.reasoning.budget_tokens must not be negative",
+		},
+		{
+			"budget_tokens on the openai dialect",
+			func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192} },
+			"budget_tokens is only mapped for anthropic wire or openrouter dialect",
+		},
+		{
+			"budget_tokens on the deepseek dialect",
+			func(c *Config) {
+				c.Provider.Dialect = "deepseek"
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"budget_tokens is only mapped for anthropic wire or openrouter dialect",
+		},
+		{
+			"budget_tokens on the openrouter dialect",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
+		{
+			"budget_tokens on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
+
+		// Rule 4: the K-series fixes its sampling values, so anything else is
+		// a 400 - caught here instead of on the first cron run.
+		{
+			"kimi with temperature",
+			func(c *Config) {
+				c.Provider.Dialect = "kimi"
+				c.Provider.Temperature = ptrFloat(0.2)
+			},
+			"kimi K-series models fix sampling; remove temperature/top_p",
+		},
+		{
+			"kimi with top_p",
+			func(c *Config) {
+				c.Provider.Dialect = "kimi"
+				c.Provider.TopP = ptrFloat(0.9)
+			},
+			"kimi K-series models fix sampling; remove temperature/top_p",
+		},
+		{"kimi without sampling", func(c *Config) { c.Provider.Dialect = "kimi" }, ""},
+
+		// Rule 5: Kimi's thinking models cannot be switched off.
+		{
+			"kimi with effort none",
+			func(c *Config) {
+				c.Provider.Dialect = "kimi"
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "none"}
+			},
+			"kimi models cannot disable thinking",
+		},
+		{
+			"kimi with effort high",
+			func(c *Config) {
+				c.Provider.Dialect = "kimi"
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "high"}
+			},
+			"",
+		},
+
+		// Rule 6: params is a raw merge into the request body, so a key amele
+		// sets itself would either be overwritten or overwrite a contract.
+		{
+			"params collides with an owned field",
+			func(c *Config) { c.Provider.Params = map[string]any{"temperature": 0.5} },
+			`provider.params key "temperature"`,
+		},
+		{
+			"params collides with messages",
+			func(c *Config) { c.Provider.Params = map[string]any{"messages": []any{}} },
+			`provider.params key "messages"`,
+		},
+		{
+			"params collides with thinking",
+			func(c *Config) { c.Provider.Params = map[string]any{"thinking": map[string]any{"type": "enabled"}} },
+			`provider.params key "thinking"`,
+		},
+		{
+			"params with a provider-specific key",
+			func(c *Config) { c.Provider.Params = map[string]any{"verbosity": "low", "clear_thinking": false} },
+			"",
+		},
+
+		// Rule 7: ranges. They are total for the dialect, so they belong in
+		// validate rather than in a runtime error message.
+		{"temperature too high", func(c *Config) { c.Provider.Temperature = ptrFloat(2.5) }, "provider.temperature"},
+		{"temperature negative", func(c *Config) { c.Provider.Temperature = ptrFloat(-0.1) }, "provider.temperature"},
+		{"temperature at the ceiling", func(c *Config) { c.Provider.Temperature = ptrFloat(2) }, ""},
+		{"temperature zero", func(c *Config) { c.Provider.Temperature = ptrFloat(0) }, ""},
+		{
+			"glm narrows temperature",
+			func(c *Config) {
+				c.Provider.Dialect = "glm"
+				c.Provider.Temperature = ptrFloat(1.5)
+			},
+			"provider.temperature",
+		},
+		{
+			"glm temperature at its ceiling",
+			func(c *Config) {
+				c.Provider.Dialect = "glm"
+				c.Provider.Temperature = ptrFloat(1)
+			},
+			"",
+		},
+		// NaN is reachable from both directions (YAML ".nan", --set "NaN")
+		// and every comparison against it is false, so a range check written
+		// the natural way would let it through to a request body JSON cannot
+		// even encode.
+		{"temperature NaN", func(c *Config) { c.Provider.Temperature = ptrFloat(math.NaN()) }, "provider.temperature"},
+		{"top_p NaN", func(c *Config) { c.Provider.TopP = ptrFloat(math.NaN()) }, "provider.top_p"},
+		{"temperature infinity", func(c *Config) { c.Provider.Temperature = ptrFloat(math.Inf(1)) }, "provider.temperature"},
+		{"top_p above one", func(c *Config) { c.Provider.TopP = ptrFloat(1.1) }, "provider.top_p"},
+		{"top_p zero", func(c *Config) { c.Provider.TopP = ptrFloat(0) }, "provider.top_p"},
+		{"top_p at one", func(c *Config) { c.Provider.TopP = ptrFloat(1) }, ""},
+
+		// Rule 8: params is serialized to JSON verbatim, so a value JSON
+		// cannot express must fail here rather than at the first request.
+		{
+			"params value is not JSON-serializable",
+			func(c *Config) { c.Provider.Params = map[string]any{"x": map[any]any{1: "a"}} },
+			"provider.params",
+		},
+		{
+			"params NaN is not JSON-serializable",
+			func(c *Config) { c.Provider.Params = map[string]any{"x": math.NaN()} },
+			"provider.params",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tuningBase(dir)
+			tt.mutate(cfg)
+			err := cfg.Validate()
+			if tt.wantSub == "" {
+				if err != nil {
+					t.Fatalf("config must validate, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected a violation")
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error should wrap ErrInvalid: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not mention %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidateParamsRejectsEveryOwnedKey walks the whole owned-field set: each
+// name amele writes into the request body itself must be refused in params, or
+// the escape hatch would silently overwrite a contract (the tool definitions,
+// the response format, the budget cap).
+func TestValidateParamsRejectsEveryOwnedKey(t *testing.T) {
+	dir := t.TempDir()
+	owned := []string{
+		"model", "messages", "tools", "tool_choice", "response_format",
+		"max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
+		"thinking", "temperature", "top_p", "stream", "output_config", "system",
+	}
+	for _, key := range owned {
+		t.Run(key, func(t *testing.T) {
+			cfg := tuningBase(dir)
+			cfg.Provider.Params = map[string]any{key: "x"}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("params key %q was accepted", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q does not name the colliding key %q", err, key)
+			}
+		})
+	}
+}
+
+// TestValidateDialectViolationSuppressesDialectRules: an unparseable dialect
+// makes every dialect-dependent rule unanswerable, so validate reports the
+// dialect once instead of piling on rules the operator cannot act on until it
+// is fixed. The dialect-independent rules still fire in the same pass.
+func TestValidateDialectViolationSuppressesDialectRules(t *testing.T) {
+	cfg := tuningBase(t.TempDir())
+	cfg.Provider.Dialect = "kimi-k3"
+	cfg.Provider.Temperature = ptrFloat(0.2)
+	cfg.Provider.Reasoning = &ReasoningConfig{Effort: "bogus", BudgetTokens: 4096}
+
+	msgs := cfg.Violations()
+	joined := strings.Join(msgs, "\n")
+	if !strings.Contains(joined, "provider.dialect") {
+		t.Fatalf("violations do not report the dialect:\n%s", joined)
+	}
+	if strings.Contains(joined, "kimi K-series models fix sampling") ||
+		strings.Contains(joined, "budget_tokens is only mapped") {
+		t.Errorf("dialect-dependent rules fired on an unparseable dialect:\n%s", joined)
+	}
+	if !strings.Contains(joined, "provider.reasoning.effort") {
+		t.Errorf("the dialect-independent effort rule was skipped:\n%s", joined)
 	}
 }

@@ -215,12 +215,17 @@ FLAGS
                   more. Settable keys, and nothing else:
                     model, prompt, system_prompt_file, workspace, session_dir,
                     limits.max_turns, limits.max_tokens, limits.timeout,
-                    output.max_schema_retries
-                  Tools, permissions, provider settings and the run lock are
-                  deliberately NOT settable: the YAML file stays the audited
-                  grant of authority, so what "amele explain agent.yaml"
-                  reports cannot be widened - or, in the lock's case, weakened
-                  - by a flag on the cron line (docs/threat-model.md §2).
+                    output.max_schema_retries, provider.max_output_tokens,
+                    provider.reasoning.effort, provider.temperature,
+                    provider.top_p
+                  Tools, permissions, the provider's identity (type, base_url,
+                  api_key) and the run lock are deliberately NOT settable: the
+                  YAML file stays the audited grant of authority, so what
+                  "amele explain agent.yaml" reports cannot be widened - or, in
+                  the lock's case, weakened - by a flag on the cron line
+                  (docs/threat-model.md §2). The provider tuning knobs above
+                  are settable because they only change what a run spends, not
+                  what it may do.
                   workspace, session_dir and system_prompt_file resolve against
                   the CURRENT DIRECTORY, not the config's - a path typed in a
                   shell means what it means in that shell. system_prompt_file

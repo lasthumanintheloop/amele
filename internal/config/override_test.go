@@ -23,10 +23,12 @@ func overrideBase() *Config {
 	}
 }
 
-// TestApplyOverridesAllowedKeys walks the whole allowlist: every settable key
-// must round-trip from the command line into the field it names. A key that
+// TestApplyOverridesAllowedKeys walks the allowlist: every settable key must
+// round-trip from the command line into the field it names. A key that
 // silently does nothing would be the worst possible failure - the run would
 // proceed with the config's value while the operator believes otherwise.
+// The four provider tuning keys live in TestApplyOverridesProviderTuningKeys,
+// which covers the same ground for them.
 func TestApplyOverridesAllowedKeys(t *testing.T) {
 	baseDir := t.TempDir()
 
@@ -105,7 +107,9 @@ func TestApplyOverridesAllowedKeys(t *testing.T) {
 func TestSettableKeysCoversAllowlist(t *testing.T) {
 	want := []string{
 		"limits.max_tokens", "limits.max_turns", "limits.timeout", "model",
-		"output.max_schema_retries", "prompt", "session_dir", "system_prompt_file", "workspace",
+		"output.max_schema_retries", "prompt", "provider.max_output_tokens",
+		"provider.reasoning.effort", "provider.temperature", "provider.top_p",
+		"session_dir", "system_prompt_file", "workspace",
 	}
 	got := SettableKeys()
 	if len(got) != len(want) {
@@ -125,14 +129,22 @@ func TestSettableKeysCoversAllowlist(t *testing.T) {
 }
 
 // TestApplyOverridesRejectsExcludedKeys is the SECURITY test: the fields that
-// grant capability (tools, permissions, provider) are deliberately NOT
+// grant capability (tools, permissions) and the provider's IDENTITY (type,
+// base_url, api_key - where the run's credentials go) are deliberately NOT
 // settable, so the YAML stays the audited grant of authority
-// (docs/threat-model.md §2). A typo'd key must fail just as loudly.
+// (docs/threat-model.md §2). The provider TUNING keys settable since
+// 2026-08-24 do not weaken that: they change what a run spends, not what it
+// may do. A typo'd key must fail just as loudly.
 func TestApplyOverridesRejectsExcludedKeys(t *testing.T) {
 	for _, key := range []string{
 		"tools.fs", "tools.shell.enabled", "permissions.default", "permissions.tools.fs_write",
 		"provider.api_key", "provider.base_url", "provider.type", "system_prompt",
 		"output.schema", "limits", "max_turns", "lock", "",
+		// The tuning surface is settable only where the allowlist says so:
+		// the dialect reshapes every request, params writes arbitrary keys
+		// into the body, and budget_tokens is legal on two targets only.
+		"provider.dialect", "provider.params", "provider.reasoning",
+		"provider.reasoning.budget_tokens",
 	} {
 		t.Run(key, func(t *testing.T) {
 			cfg := overrideBase()
@@ -370,6 +382,121 @@ func TestSplitOverride(t *testing.T) {
 			if key != tt.key || value != tt.value || ok != tt.ok {
 				t.Errorf("SplitOverride(%q) = (%q, %q, %v), want (%q, %q, %v)",
 					tt.pair, key, value, ok, tt.key, tt.value, tt.ok)
+			}
+		})
+	}
+}
+
+// TestApplyOverridesProviderTuningKeys is TestApplyOverridesAllowedKeys for the
+// four provider tuning keys: each must land in the field it names, and a
+// sampling value must land as a SET pointer even when it is zero.
+func TestApplyOverridesProviderTuningKeys(t *testing.T) {
+	tests := []struct {
+		name  string
+		pair  string
+		check func(c *Config) bool
+	}{
+		{"max_output_tokens", "provider.max_output_tokens=65536", func(c *Config) bool {
+			return c.Provider.MaxOutputTokens == 65536
+		}},
+		{"reasoning.effort", "provider.reasoning.effort=high", func(c *Config) bool {
+			return c.Provider.Reasoning != nil && c.Provider.Reasoning.Effort == "high"
+		}},
+		{"temperature", "provider.temperature=0.2", func(c *Config) bool {
+			return hasFloat(c.Provider.Temperature, 0.2)
+		}},
+		// 0 is the deterministic setting, not "unset" - the pointer field
+		// exists precisely so the two stay distinguishable.
+		{"temperature zero is a value", "provider.temperature=0", func(c *Config) bool {
+			return hasFloat(c.Provider.Temperature, 0)
+		}},
+		{"top_p", "provider.top_p=0.9", func(c *Config) bool {
+			return hasFloat(c.Provider.TopP, 0.9)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := overrideBase()
+			if err := ApplyOverrides(cfg, []string{tt.pair}, t.TempDir()); err != nil {
+				t.Fatalf("ApplyOverrides(%q): %v", tt.pair, err)
+			}
+			if !tt.check(cfg) {
+				t.Errorf("--set %s did not land in the provider block: %+v", tt.pair, cfg.Provider)
+			}
+		})
+	}
+}
+
+// TestApplyOverridesProviderTuning covers what the four tuning keys do beyond
+// landing in a field: they retune a run whose authority is already fixed, so
+// they must be as predictable as the budget keys - a bad number is exit 2, and
+// an override never invents a reasoning block the operator did not ask for.
+func TestApplyOverridesProviderTuning(t *testing.T) {
+	t.Run("effort keeps an existing budget", func(t *testing.T) {
+		cfg := overrideBase()
+		cfg.Provider.Reasoning = &ReasoningConfig{Effort: "low", BudgetTokens: 4096}
+		if err := ApplyOverrides(cfg, []string{"provider.reasoning.effort=max"}, t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider.Reasoning.Effort != "max" || cfg.Provider.Reasoning.BudgetTokens != 4096 {
+			t.Errorf("reasoning = %+v, want the effort replaced and the budget untouched", *cfg.Provider.Reasoning)
+		}
+	})
+
+	// An empty value is how an operator drops back to the provider default,
+	// exactly as an absent block does - so with no block to clear there is
+	// nothing to create either.
+	t.Run("empty effort clears without creating a block", func(t *testing.T) {
+		cfg := overrideBase()
+		if err := ApplyOverrides(cfg, []string{"provider.reasoning.effort="}, t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider.Reasoning != nil {
+			t.Errorf("reasoning = %+v, want nil", *cfg.Provider.Reasoning)
+		}
+
+		cfg.Provider.Reasoning = &ReasoningConfig{Effort: "high"}
+		if err := ApplyOverrides(cfg, []string{"provider.reasoning.effort="}, t.TempDir()); err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Provider.Reasoning.Effort != "" {
+			t.Errorf("effort = %q, want it cleared", cfg.Provider.Reasoning.Effort)
+		}
+	})
+
+	// The value is not judged here - Validate owns the vocabulary, once, for
+	// YAML and --set alike.
+	t.Run("an unknown effort survives to validation", func(t *testing.T) {
+		cfg := overrideBase()
+		if err := ApplyOverrides(cfg, []string{"provider.reasoning.effort=insane"}, t.TempDir()); err != nil {
+			t.Fatalf("ApplyOverrides rejected a value Validate owns: %v", err)
+		}
+		if cfg.Provider.Reasoning.Effort != "insane" {
+			t.Errorf("effort = %q", cfg.Provider.Reasoning.Effort)
+		}
+	})
+
+	for _, tt := range []struct {
+		name string
+		pair string
+	}{
+		{"temperature is not a number", "provider.temperature=warm"},
+		{"top_p is not a number", "provider.top_p="},
+		{"max_output_tokens is not an integer", "provider.max_output_tokens=lots"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := overrideBase()
+			err := ApplyOverrides(cfg, []string{tt.pair}, t.TempDir())
+			if err == nil {
+				t.Fatal("expected a rejection")
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error does not wrap ErrInvalid: %v", err)
+			}
+			key, _, _ := SplitOverride(tt.pair)
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q does not name the key %q", err, key)
 			}
 		})
 	}

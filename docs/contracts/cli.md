@@ -79,17 +79,33 @@ on `run`, `chat`, `validate` and `explain`.
   anything is spent.
 - **Settable keys (closed list).** `model`, `prompt`, `system_prompt_file`,
   `workspace`, `session_dir`, `limits.max_turns`, `limits.max_tokens`,
-  `limits.timeout`, `output.max_schema_retries`. Any other key - including a
-  typo - is exit 2 with
+  `limits.timeout`, `output.max_schema_retries`, `provider.max_output_tokens`,
+  `provider.reasoning.effort`, `provider.temperature`, `provider.top_p`. Any
+  other key - including a typo - is exit 2 with
   `cannot override "X" from the command line; settable keys: ...`.
 - **What is deliberately NOT settable**, and why: `tools.*`, `mcp.*`,
-  `permissions.*` and `provider.*` grant capability - connecting an MCP server
-  hands the run a new set of tools and the credential they travel with - and
-  `lock` guards single-flight. The YAML
+  `permissions.*` and the provider's IDENTITY (`provider.type`,
+  `provider.base_url`, `provider.api_key`) grant capability
+  or decide where the run's credentials go - connecting an MCP server hands the
+  run a new set of tools and the credential they travel with - and `lock`
+  guards single-flight. The YAML
   file is the operator's audited grant of authority
   ([threat model §2](../threat-model.md)), so what
   `amele explain agent.yaml` reports about a config cannot be widened - or, for
-  the lock, weakened - by a flag appended to the cron line that runs it.
+  the lock, weakened - by a flag appended to the cron line that runs it. The
+  four `provider.*` TUNING keys are settable for the same reason the budgets
+  are: they change what a run spends, never what it may do.
+- **Addition (2026-08-24): the four provider tuning keys.**
+  `provider.max_output_tokens`, `provider.reasoning.effort`,
+  `provider.temperature` and `provider.top_p` joined the allowlist. Additive:
+  no existing key changed, and the refusal message for every other key
+  (`provider.api_key` included) is unchanged apart from the longer list it
+  prints. `provider.dialect`, `provider.reasoning.budget_tokens` and
+  `provider.params` are deliberately absent: the dialect changes how every
+  request is SHAPED rather than what it spends, `budget_tokens` is legal on
+  only two of the targets (so a cron line carrying it would be a config error
+  more often than not), and `params` is a free-form mapping with no
+  `key=value` spelling.
 - **Migration (2026-08-12): the allowlist shrank.** `lock` was settable when
   overrides shipped and no longer is: `--set lock=true|false` is now exit 2
   like any other non-settable key. It was the one entry that could *weaken* a
@@ -98,11 +114,18 @@ on `run`, `chat`, `validate` and `explain`.
   Set the field in YAML instead; nothing about `lock:` in the config changed.
   This is the only key ever removed from the list.
 - **Values.** Integers via `strconv` (`limits.max_turns`, `limits.max_tokens`,
-  `output.max_schema_retries`); `limits.timeout` takes a Go duration
+  `output.max_schema_retries`, `provider.max_output_tokens`); floating point
+  via `strconv` (`provider.temperature`, `provider.top_p`);
+  `limits.timeout` takes a Go duration
   (`30s`, `5m`); the rest are strings taken verbatim. An
   empty value is accepted where it means something: `--set session_dir=`
-  disables session logging. It is refused for `workspace` and
-  `system_prompt_file`, which name nothing readable when empty.
+  disables session logging, and `--set provider.reasoning.effort=` drops back
+  to the provider's own default. It is refused for `workspace` and
+  `system_prompt_file`, which name nothing readable when empty, and for the two
+  sampling keys, where it is not a number.
+  Range and vocabulary checks belong to validation, not to the override: an
+  out-of-range `provider.temperature` is exit 2 from `Validate` exactly as the
+  same value written in YAML would be.
 - **Paths.** `workspace`, `session_dir` and `system_prompt_file` given via an
   override resolve against the **current working directory**, not the config
   file's directory (which is what the same fields written in YAML resolve

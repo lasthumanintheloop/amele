@@ -16,8 +16,9 @@ import (
 // SECURITY: the fields that grant capability are deliberately absent -
 // tools.* (which tools exist at all), mcp.* (which external servers the run
 // connects to, and therefore which tools and credentials it carries),
-// permissions.* (who may run them) and provider.* (where the run's credentials
-// go). docs/threat-model.md §2 puts
+// permissions.* (who may run them) and the provider's IDENTITY - type,
+// base_url, api_key, which decide where the run's credentials go.
+// docs/threat-model.md §2 puts
 // the YAML file on the trusted side of the boundary precisely because it is
 // the operator's reviewable, diffable declaration of authority: `amele explain
 // agent.yaml` tells you what agent.yaml grants, and that answer must not be
@@ -33,6 +34,13 @@ import (
 // explain report to show for it. Removing it is a breaking change to the
 // documented allowlist (docs/contracts/cli.md); `lock: true` in YAML is
 // untouched.
+//
+// SECURITY: the four provider.* entries added on 2026-08-24 are TUNING, not
+// identity - how hard the model thinks, how it samples, how long its answer may
+// be. They belong with the budgets: the worst an operator can do with them is
+// make a run spend differently. provider.dialect stays out because it reshapes
+// every request rather than retuning one, and provider.params because it writes
+// arbitrary keys into the request body.
 var settableKeys = []string{
 	"limits.max_tokens",
 	"limits.max_turns",
@@ -40,6 +48,10 @@ var settableKeys = []string{
 	"model",
 	"output.max_schema_retries",
 	"prompt",
+	"provider.max_output_tokens",
+	"provider.reasoning.effort",
+	"provider.temperature",
+	"provider.top_p",
 	"session_dir",
 	"system_prompt_file",
 	"workspace",
@@ -135,10 +147,30 @@ func (c *Config) applyTextOverride(key, value, baseDir string) (handled bool, er
 		c.SessionDir = resolveOverridePath(value, baseDir)
 	case "system_prompt_file":
 		return true, c.overrideSystemPromptFile(value, baseDir)
+	case "provider.reasoning.effort":
+		c.overrideReasoningEffort(value)
 	default:
 		return false, nil
 	}
 	return true, nil
+}
+
+// overrideReasoningEffort sets the reasoning depth, allocating the block when
+// the config has none. The value is not judged here: Validate owns the effort
+// vocabulary, once, for YAML and --set alike.
+//
+// An empty value means "back to the provider default", which is exactly what an
+// absent block means - so with no block to clear, none is created either. That
+// keeps `--set provider.reasoning.effort=` from handing the wiring below an
+// empty-but-present block to interpret.
+func (c *Config) overrideReasoningEffort(value string) {
+	if c.Provider.Reasoning == nil {
+		if value == "" {
+			return
+		}
+		c.Provider.Reasoning = &ReasoningConfig{}
+	}
+	c.Provider.Reasoning.Effort = value
 }
 
 // overrideSystemPromptFile points the system prompt at a different file and
@@ -192,6 +224,12 @@ func (c *Config) applyScalarOverride(key, value string) (handled bool, err error
 		return true, overrideInt(key, value, &c.Limits.MaxTokens)
 	case "output.max_schema_retries":
 		return true, overrideInt(key, value, &c.Output.MaxSchemaRetries)
+	case "provider.max_output_tokens":
+		return true, overrideInt(key, value, &c.Provider.MaxOutputTokens)
+	case "provider.temperature":
+		return true, overrideFloat(key, value, &c.Provider.Temperature)
+	case "provider.top_p":
+		return true, overrideFloat(key, value, &c.Provider.TopP)
 	case "limits.timeout":
 		parsed, err := time.ParseDuration(value)
 		if err != nil {
@@ -212,6 +250,19 @@ func overrideInt(key, value string, dst *int) error {
 		return fmt.Errorf("%w: --set %s: %q is not an integer", ErrInvalid, key, value)
 	}
 	*dst = parsed
+	return nil
+}
+
+// overrideFloat parses one sampling override into dst, which is a POINTER
+// field: the override sets it, so "--set provider.temperature=0" means the
+// deterministic setting rather than "unset". Range checks stay in Validate,
+// like every other field's.
+func overrideFloat(key, value string, dst **float64) error {
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return fmt.Errorf("%w: --set %s: %q is not a number", ErrInvalid, key, value)
+	}
+	*dst = &parsed
 	return nil
 }
 
