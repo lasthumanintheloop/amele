@@ -664,20 +664,22 @@ func (c *GeminiClient) endpoint(model string) string {
 	return strings.TrimSuffix(base, "/") + "/" + geminiAPIVersion + "/models/" + geminiModelPath(model) + ":generateContent"
 }
 
-// geminiModelPath renders a model name as URL path segments.
+// geminiModelPath renders a model name as ONE URL path segment.
 //
 // The "models/" prefix is trimmed because the API's own documentation prints
 // model ids both ways ("gemini-3-pro" and "models/gemini-3-pro") and a config
 // copied from the latter would otherwise request /models/models/... and 404.
-// SECURITY: each remaining segment is escaped, so a model name can only ever
-// name a model - it cannot append a query string or climb out of the path the
-// client chose.
+//
+// SECURITY: what remains is escaped as a single segment, so every separator a
+// model name might carry - "/" included - is percent-encoded. A model name can
+// then only ever name a model: it cannot append a query string, and it cannot
+// climb out of the path this client chose, not even through a "../.." that a
+// normalizing proxy would otherwise resolve away. Real model ids carry no
+// slash, so single-segment escaping costs nothing; a slash-bearing name (a
+// tuned model, which amele does not support today) fails loudly with a 404
+// instead of silently addressing another endpoint.
 func geminiModelPath(model string) string {
-	segments := strings.Split(strings.TrimPrefix(model, "models/"), "/")
-	for i, segment := range segments {
-		segments[i] = url.PathEscape(segment)
-	}
-	return strings.Join(segments, "/")
+	return url.PathEscape(strings.TrimPrefix(model, "models/"))
 }
 
 func (c *GeminiClient) httpClient() *http.Client {

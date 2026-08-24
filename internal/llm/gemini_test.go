@@ -175,6 +175,19 @@ func gemWireCases() []gemWireCase {
 			},
 		},
 		{
+			// A message that would produce no parts is DROPPED: an empty text
+			// part encodes to {}, a shape protobuf-JSON rejects, and a turn
+			// with no parts is a 400. Pinned because Task 3 changes exactly
+			// this branch - an assistant turn that carries only tool calls
+			// stops being empty once functionCall parts exist.
+			name:   "a message with no parts is dropped",
+			golden: "gemini-baseline.json",
+			req: Request{
+				Model:    "gemini-3-pro",
+				Messages: append(baseMessages(), Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "fs_read"}}}),
+			},
+		},
+		{
 			// CONTRACT for the task boundary: tools, the reasoning knob and the
 			// response format are NOT on this wire yet (Task 3 sanitizes tool
 			// schemas, Task 4 maps thinkingConfig/responseJsonSchema). A
@@ -287,6 +300,14 @@ func TestGeminiEndpoint(t *testing.T) {
 			"https://proxy.example.com", "gemini-3-pro?key=leak",
 			"https://proxy.example.com/v1beta/models/gemini-3-pro%3Fkey=leak:generateContent",
 		},
+		{
+			// SECURITY: the separators are what makes traversal work, and they
+			// are encoded - so a normalizing proxy has no ".." SEGMENT to
+			// resolve and the request stays under /v1beta/models/.
+			"traversal cannot escape the models path",
+			"https://proxy.example.com", "../../../foo",
+			"https://proxy.example.com/v1beta/models/..%2F..%2F..%2Ffoo:generateContent",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -295,6 +316,32 @@ func TestGeminiEndpoint(t *testing.T) {
 				t.Errorf("endpoint: got %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestGeminiCandidateWithoutParts: a candidate whose content carries NO parts
+// key at all is an empty turn, not a decode failure - MAX_TOKENS and a blocked
+// candidate really do produce one. The client must hand the loop an empty
+// assistant message with the mapped finish reason and let the loop decide.
+func TestGeminiCandidateWithoutParts(t *testing.T) {
+	srv := geminiServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		_, _ = w.Write([]byte(`{"candidates": [{"content": {"role": "model"}, "finishReason": "MAX_TOKENS"}],
+			"usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 0}}`))
+	})
+
+	client := &GeminiClient{BaseURL: srv.URL, Sleep: failingSleep(t)}
+	resp, err := client.Chat(context.Background(), gemUserRequest())
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if resp.Message.Content != "" {
+		t.Errorf("content: got %q, want empty", resp.Message.Content)
+	}
+	if resp.Message.Role != RoleAssistant {
+		t.Errorf("role: got %q", resp.Message.Role)
+	}
+	if resp.FinishReason != "length" {
+		t.Errorf("finish reason: got %q, want length", resp.FinishReason)
 	}
 }
 
@@ -502,6 +549,12 @@ func TestParseGoogleRetryDelay(t *testing.T) {
 		},
 		{"no retry info", `{"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": []}`, 0},
 		{"unparseable duration", `{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "soon"}`, 0},
+		{
+			// A detail that is not an object at all: the entry is skipped
+			// rather than failing the whole read, so a later well-formed
+			// RetryInfo would still be honored.
+			"detail is not an object", `"oops"`, 0,
+		},
 		{"negative duration", `{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "-3s"}`, 0},
 		{"no details", ``, 0},
 	}
