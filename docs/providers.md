@@ -226,7 +226,11 @@ provider:
 
 DeepSeek thinks by default, so a config with no `reasoning` block still gets
 reasoning back - and still has to echo it. Set `effort: none` to turn thinking
-off. `output.schema` runs on the fallback path here (no `json_schema` support).
+off. That default also decides what your sampling knobs do: `temperature` and
+`top_p` are accepted and then **silently ignored while thinking**, so `explain`
+prints `temperature/top_p: sent but ignored by deepseek in thinking mode` next
+to the values rather than promising an effect the run will not have. With
+`effort: none` they take effect and the caveat disappears. `output.schema` runs on the fallback path here (no `json_schema` support).
 
 ### GLM (Z.ai)
 

@@ -63,6 +63,52 @@ func TestProviderMappingRows(t *testing.T) {
 			},
 		},
 		{
+			// DeepSeek accepts temperature/top_p and then IGNORES them while
+			// thinking - and thinking is on by default there. Reporting the
+			// values as a plain pass-through would promise an effect the run
+			// will not have, which is exactly what this block exists to
+			// prevent.
+			name: "deepseek reports sampling as ignored in thinking mode",
+			mutate: func(c *config.Config) {
+				c.Provider.Dialect = "deepseek"
+				c.Provider.Temperature = ptrFloat(0.2)
+			},
+			want: []string{
+				"temperature: 0.2 -> temperature: 0.2",
+				"temperature/top_p: sent but ignored by deepseek in thinking mode (thinking is on by default)",
+			},
+		},
+		{
+			// Thinking off is the one case where the values do take effect.
+			name: "deepseek with thinking off reports no sampling caveat",
+			mutate: func(c *config.Config) {
+				c.Provider.Dialect = "deepseek"
+				c.Provider.TopP = ptrFloat(0.9)
+				c.Provider.Reasoning = &config.ReasoningConfig{Effort: "none"}
+			},
+			want:    []string{"top_p: 0.9 -> top_p: 0.9"},
+			notWant: []string{"sent but ignored"},
+		},
+		{
+			// The caveat is deepseek's, not every dialect's: glm and kimi have
+			// their own (different) sampling rules, already covered elsewhere.
+			name: "the sampling caveat is dialect-scoped",
+			mutate: func(c *config.Config) {
+				c.Provider.Dialect = "glm"
+				c.Provider.Temperature = ptrFloat(0.2)
+			},
+			notWant: []string{"sent but ignored"},
+		},
+		{
+			// No knob set, nothing to caveat.
+			name: "no sampling knob, no caveat",
+			mutate: func(c *config.Config) {
+				c.Provider.Dialect = "deepseek"
+				c.Provider.Reasoning = &config.ReasoningConfig{Effort: "high"}
+			},
+			notWant: []string{"sent but ignored"},
+		},
+		{
 			// SECURITY: a params value can be a routing credential, so the
 			// report lists the KEYS and never the values.
 			name: "params list keys only, with the dialect's unknown-field policy",

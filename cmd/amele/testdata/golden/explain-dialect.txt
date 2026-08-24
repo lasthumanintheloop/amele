@@ -12,6 +12,7 @@ MODEL & PROVIDER
     reasoning.effort: medium -> reasoning_effort: high (deepseek has no medium)
     temperature: 0.2 -> temperature: 0.2
     top_p: 0.9 -> top_p: 0.9
+    temperature/top_p: sent but ignored by deepseek in thinking mode (thinking is on by default)
     params keys (merged verbatim, values not shown): "provider", "verbosity"
     unknown request fields: ignored
 

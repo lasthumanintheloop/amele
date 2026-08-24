@@ -48,6 +48,28 @@ func UnknownFieldPolicy(d Dialect) string {
 	}
 }
 
+// SamplingNote returns the caveat that applies to a temperature/top_p this
+// dialect will ACCEPT but not honor, or "" when the values take effect as sent.
+// spec is what the config asked of the reasoning knob, because the answer can
+// depend on it.
+//
+// Only deepseek has one today: it accepts both knobs and silently ignores them
+// while thinking (research §matrix "temperature/top_p"), and thinking is ON by
+// default there - so the config that says nothing about reasoning is exactly
+// the config whose sampling values do nothing. The dialects that REJECT a
+// sampling value instead (kimi's fixed K-series) are refused at validate, and
+// the ones that merely narrow the range (glm) are reported by that range.
+//
+// CONTRACT: a report that showed `temperature: 0.2 -> temperature: 0.2` and
+// stopped there would promise an effect the run will not have - the same
+// silent-degradation failure the dialect layer exists to prevent.
+func SamplingNote(d Dialect, spec ReasoningSpec) string {
+	if d != DialectDeepSeek || spec.Effort == effortNone {
+		return ""
+	}
+	return "temperature/top_p: sent but ignored by deepseek in thinking mode (thinking is on by default)"
+}
+
 // AnthropicUnknownFieldPolicy is UnknownFieldPolicy for the Anthropic Messages
 // API, which is a WIRE rather than a dialect: the dialect is not consulted at
 // all on that path, so the report needs its own answer. The Messages API is

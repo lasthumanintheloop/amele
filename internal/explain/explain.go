@@ -926,11 +926,22 @@ func providerMappingLines(cfg *config.Config) []string {
 	}
 	// Sampling is dialect-independent: both wires spell it temperature/top_p
 	// and pass the value through, so these rows survive an unknown dialect.
+	sampling := false
 	if t := cfg.Provider.Temperature; t != nil {
 		lines = append(lines, fmt.Sprintf("temperature: %g -> temperature: %g", *t, *t))
+		sampling = true
 	}
 	if p := cfg.Provider.TopP; p != nil {
 		lines = append(lines, fmt.Sprintf("top_p: %g -> top_p: %g", *p, *p))
+		sampling = true
+	}
+	// What the TARGET does with those values is not dialect-independent: a
+	// value that is accepted and then ignored has to say so next to the row
+	// that promises it, or the report promises an effect the run will not have.
+	if sampling && known && !anthropicWire(cfg) {
+		if note := llm.SamplingNote(dialect, reasoningSpec(cfg)); note != "" {
+			lines = append(lines, note)
+		}
 	}
 	if len(cfg.Provider.Params) > 0 {
 		// SECURITY: KEYS only. A params value is arbitrary text from the YAML
@@ -967,6 +978,17 @@ func capFieldFor(cfg *config.Config, dialect llm.Dialect) string {
 	return llm.CapField(dialect)
 }
 
+// reasoningSpec is what the config asked of the reasoning knob, in the neutral
+// shape the llm mapping functions take. A nil block yields the zero spec, which
+// means "the provider default stands".
+func reasoningSpec(cfg *config.Config) llm.ReasoningSpec {
+	r := cfg.Provider.Reasoning
+	if r == nil {
+		return llm.ReasoningSpec{}
+	}
+	return llm.ReasoningSpec{Effort: r.Effort, BudgetTokens: r.BudgetTokens}
+}
+
 // reasoningMappingLines asks the client's own mapping function what this
 // config's reasoning knob becomes, and returns its notes verbatim.
 func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect) []string {
@@ -977,7 +999,7 @@ func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect) []string {
 	if r == nil || (r.Effort == "" && r.BudgetTokens == 0) {
 		return nil
 	}
-	spec := llm.ReasoningSpec{Effort: r.Effort, BudgetTokens: r.BudgetTokens}
+	spec := reasoningSpec(cfg)
 	if anthropicWire(cfg) {
 		return llm.AnthropicReasoningNotes(spec)
 	}
