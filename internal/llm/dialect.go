@@ -3,6 +3,7 @@ package llm
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 )
 
@@ -347,4 +348,92 @@ func jsonString(s string) json.RawMessage {
 		return json.RawMessage(`""`)
 	}
 	return encoded
+}
+
+// errorSignature pairs a recognizer for one provider failure with the advice
+// that names the config knob to turn.
+type errorSignature struct {
+	// match reports whether this failure is the one the entry describes. It
+	// receives the whole typed error, not just the text, so an entry may key on
+	// the status code too.
+	match func(*statusError) bool
+	// advice is appended to the provider error message after an em dash. It is
+	// written in the CONFIG's vocabulary (provider.reasoning.effort,
+	// provider.dialect), because the reader is holding a YAML file, not a
+	// request body.
+	advice string
+}
+
+// errorSignatures is the ordered table consulted for a non-retryable 400 on the
+// OpenAI-compatible wire. First match wins, so more specific entries come
+// first. The slice is read-only after initialization (like dialects above);
+// nothing mutates it.
+//
+// CONTRACT: these are STRING HEURISTICS by necessity and the fixtures in
+// openai_errsig_test.go are what pins them. docs/engineering.md §5.3 bans
+// deciding control flow by matching error strings; this table is the documented
+// exception the design approved (design doc §"Error-signature detection"),
+// alongside the older rejectsResponseFormat precedent. It is safe in a way a
+// general string match is not, because it changes NOTHING but the human-facing
+// text: no retry, no downgrade, no request rewrite. A signature that stops
+// matching (a provider reworded its 400) costs a hint, never correctness - which
+// is also why detection was chosen over auto-downgrading the offending field.
+//
+// Every match runs against statusError.snippet, already capped to maxErrorBody
+// bytes; a proxy that buries the signature past that cut-off simply gets no
+// hint.
+var errorSignatures = []errorSignature{
+	{
+		// gpt-5.6 on chat/completions: function tools plus any reasoning_effort
+		// other than "none" is a hard 400, and medium is the DEFAULT - so tools
+		// break out of the box on that family (research §"Load-bearing quirks"
+		// #1, which also records that the error string is the only detection
+		// contract; the quirk is in no official doc).
+		match:  func(e *statusError) bool { return strings.Contains(e.snippet, "Function tools with reasoning_effort") },
+		advice: "set provider.reasoning.effort: none for this model on chat/completions, or use a different model",
+	},
+	{
+		// The output-cap mistake, checked BEFORE the sampling entry: OpenAI
+		// phrases it "'max_tokens' is not supported ... Use
+		// 'max_completion_tokens' instead", which shares wording with the
+		// sampling family. Requiring BOTH field names keeps it from matching a
+		// 400 that merely mentions a cap.
+		match: func(e *statusError) bool {
+			return strings.Contains(e.snippet, "max_tokens") && strings.Contains(e.snippet, "max_completion_tokens")
+		},
+		advice: "this model requires max_completion_tokens; set provider.dialect to a dialect that maps it (openai/groq/kimi)",
+	},
+	{
+		// Reasoning models on OpenAI accept only the default temperature, and
+		// the K-series fixes both temperature and top_p (research §matrix
+		// "temperature/top_p"). Two spellings are in the wild: OpenAI's
+		// "Unsupported value: 'temperature' does not support ..." and the
+		// "'temperature' is not supported ..." form. The quotes are part of the
+		// match so the word "temperature" in prose cannot trigger it.
+		match: func(e *statusError) bool {
+			return strings.Contains(e.snippet, "'temperature' does not support") ||
+				strings.Contains(e.snippet, "'temperature' is not supported")
+		},
+		advice: "this model rejects non-default sampling; remove provider.temperature/top_p",
+	},
+}
+
+// adviceFor returns the actionable hint for a recognized provider failure, or
+// "" when nothing in the table matches - in which case the error message stays
+// exactly what it was before this table existed.
+//
+// Only a 400 is inspected. A 429 or 5xx is a transient condition the client
+// retries; the same body text there says nothing about the request being
+// wrong, and advising a config change over a rate limit would be a wrong hint
+// at the worst moment.
+func adviceFor(e *statusError) string {
+	if e == nil || e.code != http.StatusBadRequest {
+		return ""
+	}
+	for _, sig := range errorSignatures {
+		if sig.match(e) {
+			return sig.advice
+		}
+	}
+	return ""
 }

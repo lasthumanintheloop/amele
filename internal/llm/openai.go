@@ -360,14 +360,8 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBody))
-		retryable := httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500
-		// Double %w: the message is unchanged ("provider error: status N: …")
-		// while callers keep both errors.Is(ErrProvider) and errors.As on the
-		// typed status.
-		statusErr := &statusError{code: httpResp.StatusCode, snippet: strings.TrimSpace(string(snippet))}
-		return nil, retryable, parseRetryAfter(httpResp.Header.Get("Retry-After")),
-			fmt.Errorf("%w: %w", ErrProvider, statusErr)
+		retryable, retryAfter, err := statusFailure(httpResp)
+		return nil, retryable, retryAfter, err
 	}
 
 	var wire oaResponse
@@ -414,6 +408,31 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 		resp.UsageMissing = true
 	}
 	return resp, false, 0, nil
+}
+
+// statusFailure turns a non-200 reply into the typed provider error, reporting
+// whether the failure is worth retrying and the provider's Retry-After wish.
+// The response body is read here (bounded to maxErrorBody) and not by the
+// caller, so the two cannot disagree about who consumed it.
+func statusFailure(httpResp *http.Response) (retryable bool, retryAfter time.Duration, err error) {
+	snippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBody))
+	retryable = httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500
+	// Double %w: the message is unchanged ("provider error: status N: …")
+	// while callers keep both errors.Is(ErrProvider) and errors.As on the
+	// typed status.
+	statusErr := &statusError{code: httpResp.StatusCode, snippet: strings.TrimSpace(string(snippet))}
+	err = fmt.Errorf("%w: %w", ErrProvider, statusErr)
+	// A recognized 400 keeps its message and gains a hint at the end
+	// ("… — set provider.reasoning.effort: none …"). The advice is appended
+	// HERE rather than inside statusError.Error() so that the anthropic client,
+	// which shares the type, keeps its own (different) signatures; and so the
+	// typed error stays a pure carrier of what the wire said. Nothing else
+	// changes: retryable, Retry-After and the errors.Is/As behavior are the
+	// same with or without a match.
+	if advice := adviceFor(statusErr); advice != "" {
+		err = fmt.Errorf("%w — %s", err, advice)
+	}
+	return retryable, parseRetryAfter(httpResp.Header.Get("Retry-After")), err
 }
 
 // shouldFallbackToPlain reports whether a failed attempt must be repeated once
