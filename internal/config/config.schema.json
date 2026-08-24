@@ -24,7 +24,7 @@
         },
         "api_key": {
           "type": "string",
-          "description": "Credential for the provider - the bearer token on the openai and anthropic wires, the x-goog-api-key header with type \"gemini\". Must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are rejected at load time. An empty key is valid for local endpoints such as Ollama."
+          "description": "Credential for the provider - the Authorization bearer token on the openai wire, the x-api-key header with type \"anthropic\", the x-goog-api-key header with type \"gemini\". Must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are rejected at load time. An empty key is valid for local endpoints such as Ollama."
         },
         "request_timeout": {
           "$ref": "#/$defs/duration",

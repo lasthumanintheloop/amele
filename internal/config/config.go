@@ -125,8 +125,12 @@ type ProviderConfig struct {
 	// client defaults to the fixed AI Studio host); a value overrides the host
 	// for proxied deployments.
 	BaseURL string `yaml:"base_url"`
-	// APIKey is the bearer token. It is normally injected via ${ENV_VAR}
-	// interpolation; an empty key is valid for local endpoints (Ollama).
+	// APIKey is the provider credential. Each wire carries it in its own
+	// header - Authorization: Bearer on the OpenAI-compatible path, x-api-key
+	// with type anthropic, x-goog-api-key with type gemini - so the config
+	// names the secret and the client decides where it goes. It is normally
+	// injected via ${ENV_VAR} interpolation; an empty key is valid for local
+	// endpoints (Ollama).
 	APIKey string `yaml:"api_key"`
 	// RequestTimeout bounds a single HTTP round-trip to the provider. Zero
 	// means the client default (120s). Distinct from limits.timeout, which
