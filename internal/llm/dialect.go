@@ -119,6 +119,41 @@ func capField(d Dialect) string {
 	}
 }
 
+// The two message keys that carry a reasoning payload on the OpenAI wire.
+// They are the response field a client reads AND the request field it writes
+// back, so they double as the json tags on oaMessage - keep the two in step.
+const (
+	fieldReasoningContent = "reasoning_content"
+	fieldReasoningDetails = "reasoning_details"
+)
+
+// reasoningField returns the message key that carries this dialect's reasoning
+// payload. The zero-value Dialect answers like DialectOpenAI.
+//
+// CONTRACT: one function answers for BOTH directions - the field captured off
+// a response and the field echoed back on the next request. A round-trip that
+// captured one spelling and echoed another would look correct in isolation and
+// fail only against a live provider, so the two ends cannot be decided apart.
+//
+// The split is between OpenRouter and everyone else. OpenRouter returns a
+// typed `reasoning_details` array (text/summary/encrypted blocks, each with an
+// optional signature) beside a plaintext `reasoning` summary; only the array
+// round-trips - it is what carries the signatures the upstream provider checks
+// (research §OpenRouter). The rest of the wire, CN natives included, uses the
+// single `reasoning_content` field (research §"Load-bearing quirks" #6).
+func reasoningField(d Dialect) string {
+	switch d {
+	case DialectOpenRouter:
+		return fieldReasoningDetails
+	case DialectOpenAI, DialectGroq, DialectDeepSeek, DialectGLM, DialectKimi:
+		return fieldReasoningContent
+	default:
+		// Unreachable through ParseDialect; the zero value lands here and must
+		// behave like openai.
+		return fieldReasoningContent
+	}
+}
+
 // ReasoningMapping is what one dialect makes of a ReasoningSpec: the request
 // body fragments to merge at the body root, and the human-readable lines that
 // describe the mapping.
