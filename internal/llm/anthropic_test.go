@@ -518,47 +518,11 @@ func TestAnthropicRetriesExhausted(t *testing.T) {
 	}
 }
 
-// TestAnthropicResponseFormatIgnored: the Messages API path has no native
-// json_schema enforcement, so ResponseFormat must not leak into the wire -
-// the validate+retry layer above is the output.schema enforcement.
-func TestAnthropicResponseFormatIgnored(t *testing.T) {
-	srv := anthropicServer(t, func(w http.ResponseWriter, req map[string]any) {
-		for _, key := range []string{"response_format", "output_config", "output_format"} {
-			if _, present := req[key]; present {
-				t.Errorf("request must not carry %q", key)
-			}
-		}
-		_, _ = w.Write([]byte(anOKBody(`{"ok":true}`)))
-	})
-
-	client := &AnthropicClient{BaseURL: srv.URL}
-	resp, err := client.Chat(context.Background(), Request{
-		Model:          "m",
-		Messages:       []Message{{Role: RoleUser, Content: "x"}},
-		ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// This client never sends the schema natively, so EVERY response to a
-	// schema-carrying request must be flagged: the caller's warning is the
-	// only thing keeping the downgrade from being silent.
-	if !resp.SchemaEnforcementDropped {
-		t.Error("anthropic response to a schema-carrying request must be flagged SchemaEnforcementDropped")
-	}
-
-	// With no schema requested there is nothing to drop.
-	plain, err := client.Chat(context.Background(), Request{
-		Model:    "m",
-		Messages: []Message{{Role: RoleUser, Content: "x"}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plain.SchemaEnforcementDropped {
-		t.Error("schema-less request must not set SchemaEnforcementDropped")
-	}
-}
+// The schema path moved: this API has native json_schema enforcement via
+// output_config.format, so the request DOES carry the schema and the response
+// is not flagged. See TestAnthropicNativeSchemaIsSent and
+// TestAnthropicOutputConfigFallback in anthropic_thinking_test.go, which
+// replaced the former TestAnthropicResponseFormatIgnored.
 
 // TestAnthropicChatResponseBodyIsBounded mirrors the OpenAI client's cap on
 // the success body: an endless stream must end as a provider error, not as

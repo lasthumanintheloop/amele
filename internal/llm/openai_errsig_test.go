@@ -127,7 +127,7 @@ func TestChatAdviceOnlyOnBadRequest(t *testing.T) {
 // reads as the cap-field mistake even though it also says "is not supported".
 func TestChat400AdviceIsFirstMatch(t *testing.T) {
 	se := &statusError{code: http.StatusBadRequest, snippet: bodyWrongOutputCapField}
-	if got := adviceFor(se); got != adviceCapField {
+	if got := adviceFor(errorSignatures, se); got != adviceCapField {
 		t.Errorf("advice: got %q, want %q", got, adviceCapField)
 	}
 }

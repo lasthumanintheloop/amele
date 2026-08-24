@@ -365,7 +365,8 @@ type errorSignature struct {
 }
 
 // errorSignatures is the ordered table consulted for a non-retryable 400 on the
-// OpenAI-compatible wire. First match wins, so more specific entries come
+// OpenAI-compatible wire (the Anthropic client has its own, different table:
+// anthropicErrorSignatures). First match wins, so more specific entries come
 // first. The slice is read-only after initialization (like dialects above);
 // nothing mutates it.
 //
@@ -419,18 +420,23 @@ var errorSignatures = []errorSignature{
 }
 
 // adviceFor returns the actionable hint for a recognized provider failure, or
-// "" when nothing in the table matches - in which case the error message stays
-// exactly what it was before this table existed.
+// "" when nothing in the given table matches - in which case the error message
+// stays exactly what it was before this table existed.
+//
+// The table is a parameter because each wire family has its own signatures:
+// errorSignatures for the OpenAI-compatible clients, anthropicErrorSignatures
+// for the Messages API. One matcher serves both so the 400 gate below cannot
+// drift between them.
 //
 // Only a 400 is inspected. A 429 or 5xx is a transient condition the client
 // retries; the same body text there says nothing about the request being
 // wrong, and advising a config change over a rate limit would be a wrong hint
 // at the worst moment.
-func adviceFor(e *statusError) string {
+func adviceFor(signatures []errorSignature, e *statusError) string {
 	if e == nil || e.code != http.StatusBadRequest {
 		return ""
 	}
-	for _, sig := range errorSignatures {
+	for _, sig := range signatures {
 		if sig.match(e) {
 			return sig.advice
 		}

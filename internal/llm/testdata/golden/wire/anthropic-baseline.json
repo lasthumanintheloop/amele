@@ -1,0 +1,1 @@
+{"model":"claude-opus-5","max_tokens":8192,"system":"you are a log sentry","messages":[{"role":"user","content":[{"type":"text","text":"scan today's log"}]}]}

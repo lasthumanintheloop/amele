@@ -301,7 +301,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 		}
 
 		resp, retryable, ra, err := c.doOnce(ctx, body)
-		if shouldFallbackToPlain(err, fallbackBody) {
+		if shouldFallback(err, fallbackBody, (*statusError).rejectsResponseFormat) {
 			// Capability discovery, not a transient failure: the provider
 			// will reject the field just as firmly on the next attempt, so
 			// the schema-less repeat happens immediately, inside this same
@@ -360,7 +360,7 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	defer func() { _ = httpResp.Body.Close() }()
 
 	if httpResp.StatusCode != http.StatusOK {
-		retryable, retryAfter, err := statusFailure(httpResp)
+		retryable, retryAfter, err := statusFailure(httpResp, errorSignatures)
 		return nil, retryable, retryAfter, err
 	}
 
@@ -414,7 +414,11 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 // whether the failure is worth retrying and the provider's Retry-After wish.
 // The response body is read here (bounded to maxErrorBody) and not by the
 // caller, so the two cannot disagree about who consumed it.
-func statusFailure(httpResp *http.Response) (retryable bool, retryAfter time.Duration, err error) {
+//
+// signatures is the caller's error-signature table: both clients share the
+// retry/Retry-After/typed-error handling and differ only in which 400 bodies
+// they recognize.
+func statusFailure(httpResp *http.Response, signatures []errorSignature) (retryable bool, retryAfter time.Duration, err error) {
 	snippet, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxErrorBody))
 	retryable = httpResp.StatusCode == http.StatusTooManyRequests || httpResp.StatusCode >= 500
 	// Double %w: the message is unchanged ("provider error: status N: …")
@@ -429,22 +433,24 @@ func statusFailure(httpResp *http.Response) (retryable bool, retryAfter time.Dur
 	// typed error stays a pure carrier of what the wire said. Nothing else
 	// changes: retryable, Retry-After and the errors.Is/As behavior are the
 	// same with or without a match.
-	if advice := adviceFor(statusErr); advice != "" {
+	if advice := adviceFor(signatures, statusErr); advice != "" {
 		err = fmt.Errorf("%w — %s", err, advice)
 	}
 	return retryable, parseRetryAfter(httpResp.Header.Get("Retry-After")), err
 }
 
-// shouldFallbackToPlain reports whether a failed attempt must be repeated once
-// without response_format. fallback is nil when there is nothing to strip or
-// when the single permitted fallback has already been spent, so this is also
-// what bounds the fallback to one extra round-trip per Chat call.
-func shouldFallbackToPlain(err error, fallback []byte) bool {
+// shouldFallback reports whether a failed attempt must be repeated once with
+// the offending field stripped. rejected recognizes the failure that warrants
+// it - response_format on the OpenAI wire, output_config on the Anthropic one -
+// and fallback is nil when there is nothing to strip or when the single
+// permitted fallback has already been spent, which is what bounds it to one
+// extra round-trip per Chat call.
+func shouldFallback(err error, fallback []byte, rejected func(*statusError) bool) bool {
 	if err == nil || fallback == nil {
 		return false
 	}
 	var se *statusError
-	return errors.As(err, &se) && se.rejectsResponseFormat()
+	return errors.As(err, &se) && rejected(se)
 }
 
 // parseRetryAfter reads the seconds form of a Retry-After header. The
@@ -539,8 +545,10 @@ func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessag
 }
 
 // encodeBody renders one request body: the struct-encoded fields first, in
-// declaration order, then the merged fragments.
-func encodeBody(wire oaRequest, fields map[string]json.RawMessage) ([]byte, error) {
+// declaration order, then the merged fragments. wire is any request struct
+// (oaRequest, anRequest) - both wire families need the same two-stage encoding,
+// because the KEY of a merged fragment is data rather than a Go field.
+func encodeBody(wire any, fields map[string]json.RawMessage) ([]byte, error) {
 	body, err := json.Marshal(wire)
 	if err != nil {
 		return nil, fmt.Errorf("encoding request: %w", err)

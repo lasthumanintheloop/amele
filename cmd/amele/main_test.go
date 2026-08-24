@@ -567,11 +567,44 @@ func TestE2ESchemaDowngradeWarningOpenAIFallback(t *testing.T) {
 	}
 }
 
-// TestE2ESchemaDowngradeWarningAnthropic: the native Anthropic path never
-// sends the schema to the provider, so a schema-carrying run must always
-// print the downgrade warning.
-func TestE2ESchemaDowngradeWarningAnthropic(t *testing.T) {
+// TestE2ENoSchemaDowngradeWarningAnthropicNative: the Messages API enforces
+// json_schema natively (output_config.format), so a schema-carrying run that
+// the provider accepts must NOT print the downgrade warning. This inverts the
+// former TestE2ESchemaDowngradeWarningAnthropic, which pinned the behavior of
+// the client back when it sent no schema at all.
+func TestE2ENoSchemaDowngradeWarningAnthropicNative(t *testing.T) {
 	srv, _ := anthropicServer(t, anthropicTextBody(`{"score": 7}`))
+	cfgPath, _ := writeAnthropicConfig(t, srv.URL, schemaBlock)
+
+	code, stdout, stderr := execCLI(t, []string{"run", cfgPath, "score it"}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "{\"score\": 7}\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if strings.Contains(stderr, downgradeWarning) {
+		t.Errorf("natively enforced schema must not warn, stderr: %q", stderr)
+	}
+}
+
+// TestE2ESchemaDowngradeWarningAnthropicFallback: an endpoint that rejects
+// output_config (an Anthropic-compatible gateway that never implemented it)
+// makes the client repeat the call without the field. The run still succeeds
+// via validate+retry - but the operator must be told, once, on stderr, that
+// native enforcement was unavailable.
+func TestE2ESchemaDowngradeWarningAnthropicFallback(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"type":"error","error":{"message":"output_config: Extra inputs are not permitted"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(anthropicTextBody(`{"score": 7}`)))
+	}))
+	t.Cleanup(srv.Close)
 	cfgPath, _ := writeAnthropicConfig(t, srv.URL, schemaBlock)
 
 	code, stdout, stderr := execCLI(t, []string{"run", cfgPath, "score it"}, "")

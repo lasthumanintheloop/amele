@@ -225,13 +225,13 @@ type Response struct {
 	UsageMissing bool
 	// SchemaEnforcementDropped is true when this response was produced
 	// WITHOUT provider-native schema enforcement even though the request
-	// carried a ResponseFormat: the OpenAI client sets it on every response
-	// produced after its response_format fallback fired (the fallback
-	// response and any later retry in the same Chat call), and the Anthropic
-	// client sets it on every response to a schema-carrying request (that
-	// API has no native enforcement). Callers surface it as a warning - the
-	// validate+retry layer above is then the only thing enforcing
-	// output.schema. Always false when the request asked for no schema.
+	// carried a ResponseFormat: each client sets it on every response
+	// produced after its capability fallback fired (the fallback response and
+	// any later retry in the same Chat call) - response_format on the OpenAI
+	// wire, output_config on the Anthropic one. Callers surface it as a
+	// warning - the validate+retry layer above is then the only thing
+	// enforcing output.schema. Always false when the request asked for no
+	// schema.
 	SchemaEnforcementDropped bool
 }
 
