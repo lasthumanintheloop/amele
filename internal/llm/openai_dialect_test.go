@@ -185,6 +185,29 @@ func wireCases() []wireCase {
 				Reasoning: &ReasoningSpec{Effort: "high", BudgetTokens: 8192},
 			},
 		},
+		{
+			// deepseek has no json_schema on this wire, so the schema-carrying
+			// request would be a guaranteed 400 followed by a schema-LESS
+			// repeat. It sends the JSON mode the provider does have instead.
+			name:    "deepseek schema becomes json_object",
+			golden:  "deepseek-json-object.json",
+			dialect: DialectDeepSeek,
+			req: Request{
+				Model:          "deepseek-v4-pro",
+				Messages:       baseMessages(),
+				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
+			},
+		},
+		{
+			name:    "glm schema becomes json_object",
+			golden:  "glm-json-object.json",
+			dialect: DialectGLM,
+			req: Request{
+				Model:          "glm-5.3",
+				Messages:       baseMessages(),
+				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
+			},
+		},
 	}
 }
 

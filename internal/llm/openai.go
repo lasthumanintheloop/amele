@@ -137,12 +137,16 @@ type oaRequest struct {
 	TopP        *float64 `json:"top_p,omitempty"`
 }
 
-// oaResponseFormat is the OpenAI json_schema response format. Only the
-// json_schema variant is emitted; the older "json_object" mode is not used
-// because it enforces "some JSON" rather than the caller's schema.
+// oaResponseFormat is the response_format object. Which variant it carries is
+// the dialect's answer (ResponseFormatType): json_schema for the wires that
+// have it, json_object for deepseek and glm, whose only JSON mode this is.
+//
+// JSONSchema is a pointer so the key vanishes entirely on the json_object
+// variant: that mode takes no schema, and a gateway that sees an unexpected
+// key answers with the 400 this whole path exists to avoid.
 type oaResponseFormat struct {
-	Type       string       `json:"type"`
-	JSONSchema oaJSONSchema `json:"json_schema"`
+	Type       string        `json:"type"`
+	JSONSchema *oaJSONSchema `json:"json_schema,omitempty"`
 }
 
 type oaJSONSchema struct {
@@ -296,8 +300,18 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	// (docs/engineering.md §5.1), and the cost - one extra 400 round-trip - is paid
 	// only by the misconfigured combination of a schema and a provider that
 	// cannot honor it.
+	//
+	// dropped remembers that this response was produced WITHOUT provider-native
+	// schema enforcement. On the json_object dialects it is known before the
+	// first request: that mode carries no schema at all, so there is nothing to
+	// probe for and no 400 to spend a round-trip on.
 	var fallbackBody []byte
-	if wire.ResponseFormat != nil {
+	dropped := false
+	switch {
+	case wire.ResponseFormat == nil:
+	case wire.ResponseFormat.JSONSchema == nil:
+		dropped = true
+	default:
 		wire.ResponseFormat = nil
 		fallbackBody, err = encodeBody(wire, fields)
 		if err != nil {
@@ -312,11 +326,11 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 
 	var lastErr error
 	var retryAfter time.Duration
-	// dropped remembers that the fallback fired: every response produced
-	// after that point - the fallback response itself and any later retry in
-	// this Chat call - was generated without native schema enforcement and
-	// must say so (Response.SchemaEnforcementDropped).
-	dropped := false
+	// Beyond the json_object case above, dropped also records that the fallback
+	// fired: every response produced after that point - the fallback response
+	// itself and any later retry in this Chat call - was generated without
+	// native schema enforcement and must say so
+	// (Response.SchemaEnforcementDropped).
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
 			// Exponential backoff from InitialBackoff (1s, 2s, 4s... by
@@ -534,13 +548,15 @@ func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessag
 		out.Tools = append(out.Tools, oaTool{Type: "function", Function: oaFunctionDef(t)})
 	}
 	if rf := req.ResponseFormat; rf != nil {
-		out.ResponseFormat = &oaResponseFormat{
-			Type: "json_schema",
-			JSONSchema: oaJSONSchema{
+		// The dialect decides which JSON mode the endpoint has; the schema
+		// travels only with the variant that can carry one.
+		out.ResponseFormat = &oaResponseFormat{Type: ResponseFormatType(c.Dialect)}
+		if out.ResponseFormat.Type == responseFormatJSONSchema {
+			out.ResponseFormat.JSONSchema = &oaJSONSchema{
 				Name:   rf.Name,
 				Strict: true,
 				Schema: rf.Schema,
-			},
+			}
 		}
 	}
 	if req.MaxOutputTokens > 0 {

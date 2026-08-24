@@ -50,8 +50,10 @@ How it is enforced:
 
 1. Providers with native structured output get `response_format:
    {type: json_schema, ...}`, so the reply is constrained while decoding. A
-   provider that rejects it is detected and the request is retried without it -
-   automatically, no config needed.
+   dialect whose endpoint has no `json_schema` sends the JSON mode it does have
+   (`{type: json_object}`) instead, and a provider that rejects the schema
+   outright is detected and retried without it - automatically, no config
+   needed.
 2. The answer is validated locally either way. A fenced answer
    (```` ```json … ``` ````) or one padded with prose is unwrapped; stdout gets
    the extracted JSON, never the model's framing.

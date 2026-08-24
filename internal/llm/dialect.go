@@ -123,6 +123,43 @@ func CapField(d Dialect) string {
 	}
 }
 
+// The two response_format variants of the OpenAI-compatible wire.
+// json_schema constrains decoding to the caller's schema; json_object only
+// promises "some JSON object" and leaves the schema to the validate+retry
+// layer above.
+const (
+	responseFormatJSONSchema = "json_schema"
+	responseFormatJSONObject = "json_object"
+)
+
+// ResponseFormatType returns the response_format variant to send for this
+// dialect when the config asked for structured output. The zero-value Dialect
+// answers like DialectOpenAI.
+//
+// CONTRACT: json_object is not a downgrade decided at runtime - it is the only
+// JSON mode deepseek and glm HAVE on this wire (research §matrix
+// "response_format"), so sending json_schema there bought a guaranteed 400 and
+// a schema-less repeat on every single Chat call. The caller must therefore
+// treat a json_object response as "native schema enforcement did not happen"
+// (Response.SchemaEnforcementDropped): the schema never reached the provider.
+//
+// Every other dialect keeps json_schema plus the 400-probe fallback, which is
+// the right behavior for the ones whose support is documented (openai,
+// openrouter) and for the ones whose support is ambiguous (kimi, groq -
+// docs/providers.md §"Structured output").
+func ResponseFormatType(d Dialect) string {
+	switch d {
+	case DialectDeepSeek, DialectGLM:
+		return responseFormatJSONObject
+	case DialectOpenAI, DialectGroq, DialectKimi, DialectOpenRouter:
+		return responseFormatJSONSchema
+	default:
+		// Unreachable through ParseDialect; the zero value lands here and must
+		// behave like openai.
+		return responseFormatJSONSchema
+	}
+}
+
 // The two message keys that carry a reasoning payload on the OpenAI wire.
 // They are the response field a client reads AND the request field it writes
 // back, so they double as the json tags on oaMessage - keep the two in step.

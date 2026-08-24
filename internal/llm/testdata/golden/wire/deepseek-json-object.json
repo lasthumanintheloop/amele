@@ -1,0 +1,1 @@
+{"model":"deepseek-v4-pro","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"response_format":{"type":"json_object"}}

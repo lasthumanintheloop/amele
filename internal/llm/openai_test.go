@@ -618,6 +618,57 @@ func TestChatFallbackBodyReusedOnLaterRetries(t *testing.T) {
 	}
 }
 
+// TestChatJSONObjectDialectSkipsTheProbe is the regression for the review
+// finding: deepseek and glm have no json_schema on this wire, so sending one
+// bought a guaranteed 400 plus a schema-less repeat on EVERY Chat call - an
+// extra round-trip per turn, and a fallback body that then carried no JSON
+// instruction at all. These dialects now send the JSON mode they do have in
+// the first request, and report that native SCHEMA enforcement is not in play
+// (the validate+retry layer is the enforcement).
+func TestChatJSONObjectDialectSkipsTheProbe(t *testing.T) {
+	for _, dialect := range []Dialect{DialectDeepSeek, DialectGLM} {
+		t.Run(string(dialect), func(t *testing.T) {
+			var calls int
+			var format any
+			srv := chatServer(t, func(w http.ResponseWriter, req map[string]any) {
+				calls++
+				format = req["response_format"]
+				// A provider that would 400 on json_schema: if the client ever
+				// sends one, this test fails on the call count too.
+				if b, err := json.Marshal(format); err == nil && strings.Contains(string(b), "json_schema") {
+					w.WriteHeader(http.StatusBadRequest)
+					_, _ = w.Write([]byte(`{"error": {"message": "response_format json_schema is not supported"}}`))
+					return
+				}
+				_, _ = w.Write([]byte(okBody(`{"ok":true}`)))
+			})
+
+			client := &OpenAIClient{BaseURL: srv.URL + "/v1", Dialect: dialect}
+			resp, err := client.Chat(context.Background(), Request{
+				Model:          "m",
+				Messages:       []Message{{Role: RoleUser, Content: "x"}},
+				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 1 {
+				t.Errorf("calls: got %d, want 1 (no capability probe on this dialect)", calls)
+			}
+			b, err := json.Marshal(format)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := `{"type":"json_object"}`; string(b) != want {
+				t.Errorf("response_format wire shape:\n got %s\nwant %s", b, want)
+			}
+			if !resp.SchemaEnforcementDropped {
+				t.Error("json_object carries no schema: the response must report enforcement as dropped")
+			}
+		})
+	}
+}
+
 // TestChatSchemaEnforcementNotDropped: a provider that ACCEPTS
 // response_format produced a natively-constrained answer, so the flag stays
 // false - and so does a request that asked for no schema at all (there was

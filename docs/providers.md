@@ -90,8 +90,8 @@ What each dialect makes of the same config, on the OpenAI-compatible wire:
 | dialect | `reasoning.effort` becomes | output cap field | reasoning returned / echoed back | sampling | `output.schema` | unknown request fields |
 | --- | --- | --- | --- | --- | --- | --- |
 | `openai` | `reasoning_effort` (verbatim) | `max_completion_tokens` | nothing returned on this API | passed through | native `response_format: json_schema` | rejected (400) |
-| `deepseek` | `thinking: {"type":"enabled"}` + `reasoning_effort` (medium->high, xhigh->max); `none` -> `thinking: {"type":"disabled"}` | `max_tokens` | `reasoning_content`, echoed back on **every** later request | passed through (ignored while thinking) | fallback: validate + retry | ignored (undocumented, observed) |
-| `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through, `temperature` capped at 1 | fallback: validate + retry | not documented; assume rejected (400) |
+| `deepseek` | `thinking: {"type":"enabled"}` + `reasoning_effort` (medium->high, xhigh->max); `none` -> `thinking: {"type":"disabled"}` | `max_tokens` | `reasoning_content`, echoed back on **every** later request | passed through (ignored while thinking) | `json_object` + validate + retry | ignored (undocumented, observed) |
+| `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through, `temperature` capped at 1 | `json_object` + validate + retry | not documented; assume rejected (400) |
 | `kimi` | `reasoning_effort` (medium->high, xhigh->max), no thinking object | `max_completion_tokens` | `reasoning_content`, echoed back | **config error**: the K-series fixes `temperature`/`top_p` | attempted, then fallback | not documented; assume rejected (400) |
 | `groq` | `reasoning_effort` (verbatim) | `max_completion_tokens` | captured if present, echoed back | passed through | `json_schema` sent, then fallback - native support **unverified** | not documented; assume rejected (400) |
 | `openrouter` | `reasoning: {"effort": ...}` (verbatim; `budget_tokens` -> `reasoning: {"max_tokens": N}`) | `max_tokens` | `reasoning_details` array, echoed back verbatim and in order | passed through (the gateway drops what the model cannot take) | native `json_schema` - but see [OpenRouter](#openrouter) | passed through to the upstream provider |
@@ -321,31 +321,40 @@ provider; what differs is who enforces it.
 - **Natively** on `openai`, `openrouter` and the anthropic wire: the schema
   travels in the request (`response_format: json_schema`, or
   `output_config.format` on the Messages API).
-- **By fallback** on `deepseek` and `glm`, which have no `json_schema` on this
-  wire, and on `kimi`, whose support is ambiguous (below). When the endpoint
-  answers a schema-carrying request with a 400 naming the field, amele repeats
-  that one request without it - once, immediately, costing no retry budget - and
-  enforces the schema itself: the answer is validated locally and violations
-  are fed back to the model for up to `output.max_schema_retries` repair
-  rounds.
+- **By `json_object` + local enforcement** on `deepseek` and `glm`. Neither has
+  `json_schema` on this wire, so amele sends the JSON mode they do have -
+  `response_format: {"type":"json_object"}` - in the first request and enforces
+  the schema itself. No capability probe is involved: sending a `json_schema`
+  those endpoints cannot accept would buy a guaranteed 400 and a second
+  round-trip on **every turn**, and the repeat would then carry no JSON
+  instruction at all.
+- **By fallback** on `kimi`, whose support is ambiguous (below). When the
+  endpoint answers a schema-carrying request with a 400 naming the field, amele
+  repeats that one request without it - once, immediately, costing no retry
+  budget - and enforces the schema itself.
 
-The fallback is not silent. The run prints a warning on stderr - `provider did
-not enforce output.schema natively; the validate+retry layer was the only
-enforcement` - and the exit-code contract is unchanged either way:
-stdout is a schema-valid JSON document, or the run fails with exit 6.
+"Enforces the schema itself" means the same thing in both cases: the answer is
+validated against `output.schema` and violations are fed back to the model for
+up to `output.max_schema_retries` repair rounds.
 
-Two dialects are in neither list, because their support is **unverified** here -
-no test in this repository pins it and the 2026-08-24 documentation sweep did
-not establish it:
+Local enforcement is never silent. Whenever the schema did not travel with the
+request - a `json_object` dialect, or a fallback that fired - the run prints a
+warning on stderr (`provider did not enforce output.schema natively; the
+validate+retry layer was the only enforcement`). The exit-code contract is
+unchanged either way: stdout is a schema-valid JSON document, or the run fails
+with exit 6.
+
+For two dialects the endpoint's own support is **unverified** here - no test in
+this repository pins it and the 2026-08-24 documentation sweep did not
+establish it:
 
 - **`kimi`.** Its API reference lists `json_schema` while its guide documents
   `json_object`, and the interaction with thinking is undocumented.
 - **`groq`.** Groq's structured-output support is not verified here and varies
   per hosted model, the same way its `reasoning_effort` vocabulary does.
 
-For both, amele does what it does on every OpenAI-compatible dialect: it sends
-the schema and takes the fallback if the endpoint refuses it - the right
-behavior whichever way that documentation settles. The case worth knowing about
+For both, amele sends the schema and takes the fallback if the endpoint refuses
+it - the right behavior whichever way that documentation settles. The case worth knowing about
 is the third one: an endpoint that **accepts the field and ignores it** answers
 with no 400, so there is nothing to warn about and the local validate+retry
 layer is the only enforcement (the same silent degradation described under
