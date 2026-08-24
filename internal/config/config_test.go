@@ -919,6 +919,37 @@ func TestValidateErrors(t *testing.T) {
 			"/v1/messages",
 		},
 		{
+			// Same class of mistake on the gemini wire, and the same silent
+			// 404: the client appends /v1beta/models/{model}:generateContent
+			// itself, so a base_url that already carries the version segment
+			// would send it twice. The proxy answers 404 at run time, which
+			// reads as a broken endpoint rather than as the config error it is.
+			"gemini base_url ending in /v1beta",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = "https://gw.example.com/v1beta"
+			},
+			"the client appends",
+		},
+		{
+			"gemini base_url ending in /v1beta/ (trailing slash)",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = "https://gw.example.com/v1beta/"
+			},
+			"the client appends",
+		},
+		{
+			// The OpenAI-compat habit reaches this wire too: /v1 is what an
+			// operator moving a config from a gateway leaves behind.
+			"gemini base_url ending in /v1",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = "https://gw.example.com/v1"
+			},
+			"the client appends",
+		},
+		{
 			// CONTRACT: a config that passes validate must not fail
 			// configuration at run time. A non-http(s) scheme reaches the HTTP
 			// client and surfaces as a provider error (exit 5) instead of the

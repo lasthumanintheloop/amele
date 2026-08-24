@@ -253,30 +253,6 @@ var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
 //     removes that stopping condition and every run ends at max_turns (exit 3).
 var reservedWireFields = []string{"stream", "tool_choice"}
 
-// geminiOwnedWireFields are the generateContent body-root keys the gemini
-// client writes itself, so provider.params must not carry them. Both spellings
-// are listed on purpose: the wire is camelCase but protobuf-JSON accepts the
-// snake_case form too, and a params key that reaches the body under EITHER
-// spelling would clobber a field amele owns.
-//
-// The model is not here because it is not a body field on this wire at all: it
-// lives in the request path.
-//
-// This list is a temporary home; Task 2 moves it beside the gemini wire structs
-// as llm.GeminiOwnedWireFields, where the same file that writes the fields owns
-// the list - the discipline llm.OwnedWireFields and llm.AnthropicOwnedWireFields
-// already follow. It lives here for now so the params escape hatch is
-// fail-closed on the gemini wire from the moment the type is accepted.
-var geminiOwnedWireFields = []string{
-	"contents",
-	"system_instruction", "systemInstruction",
-	"tools",
-	"tool_config", "toolConfig",
-	"generation_config", "generationConfig",
-	"safety_settings", "safetySettings",
-	"cached_content", "cachedContent",
-}
-
 // SubprocessTool declares an external executable the model may invoke as a
 // tool. The command is a fixed argv vector: there is no shell involved, so
 // the model can never inject into a shell string.
@@ -1038,12 +1014,8 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 		}
 	} else if problem := baseURLProblem(c.Provider.BaseURL); problem != "" {
 		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
-	} else if anthropic && strings.HasSuffix(strings.TrimRight(c.Provider.BaseURL, "/"), "/v1") {
-		// The OpenAI-compat convention puts /v1 in base_url, so users moving a
-		// config to type anthropic reflexively keep it - and the native client
-		// appends /v1/messages itself, turning that habit into a silent
-		// /v1/v1/messages 404 at runtime. Caught here instead.
-		add("provider.base_url %q must not end with /v1 when provider.type is anthropic: the client appends /v1/messages itself", c.Provider.BaseURL)
+	} else if problem := versionedBaseURLProblem(c.Provider.Type, c.Provider.BaseURL); problem != "" {
+		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
 	}
 
 	if c.Provider.RequestTimeout < 0 {
@@ -1144,7 +1116,7 @@ func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
 		// Same reasoning, and here the dialect is not even legal: an illegal
 		// one is reported on its own line and must not also cost the operator
 		// the params answer, which this wire can give without it.
-		return slices.Concat(geminiOwnedWireFields, reservedWireFields)
+		return slices.Concat(llm.GeminiOwnedWireFields(), reservedWireFields)
 	}
 	if !known {
 		// Cloned, like the Concat branches allocate: handing out the package
@@ -1347,6 +1319,34 @@ func baseURLProblem(raw string) string {
 	}
 	if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return "must not contain a query string or fragment: the client appends request paths to it"
+	}
+	return ""
+}
+
+// versionedBaseURLProblem reports the "the API version is still in base_url"
+// mistake, phrased to follow the quoted value in an error message, or "" when
+// there is none.
+//
+// It applies to the two NATIVE wires only. Both append their own versioned
+// request path, while the OpenAI-compatible convention puts the version IN
+// base_url - so an operator moving a config from a gateway reflexively keeps a
+// suffix that then travels twice. The result is a 404 on the first real request
+// of an unattended run, which reads as a broken endpoint rather than as the
+// config error it is, so it is caught here instead.
+func versionedBaseURLProblem(providerType, baseURL string) string {
+	trimmed := strings.TrimRight(baseURL, "/")
+	switch providerType {
+	case ProviderTypeAnthropic:
+		if strings.HasSuffix(trimmed, "/v1") {
+			// Wording frozen: this line is pinned by tests.
+			return "must not end with /v1 when provider.type is anthropic: the client appends /v1/messages itself"
+		}
+	case ProviderTypeGemini:
+		// /v1 is refused beside /v1beta because it is the habit the operator
+		// brings, not because this client would ever append it.
+		if strings.HasSuffix(trimmed, "/v1beta") || strings.HasSuffix(trimmed, "/v1") {
+			return "must not end with /v1beta or /v1 when provider.type is gemini: the client appends /v1beta/models/{model}:generateContent itself"
+		}
 	}
 	return ""
 }
