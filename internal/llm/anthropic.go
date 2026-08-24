@@ -500,8 +500,12 @@ var anthropicErrorSignatures = []errorSignature{
 		// and the "not supported" family the compatible gateways use - and the
 		// field name alone is not enough: a 400 may mention temperature while
 		// complaining about something else entirely.
+		//
+		// top_p is matched on the same terms. The Messages API applies the
+		// thinking restriction to both knobs and words it identically, and a
+		// config that sets top_p alone matched nothing here until 2026-08-24.
 		match: func(e *statusError) bool {
-			if !strings.Contains(e.snippet, "temperature") {
+			if !strings.Contains(e.snippet, "temperature") && !strings.Contains(e.snippet, "top_p") {
 				return false
 			}
 			return strings.Contains(e.snippet, "not supported") ||

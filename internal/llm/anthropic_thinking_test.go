@@ -619,6 +619,11 @@ const (
 	bodyAnthropicTemperatureWithThinking = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"`temperature`" + ` may only be set to 1 when thinking is enabled."}}`
 	bodyAnthropicTemperatureNotSupported = `{"type":"error","error":{"type":"invalid_request_error","message":"temperature is not supported with this model."}}`
+	// The same two phrasings for top_p. A config may set top_p alone, and
+	// before 2026-08-24 that 400 matched nothing at all.
+	bodyAnthropicTopPWithThinking = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"`top_p`" + ` may only be set to 1 when thinking is enabled."}}`
+	bodyAnthropicTopPNotSupported = `{"type":"error","error":{"type":"invalid_request_error","message":"top_p is not supported with this model."}}`
 )
 
 // TestAnthropic400AdviceForSampling: the recognized sampling 400 gains the hint
@@ -632,6 +637,8 @@ func TestAnthropic400AdviceForSampling(t *testing.T) {
 	}{
 		{"thinking forbids sampling", bodyAnthropicTemperatureWithThinking, adviceNoSampling},
 		{"model rejects sampling", bodyAnthropicTemperatureNotSupported, adviceNoSampling},
+		{"thinking forbids top_p", bodyAnthropicTopPWithThinking, adviceNoSampling},
+		{"model rejects top_p", bodyAnthropicTopPNotSupported, adviceNoSampling},
 		{"unrelated 400 keeps its message", `{"error":{"message":"bad model"}}`, ""},
 	}
 	for _, tt := range tests {

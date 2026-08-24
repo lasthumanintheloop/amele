@@ -524,7 +524,12 @@ var errorSignatures = []errorSignature{
 		match: func(e *statusError) bool {
 			return strings.Contains(e.snippet, "max_tokens") && strings.Contains(e.snippet, "max_completion_tokens")
 		},
-		advice: "this model requires max_completion_tokens; set provider.dialect to a dialect that maps it (openai/groq/kimi)",
+		// Both doors are named. The dialect is the usual cause, but the same 400
+		// is reachable when the operator wrote a cap key into provider.params
+		// themselves - legal on a dialect that does not write that key, so
+		// validate cannot refuse it - and "change the dialect" would then be
+		// the wrong door, on a config where changing it fixes nothing.
+		advice: "this model requires max_completion_tokens; set provider.dialect to a dialect that maps it (openai/groq/kimi), or remove that key from provider.params",
 	},
 	{
 		// Reasoning models on OpenAI accept only the default temperature, and
@@ -533,12 +538,30 @@ var errorSignatures = []errorSignature{
 		// "Unsupported value: 'temperature' does not support ..." and the
 		// "'temperature' is not supported ..." form. The quotes are part of the
 		// match so the word "temperature" in prose cannot trigger it.
-		match: func(e *statusError) bool {
-			return strings.Contains(e.snippet, "'temperature' does not support") ||
-				strings.Contains(e.snippet, "'temperature' is not supported")
-		},
+		//
+		// Both knobs are matched, in both spellings: the providers that fix one
+		// fix the other, and a config may set top_p alone - which named nothing
+		// in this table until 2026-08-24, so the operator got the raw 400 for
+		// exactly the mistake the table exists to explain.
+		match:  func(e *statusError) bool { return matchesFixedSampling(e.snippet) },
 		advice: "this model rejects non-default sampling; remove provider.temperature/top_p",
 	},
+}
+
+// matchesFixedSampling reports whether body is a "this model does not let you
+// set that sampling knob" 400, for either knob.
+//
+// The field name is quoted in the match so the word "temperature" appearing in
+// unrelated prose cannot trigger the hint - the same reason the table's other
+// entries key on distinctive fragments rather than on a bare field name.
+func matchesFixedSampling(body string) bool {
+	for _, field := range []string{"'temperature'", "'top_p'"} {
+		if strings.Contains(body, field+" does not support") ||
+			strings.Contains(body, field+" is not supported") {
+			return true
+		}
+	}
+	return false
 }
 
 // adviceFor returns the actionable hint for a recognized provider failure, or

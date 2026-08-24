@@ -21,6 +21,13 @@ const (
 
 	bodyTemperatureNotSupported = `{"error":{"message":"Invalid request: 'temperature' is not supported with this model. The K-series uses a fixed temperature of 1.0.","type":"invalid_request_error","param":"temperature"}}`
 
+	// top_p is rejected by exactly the same models, in exactly the same two
+	// phrasings, and a config that sets top_p without temperature hit neither
+	// matcher before 2026-08-24.
+	bodyTopPUnsupportedValue = `{"error":{"message":"Unsupported value: 'top_p' does not support 0.9 with this model. Only the default (1) value is supported.","type":"invalid_request_error","param":"top_p","code":"unsupported_value"}}`
+
+	bodyTopPNotSupported = `{"error":{"message":"Invalid request: 'top_p' is not supported with this model. The K-series uses a fixed top_p of 1.0.","type":"invalid_request_error","param":"top_p"}}`
+
 	bodyWrongOutputCapField = `{"error":{"message":"Unsupported parameter: 'max_tokens' is not supported with this model. Use 'max_completion_tokens' instead.","type":"invalid_request_error","param":"max_tokens","code":"unsupported_parameter"}}`
 
 	bodyUnrelated400 = `{"error": {"message": "bad model"}}`
@@ -31,7 +38,11 @@ const (
 const (
 	adviceReasoningEffortNone = "set provider.reasoning.effort: none for this model on chat/completions, or use a different model"
 	adviceNoSampling          = "this model rejects non-default sampling; remove provider.temperature/top_p"
-	adviceCapField            = "this model requires max_completion_tokens; set provider.dialect to a dialect that maps it (openai/groq/kimi)"
+	// The cap advice names both doors, because the same 400 is reachable two
+	// ways: the dialect mapped the wrong cap field, or the operator wrote a cap
+	// key into provider.params themselves (legal on a dialect that does not
+	// write it, so validate cannot refuse it).
+	adviceCapField = "this model requires max_completion_tokens; set provider.dialect to a dialect that maps it (openai/groq/kimi), or remove that key from provider.params"
 )
 
 func TestChat400AdviceForKnownSignatures(t *testing.T) {
@@ -43,6 +54,10 @@ func TestChat400AdviceForKnownSignatures(t *testing.T) {
 		{"gpt-5.6 function tools with reasoning_effort", body56ToolsReasoning, adviceReasoningEffortNone},
 		{"sampling rejected (unsupported value)", bodyTemperatureUnsupportedValue, adviceNoSampling},
 		{"sampling rejected (not supported)", bodyTemperatureNotSupported, adviceNoSampling},
+		// top_p carries the same advice as temperature: the models that fix one
+		// fix the other, and the advice already names both keys.
+		{"top_p rejected (unsupported value)", bodyTopPUnsupportedValue, adviceNoSampling},
+		{"top_p rejected (not supported)", bodyTopPNotSupported, adviceNoSampling},
 		{"wrong output cap field", bodyWrongOutputCapField, adviceCapField},
 	}
 
