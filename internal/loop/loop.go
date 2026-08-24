@@ -2,8 +2,11 @@
 // provider, dispatch requested tools, feed results back, and stop when the
 // model produces a final answer - or when a budget kill switch fires.
 //
-// The loop is strictly sequential and side-effect ordered, which is what
-// makes the append-only session log a faithful replay source (docs/contracts/jsonl-events.md).
+// Turns are strictly sequential. Within ONE turn the tool calls a model asked
+// for may run concurrently (ParallelTools), but every observable effect - the
+// session events, the message history, the progress feed - is still produced in
+// the model's original call order, which is what keeps the append-only session
+// log a faithful replay source (docs/contracts/jsonl-events.md).
 package loop
 
 import (
@@ -12,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/llm"
@@ -139,7 +143,27 @@ type Loop struct {
 	Limits  Limits
 	// Approve may be nil, meaning allow-all.
 	Approve Approver
+	// AutoApprove reports whether a call's permission policy resolves to a
+	// plain "allow" - a ruling that needs no human and produces no side effect
+	// of its own. It exists ONLY as the gate on concurrent dispatch: a call
+	// that might stop to ask somebody must never run beside another call.
+	//
+	// SECURITY: nil means "the caller did not say", and an unknown policy is
+	// never assumed safe - with an Approve hook installed and no predicate the
+	// loop stays sequential. It is ignored entirely when Approve is nil, which
+	// is already allow-all.
+	AutoApprove func(call llm.ToolCall) bool
+	// ParallelTools enables concurrent dispatch of the tool calls within one
+	// turn. It is only ever an upper bound: see parallelizable for the three
+	// conditions that must all hold before a turn actually runs concurrently.
+	// The zero value (false) keeps the pre-v0.2 strictly sequential loop.
+	ParallelTools bool
 	// Clock may be nil, meaning time.Now.
+	//
+	// CONCURRENCY: with ParallelTools enabled AND a Progress hook installed,
+	// the clock is read from the per-call goroutines (it times each tool
+	// invocation), so an injected Clock must be safe for concurrent use.
+	// time.Now is; a test clock counting its reads needs a mutex.
 	Clock Clock
 
 	// FinalValidator may be nil, meaning every clean final answer is
@@ -179,6 +203,10 @@ type Loop struct {
 	// goroutine running RunMessages, in event order, and never concurrently
 	// with itself - so an implementation needs no locking of its own. It does
 	// need to be quick: the loop is blocked for the duration of the call.
+	// This holds for concurrent tool dispatch too: the per-call goroutines
+	// never touch the hook, so a parallel turn reports its calls in the
+	// model's order - all "model requested" lines first, then all results,
+	// once the slowest call has returned.
 	//
 	// SECURITY: event text embeds model-controlled strings (tool names, tool
 	// arguments, tool error text). The loop clips them so one event cannot
@@ -378,20 +406,23 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 			return finish(nil)
 		}
 
-		for _, call := range resp.Message.ToolCalls {
-			output, err := l.dispatch(ctx, l.TurnBase+turn, call)
-			if err != nil {
-				// Approval denial aborts the run (conservative Phase 1
-				// stance); everything else has already been converted to
-				// model-visible text by dispatch.
-				return finish(err)
-			}
+		// Outputs come back positionally: whether the calls ran one after the
+		// other or side by side, outputs[i] answers ToolCalls[i], and a run
+		// that aborted mid-turn returns the outputs it managed to produce.
+		outputs, err := l.dispatchCalls(ctx, l.TurnBase+turn, resp.Message.ToolCalls)
+		for i, output := range outputs {
 			res.ToolCalls++
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				Content:    output,
-				ToolCallID: call.ID,
+				ToolCallID: resp.Message.ToolCalls[i].ID,
 			})
+		}
+		if err != nil {
+			// Approval denial aborts the run (conservative Phase 1
+			// stance); everything else has already been converted to
+			// model-visible text by dispatch.
+			return finish(err)
 		}
 	}
 }
@@ -483,63 +514,263 @@ func wrapContextErr(err error) error {
 	return fmt.Errorf("run interrupted: %w", err)
 }
 
-// dispatch runs a single tool call. Tool-level failures (unknown tool, bad
-// arguments, tool errors) come back as result text so the model can adapt;
-// only a permission denial escalates to a run-level error.
+// callResult is one dispatched call's outcome, held until the dispatcher is
+// ready to publish it.
+//
+// It exists so that RUNNING a call and REPORTING it are two separate steps:
+// concurrent calls finish in whatever order their tools happen to return, but
+// the session events, the progress feed and the message history must still be
+// produced in the model's original call order (docs/contracts/jsonl-events.md).
+// The sequential path builds and publishes one of these immediately, so both
+// paths emit byte-identical output for a single call.
+type callResult struct {
+	// output is the text handed back to the model. Empty when fail is set:
+	// a call that aborts the run never reaches the history.
+	output string
+	// logged is the tool_result event's text, which differs from output on the
+	// abort paths (the model never sees them, an operator must).
+	logged string
+	// isErr fills the frozen is_error field: a harness dispatch failure.
+	isErr    bool
+	outcome  session.ToolOutcome
+	exitCode *int
+	// progress is the preformatted progress line, or "" when no hook is
+	// installed (an unobserved run must not pay for the formatting).
+	progress string
+	// fail, when non-nil, aborts the whole run.
+	fail error
+}
+
+// dispatchCalls runs one turn's tool calls and returns their outputs
+// positionally: outputs[i] answers calls[i]. A non-nil error aborts the run,
+// and the outputs returned alongside it are the ones that must still be
+// counted and appended (the sequential loop's behavior, preserved).
 //
 // turn is the session-numbered turn (TurnBase already applied) and is used for
 // progress events only - the loop's own budget counts elsewhere.
-func (l *Loop) dispatch(ctx context.Context, turn int, call llm.ToolCall) (string, error) {
-	l.Session.ToolCall(call.ID, call.Name, call.Arguments)
-	name := clipRunes(call.Name, maxProgressName)
-	l.progressf("turn %d: model requested %s %s", turn, name, clipRunes(call.Arguments, maxProgressArgs))
-
-	if l.Approve != nil {
-		ruling, err := l.Approve(ctx, call)
-		if err != nil {
-			// CONTRACT: a policy that could not answer is a harness dispatch
-			// failure (`error`), not a denial - nothing ruled on this call.
-			l.logToolResult(call, "approval check failed: "+err.Error(), true, session.OutcomeError, nil)
-			l.progressf("turn %d: %s error: approval check failed: %s", turn, name, clipRunes(err.Error(), maxProgressArgs))
-			return "", fmt.Errorf("approval check for tool %q: %w", call.Name, err)
+func (l *Loop) dispatchCalls(ctx context.Context, turn int, calls []llm.ToolCall) ([]string, error) {
+	if l.parallelizable(calls) {
+		return l.dispatchParallel(ctx, turn, calls)
+	}
+	outputs := make([]string, 0, len(calls))
+	for _, call := range calls {
+		l.announce(turn, call)
+		r := l.approveCall(ctx, turn, call)
+		if r == nil {
+			ran := l.runCall(ctx, turn, call)
+			r = &ran
 		}
-		// CONTRACT: the denial reason is recorded so the session file answers
-		// "why did the agent stop using that tool?" without the operator having
-		// to re-derive the profile and the TTY state of a run that is over
-		// (live-test finding C-3).
-		outcome := denialOutcome(ruling.Reason)
-		switch ruling.Decision {
-		case DenyAbort:
-			l.logToolResult(call, "permission denied", true, outcome, nil)
-			l.progressf("turn %d: %s error: permission denied", turn, name)
-			return "", fmt.Errorf("%w: tool %q", ErrPermissionDenied, call.Name)
-		case DenyContinue:
-			msg := fmt.Sprintf("permission denied: tool %q was not approved for this call", call.Name)
-			l.logToolResult(call, msg, true, outcome, nil)
-			l.progressf("turn %d: %s error: permission denied", turn, name)
-			return msg, nil
-		case Allow:
-			// fall through to the invocation below
-		default:
-			// SECURITY: an out-of-range Decision is a policy bug, and a
-			// broken policy must never fail open - abort instead of running
-			// the tool.
-			l.logToolResult(call, "approval policy returned an invalid decision", true, session.OutcomeError, nil)
-			l.progressf("turn %d: %s error: approval policy returned an invalid decision", turn, name)
-			return "", fmt.Errorf("approval check for tool %q returned invalid decision %d", call.Name, ruling.Decision)
+		output, err := l.publish(call, *r)
+		if err != nil {
+			return outputs, err
+		}
+		outputs = append(outputs, output)
+	}
+	return outputs, nil
+}
+
+// parallelizable reports whether this turn's calls may run concurrently. All
+// three conditions must hold, and each is a separate promise:
+//
+//   - more than one call: one call has nothing to overlap with, and taking the
+//     sequential path keeps the common case byte-identical to pre-v0.2;
+//   - ParallelTools: the operator did not opt out (tools.parallel: false);
+//   - every call auto-approved: see autoApproved.
+func (l *Loop) parallelizable(calls []llm.ToolCall) bool {
+	if len(calls) < 2 || !l.ParallelTools {
+		return false
+	}
+	for _, call := range calls {
+		if !l.autoApproved(call) {
+			return false
 		}
 	}
+	return true
+}
+
+// autoApproved reports whether call's policy is known to resolve without
+// asking anybody.
+//
+// SECURITY: this is the gate that keeps an "ask" policy off the concurrent
+// path. Two calls prompting at once would interleave two questions on one
+// terminal, and a human answering "y" could not tell which call they just
+// granted. Anything short of a positive "this is a plain allow" - an unlisted
+// predicate, a policy the caller did not describe - falls back to sequential.
+func (l *Loop) autoApproved(call llm.ToolCall) bool {
+	if l.Approve == nil {
+		// No approver at all is the documented allow-all default: nothing can
+		// stop for a human because nothing is asked.
+		return true
+	}
+	if l.AutoApprove == nil {
+		return false
+	}
+	return l.AutoApprove(call)
+}
+
+// dispatchParallel runs the calls of one turn concurrently and publishes their
+// results in the model's original call order.
+//
+// CONTRACT: one goroutine per call, with no worker pool. Providers cap the
+// tool calls in a single assistant turn at single digits (OpenAI, Anthropic
+// and the gateways all do), so the fan-out is bounded by the wire format, and
+// a pool would add a queue - plus a scheduling order - to a list that is
+// already short.
+func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolCall) ([]string, error) {
+	// Announced up front, in call order: the tool_call events say what the
+	// MODEL asked for, and that fact is known before any tool runs.
+	for _, call := range calls {
+		l.announce(turn, call)
+	}
+
+	// The permission checks stay sequential and in call order even here: an
+	// Approver is caller code with no concurrency contract, and every call on
+	// this path is auto-approved anyway, so the checks are cheap.
+	//
+	// A check that refuses is therefore only reachable when AutoApprove and the
+	// Approver disagree (a caller bug). It is still honored to the letter - the
+	// RULING decides, never the predicate - and the call simply does not run.
+	results := make([]callResult, len(calls))
+	refused := make([]bool, len(calls))
+	for i, call := range calls {
+		if r := l.approveCall(ctx, turn, call); r != nil {
+			results[i], refused[i] = *r, true
+		}
+	}
+
+	// OWNERSHIP: every goroutine started here is owned by this call. It writes
+	// to exactly one slot of `results` (no two goroutines share an index, so
+	// the slice needs no lock), touches no other loop state, and is joined by
+	// the Wait below before this function returns - including when ctx is
+	// already done, because the tools honor ctx themselves and returning early
+	// would leave them writing into a turn nobody is reading.
+	var wg sync.WaitGroup
+	for i, call := range calls {
+		if refused[i] {
+			continue // the policy already answered for this call
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[i] = l.runCall(ctx, turn, call)
+		}()
+	}
+	wg.Wait()
+
+	outputs := make([]string, 0, len(calls))
+	var failure error
+	for i, call := range calls {
+		output, err := l.publish(call, results[i])
+		if err != nil {
+			// The first failure in CALL order is the run's failure - not the
+			// first in completion order, which would make the exit code depend
+			// on tool latency. The remaining results are still logged: those
+			// tools ran, and a tool_call without its tool_result would be a
+			// hole in the audit trail.
+			if failure == nil {
+				failure = err
+			}
+			continue
+		}
+		if failure == nil {
+			// After a failure the run is over, so later outputs are not
+			// appended to the history - the sequential path would never have
+			// produced them either.
+			outputs = append(outputs, output)
+		}
+	}
+	return outputs, failure
+}
+
+// announce logs the tool_call event and the "model requested" progress line.
+// CONTRACT: it runs before the permission check, so denied and unknown-tool
+// calls appear in the log too (docs/contracts/jsonl-events.md).
+func (l *Loop) announce(turn int, call llm.ToolCall) {
+	l.Session.ToolCall(call.ID, call.Name, call.Arguments)
+	l.progressf("turn %d: model requested %s %s", turn,
+		clipRunes(call.Name, maxProgressName), clipRunes(call.Arguments, maxProgressArgs))
+}
+
+// approveCall consults the Approver. It returns nil when the call may run, and
+// the result to publish when it may not.
+func (l *Loop) approveCall(ctx context.Context, turn int, call llm.ToolCall) *callResult {
+	if l.Approve == nil {
+		return nil
+	}
+	name := clipRunes(call.Name, maxProgressName)
+	ruling, err := l.Approve(ctx, call)
+	if err != nil {
+		// CONTRACT: a policy that could not answer is a harness dispatch
+		// failure (`error`), not a denial - nothing ruled on this call.
+		return &callResult{
+			logged:   "approval check failed: " + err.Error(),
+			isErr:    true,
+			outcome:  session.OutcomeError,
+			progress: l.eventf("turn %d: %s error: approval check failed: %s", turn, name, clipRunes(err.Error(), maxProgressArgs)),
+			fail:     fmt.Errorf("approval check for tool %q: %w", call.Name, err),
+		}
+	}
+	// CONTRACT: the denial reason is recorded so the session file answers
+	// "why did the agent stop using that tool?" without the operator having
+	// to re-derive the profile and the TTY state of a run that is over
+	// (live-test finding C-3).
+	outcome := denialOutcome(ruling.Reason)
+	switch ruling.Decision {
+	case DenyAbort:
+		return &callResult{
+			logged:   "permission denied",
+			isErr:    true,
+			outcome:  outcome,
+			progress: l.eventf("turn %d: %s error: permission denied", turn, name),
+			fail:     fmt.Errorf("%w: tool %q", ErrPermissionDenied, call.Name),
+		}
+	case DenyContinue:
+		msg := fmt.Sprintf("permission denied: tool %q was not approved for this call", call.Name)
+		return &callResult{
+			output:   msg,
+			logged:   msg,
+			isErr:    true,
+			outcome:  outcome,
+			progress: l.eventf("turn %d: %s error: permission denied", turn, name),
+		}
+	case Allow:
+		return nil
+	default:
+		// SECURITY: an out-of-range Decision is a policy bug, and a
+		// broken policy must never fail open - abort instead of running
+		// the tool.
+		return &callResult{
+			logged:   "approval policy returned an invalid decision",
+			isErr:    true,
+			outcome:  session.OutcomeError,
+			progress: l.eventf("turn %d: %s error: approval policy returned an invalid decision", turn, name),
+			fail:     fmt.Errorf("approval check for tool %q returned invalid decision %d", call.Name, ruling.Decision),
+		}
+	}
+}
+
+// runCall looks the tool up and invokes it. Tool-level failures (unknown tool,
+// bad arguments, tool errors) come back as result text so the model can adapt;
+// nothing here can abort the run.
+//
+// CONCURRENCY: this is the only part of a dispatch that runs on a per-call
+// goroutine. It writes no loop state - the caller stores the returned value -
+// and it reads the injected Clock, which is why a parallel run needs a
+// concurrency-safe one (see Loop.Clock).
+func (l *Loop) runCall(ctx context.Context, turn int, call llm.ToolCall) callResult {
+	name := clipRunes(call.Name, maxProgressName)
 
 	tool, ok := l.Registry.Get(call.Name)
 	if !ok {
 		// The model hallucinated a tool. Tell it what actually exists so
 		// the next turn can recover instead of failing the whole run.
 		msg := fmt.Sprintf("error: unknown tool %q; available tools: %v", call.Name, l.Registry.Names())
-		l.logToolResult(call, msg, true, session.OutcomeError, nil)
 		// The registry listing is deliberately left out of the event: it is
 		// for the model, and it would push the operator's line off the screen.
-		l.progressf("turn %d: %s error: unknown tool", turn, name)
-		return msg, nil
+		return callResult{
+			output: msg, logged: msg, isErr: true, outcome: session.OutcomeError,
+			progress: l.eventf("turn %d: %s error: unknown tool", turn, name),
+		}
 	}
 
 	// Timed around the invocation alone: an "ask" policy may have kept the
@@ -557,9 +788,10 @@ func (l *Loop) dispatch(ctx context.Context, turn int, call llm.ToolCall) (strin
 	output, outcome, err := invokeTool(ctx, tool, call.Arguments)
 	if err != nil {
 		msg := fmt.Sprintf("error: %v", err)
-		l.logToolResult(call, msg, true, session.OutcomeError, nil)
-		l.progressf("turn %d: %s error: %s", turn, name, clipRunes(err.Error(), maxProgressArgs))
-		return msg, nil
+		return callResult{
+			output: msg, logged: msg, isErr: true, outcome: session.OutcomeError,
+			progress: l.eventf("turn %d: %s error: %s", turn, name, clipRunes(err.Error(), maxProgressArgs)),
+		}
 	}
 	// CONTRACT: is_error stays false here whatever the outcome was - a tool
 	// that RAN and failed is not a harness dispatch failure, and that boolean
@@ -567,14 +799,26 @@ func (l *Loop) dispatch(ctx context.Context, turn int, call llm.ToolCall) (strin
 	// the additive `outcome`/`exit_code` fields instead, so a non-zero exit is
 	// visible without being renamed an error.
 	kind, exitCode := toolOutcome(outcome)
-	l.logToolResult(call, output, false, kind, exitCode)
+	r := callResult{output: output, logged: output, outcome: kind, exitCode: exitCode}
 	if l.Progress != nil {
-		// Guarded rather than left to progressf: the arguments - the second
+		// Guarded rather than left to eventf: the arguments - the second
 		// clock read - are evaluated before the call, so only the guard here
 		// keeps the read out of an unobserved run.
-		l.progressf("turn %d: %s %s (%.1fs)", turn, name, outcome, l.now().Sub(started).Seconds())
+		r.progress = l.eventf("turn %d: %s %s (%.1fs)", turn, name, outcome, l.now().Sub(started).Seconds())
 	}
-	return output, nil
+	return r
+}
+
+// publish writes a finished call's session event and progress line, in that
+// order, and reports what the model gets to see. It is the single point where
+// a dispatch becomes visible, which is what lets the concurrent path decide
+// WHEN that happens without duplicating any of the reporting.
+func (l *Loop) publish(call llm.ToolCall, r callResult) (string, error) {
+	l.logToolResult(call, r.logged, r.isErr, r.outcome, r.exitCode)
+	if r.progress != "" && l.Progress != nil {
+		l.Progress(r.progress)
+	}
+	return r.output, r.fail
 }
 
 // logToolResult writes the one tool_result event for a dispatched call. Every
@@ -711,6 +955,19 @@ func (l *Loop) progressf(format string, args ...any) {
 		return
 	}
 	l.Progress(fmt.Sprintf(format, args...))
+}
+
+// eventf formats a progress line for LATER emission, returning "" when no hook
+// is installed. It is progressf split in half for the calls whose text is
+// composed where it may not yet be reported: a concurrent call's line is built
+// on its own goroutine and emitted by the dispatcher, in call order. The empty
+// string is what publish reads as "nothing to say", so an unobserved run still
+// formats nothing.
+func (l *Loop) eventf(format string, args ...any) string {
+	if l.Progress == nil {
+		return ""
+	}
+	return fmt.Sprintf(format, args...)
 }
 
 // now reads the injected clock, defaulting to time.Now (docs/engineering.md §5.4).

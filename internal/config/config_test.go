@@ -1874,3 +1874,34 @@ func TestValidateDialectViolationSuppressesDialectRules(t *testing.T) {
 		t.Errorf("the dialect-independent effort rule was skipped:\n%s", joined)
 	}
 }
+
+// TestToolsParallelDefault: an omitted tools.parallel must mean "on". The
+// default is the whole point of the field - configs written before v0.2 get
+// concurrent tool calls without being edited, and only an explicit `false`
+// takes it back.
+func TestToolsParallelDefault(t *testing.T) {
+	cases := []struct {
+		name     string
+		fragment string
+		want     bool
+	}{
+		{name: "omitted", fragment: "", want: true},
+		{name: "explicit true", fragment: "tools:\n  parallel: true\n", want: true},
+		{name: "explicit false", fragment: "tools:\n  parallel: false\n", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeConfig(t, t.TempDir(), minimalYAML+tc.fragment)
+			cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if got := cfg.Tools.IsParallel(); got != tc.want {
+				t.Errorf("IsParallel() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

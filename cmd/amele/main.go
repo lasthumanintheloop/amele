@@ -2532,14 +2532,18 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 	}
 
 	agent := &loop.Loop{
-		Provider:     provider,
-		Registry:     registry,
-		Session:      sess,
-		Approve:      approve,
-		Limits:       loop.Limits{MaxTurns: cfg.Limits.MaxTurns, MaxTokens: cfg.Limits.MaxTokens},
-		Model:        cfg.Model,
-		SystemPrompt: cfg.SystemPrompt,
-		Tuning:       tuning,
+		Provider: provider,
+		Registry: registry,
+		Session:  sess,
+		Approve:  approve,
+		// The concurrency gate: the loop may only overlap calls it knows
+		// nobody will be asked about (docs/features.md, "Parallel tool calls").
+		AutoApprove:   perm.AutoApproves(cfg.Permissions),
+		ParallelTools: cfg.Tools.IsParallel(),
+		Limits:        loop.Limits{MaxTurns: cfg.Limits.MaxTurns, MaxTokens: cfg.Limits.MaxTokens},
+		Model:         cfg.Model,
+		SystemPrompt:  cfg.SystemPrompt,
+		Tuning:        tuning,
 	}
 
 	if validator == nil {

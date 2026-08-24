@@ -468,3 +468,66 @@ func TestAskPromptWithoutHintProvider(t *testing.T) {
 		t.Errorf("hint = %q, want empty", gotHint)
 	}
 }
+
+// TestAutoApproves pins the concurrency gate's answer for every profile shape:
+// only a plain "allow" may run beside another call. Everything else - ask,
+// deny, a glob that narrows one tool, an absent block, an invalid value - is
+// either not auto-approval or not knowable, and both must read as false.
+func TestAutoApproves(t *testing.T) {
+	cases := []struct {
+		name  string
+		perms config.Permissions
+		tool  string
+		want  bool
+	}{
+		{name: "no block at all is allow-all", perms: config.Permissions{}, tool: "fs_read", want: true},
+		{name: "default allow", perms: config.Permissions{Default: config.PolicyAllow}, tool: "fs_read", want: true},
+		{name: "default ask", perms: config.Permissions{Default: config.PolicyAsk}, tool: "fs_read", want: false},
+		{name: "default deny", perms: config.Permissions{Default: config.PolicyDeny}, tool: "fs_read", want: false},
+		{
+			name: "per-tool ask under an allow default",
+			perms: config.Permissions{Default: config.PolicyAllow,
+				Tools: map[string]config.Policy{"shell": config.PolicyAsk}},
+			tool: "shell", want: false,
+		},
+		{
+			name: "the other tools stay auto-approved",
+			perms: config.Permissions{Default: config.PolicyAllow,
+				Tools: map[string]config.Policy{"shell": config.PolicyAsk}},
+			tool: "fs_read", want: true,
+		},
+		{
+			name: "a matching glob decides",
+			perms: config.Permissions{Default: config.PolicyAllow,
+				Tools: map[string]config.Policy{"*_delete*": config.PolicyAsk}},
+			tool: "github__issue_delete", want: false,
+		},
+		{
+			name:  "an invalid policy is never auto-approval",
+			perms: config.Permissions{Default: config.Policy("maybe")},
+			tool:  "fs_read", want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			auto := AutoApproves(tc.perms)
+			if got := auto(llm.ToolCall{Name: tc.tool}); got != tc.want {
+				t.Errorf("AutoApproves()(%q) = %v, want %v", tc.tool, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAutoApprovesSnapshotsConfig: like the approver, the predicate must not
+// alias the caller's map - a rule added after construction cannot be allowed to
+// change what a running loop considers safe to parallelize.
+func TestAutoApprovesSnapshotsConfig(t *testing.T) {
+	perms := config.Permissions{Default: config.PolicyAllow, Tools: map[string]config.Policy{}}
+	auto := AutoApproves(perms)
+	perms.Tools["fs_write"] = config.PolicyAsk
+
+	if !auto(llm.ToolCall{Name: "fs_write"}) {
+		t.Error("the predicate followed a post-construction mutation of the rules map")
+	}
+}

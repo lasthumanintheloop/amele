@@ -4197,3 +4197,50 @@ func TestProgressLoggerRedactsLateSecret(t *testing.T) {
 		t.Errorf("[REDACTED] count = %d, want %d: %q", strings.Count(out, "[REDACTED]"), want, out)
 	}
 }
+
+// TestBuildAgentParallelWiring: the YAML's tools.parallel and the permission
+// profile must both reach the loop. They are the two halves of the concurrency
+// gate, and a loop that received neither would either never parallelize or -
+// worse - parallelize a profile that asks a human.
+func TestBuildAgentParallelWiring(t *testing.T) {
+	parallelOff := false
+	tests := []struct {
+		name         string
+		tools        config.ToolsConfig
+		perms        config.Permissions
+		wantParallel bool
+		wantAuto     bool
+	}{
+		{name: "default", wantParallel: true, wantAuto: true},
+		{name: "opted out", tools: config.ToolsConfig{Parallel: &parallelOff}, wantParallel: false, wantAuto: true},
+		{
+			name:         "ask profile",
+			perms:        config.Permissions{Default: config.PolicyAsk},
+			wantParallel: true, wantAuto: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Model:       "m",
+				Workspace:   t.TempDir(),
+				Tools:       tt.tools,
+				Permissions: tt.perms,
+				Provider:    config.ProviderConfig{BaseURL: "https://api.example.com/v1", APIKey: "k"},
+			}
+			agent, _, _, err := buildAgent(cfg, nil, newLineReader(strings.NewReader("")), io.Discard, nil)
+			if err != nil {
+				t.Fatalf("buildAgent: %v", err)
+			}
+			if agent.ParallelTools != tt.wantParallel {
+				t.Errorf("ParallelTools = %v, want %v", agent.ParallelTools, tt.wantParallel)
+			}
+			if agent.AutoApprove == nil {
+				t.Fatal("AutoApprove was not wired: the loop would fall back to sequential forever")
+			}
+			if got := agent.AutoApprove(llm.ToolCall{Name: "fs_read"}); got != tt.wantAuto {
+				t.Errorf("AutoApprove(fs_read) = %v, want %v", got, tt.wantAuto)
+			}
+		})
+	}
+}

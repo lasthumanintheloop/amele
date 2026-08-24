@@ -151,6 +151,10 @@
             }
           }
         },
+        "parallel": {
+          "type": "boolean",
+          "description": "Whether the tool calls of ONE model turn may run at the same time. Default true: independent calls (three reads, two searches) finish in one round instead of N. The recorded order never changes - session events, message history and progress lines stay in the model's call order - and a turn that contains an `ask` permission falls back to one call at a time so approval prompts cannot interleave. Set false when tools are not independent (two tools writing the same file, a server that serializes badly)."
+        },
         "subprocess": {
           "type": "array",
           "description": "Custom executable tools. Each command is a fixed argv vector - no shell is involved, so the model can never inject into a shell string.",

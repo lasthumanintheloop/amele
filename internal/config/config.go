@@ -306,7 +306,25 @@ type ToolsConfig struct {
 	Shell ShellConfig `yaml:"shell"`
 	// Subprocess lists the custom executable tools.
 	Subprocess []SubprocessTool `yaml:"subprocess"`
+	// Parallel decides whether the tool calls of ONE model turn may run
+	// concurrently. nil (the field omitted) means true; see IsParallel.
+	Parallel *bool `yaml:"parallel"`
 }
+
+// IsParallel reports whether the tool calls within one turn may run at the
+// same time.
+//
+// The zero value (nil) means yes: a model that asks for three independent
+// reads in one turn should not pay for them one after the other, and every
+// tool amele dispatches is already an isolated process or request. An operator
+// whose tools are NOT independent - two subprocess tools writing the same file,
+// a server that serializes badly - opts out with `parallel: false`, and the
+// whole turn goes back to one call at a time.
+//
+// Concurrency never changes what is recorded: the session events, the message
+// history and the progress feed stay in the model's call order either way
+// (docs/contracts/jsonl-events.md).
+func (t ToolsConfig) IsParallel() bool { return t.Parallel == nil || *t.Parallel }
 
 // Limits are the run budgets. They are the kill switches that make an agent
 // safe to leave unattended in cron.

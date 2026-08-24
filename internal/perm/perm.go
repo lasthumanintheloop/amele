@@ -162,6 +162,36 @@ func NewApprover(perms config.Permissions, opts Options) (loop.Approver, error) 
 	}, nil
 }
 
+// AutoApproves reports, for one profile, whether a tool call's policy resolves
+// to a plain "allow": a ruling the approver can give with no human, no I/O and
+// no side effect at all.
+//
+// It exists for the agent loop's concurrency gate (loop.Loop.AutoApprove).
+// Answering it needs no Options - the question is about the PROFILE, not about
+// this process's terminal - and it is deliberately a separate function rather
+// than a second return value of NewApprover: a caller that never runs calls
+// concurrently should not have to hold on to it.
+//
+// SECURITY: only "allow" is auto-approval. "ask" is not (it may stop for a
+// human), "deny" is not, and an unvalidated policy value is not either - so a
+// profile this package would reject at construction can only ever make the
+// loop MORE sequential, never less.
+func AutoApproves(perms config.Permissions) func(call llm.ToolCall) bool {
+	def := perms.Default
+	if def == "" {
+		def = config.PolicyAllow
+	}
+	// Copied for the same reason NewApprover copies: a later mutation of the
+	// caller's map must not change what a running loop considers safe.
+	rules := make(map[string]Policy, len(perms.Tools))
+	for name, policy := range perms.Tools {
+		rules[name] = policy
+	}
+	return func(call llm.ToolCall) bool {
+		return policyFor(call.Name, def, rules) == config.PolicyAllow
+	}
+}
+
 // ask resolves an "ask" policy for one call. Split out to keep NewApprover's
 // returned closure small and its branches obvious.
 func ask(call llm.ToolCall, opts Options, logf func(string, string)) (loop.Ruling, error) {
