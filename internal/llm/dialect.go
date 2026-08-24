@@ -160,13 +160,50 @@ func ResponseFormatType(d Dialect) string {
 	}
 }
 
-// The two message keys that carry a reasoning payload on the OpenAI wire.
-// They are the response field a client reads AND the request field it writes
-// back, so they double as the json tags on oaMessage - keep the two in step.
+// The message keys that can carry a reasoning payload on the OpenAI wire.
+// The first two are the response field a client reads AND the request field it
+// writes back, so they double as the json tags on oaMessage - keep the two in
+// step. fieldReasoning is RESPONSE-ONLY (see capturesPlainReasoning).
 const (
 	fieldReasoningContent = "reasoning_content"
 	fieldReasoningDetails = "reasoning_details"
+	fieldReasoning        = "reasoning"
 )
+
+// capturesPlainReasoning reports whether this dialect may also read a bare
+// `reasoning` field off a response when the dialect's own carrier is absent.
+//
+// Only groq does. Groq's documentation puts the model's reasoning in
+// `message.reasoning` - a claim this repository has NOT verified against a live
+// endpoint, which is exactly why the field is read as a FALLBACK behind
+// reasoning_content rather than replacing it: if the spelling is wrong, nothing
+// changes, and if it is right, the run stops under-reporting its own cost.
+//
+// CONTRACT: capture only. The payload is observable (reasoning_bytes in the
+// session log) but never echoed, because no source establishes a request-side
+// spelling for this field and this dialect's unknown-field policy is "assume
+// rejected" (docs/providers.md §"The dialect table"). Sending an unknown key
+// back to buy an unproven echo contract is the wrong side of that trade.
+//
+// OpenRouter also returns a plaintext `reasoning` beside its typed array, and
+// is deliberately NOT here: there the field is documented display sugar next to
+// the signed carrier that does round-trip.
+func capturesPlainReasoning(d Dialect) bool {
+	return d == DialectGroq
+}
+
+// echoesReasoningFrom reports whether a payload captured from capturedFrom may
+// travel back to this dialect. An empty capturedFrom means the message did not
+// come from a wire capture (a caller-built message, a fake provider), which is
+// answered like the dialect's own key.
+//
+// CONTRACT: store-and-echo stays SYMMETRIC - the echo only ever uses the key
+// the payload was captured from. Echoing bytes under a different key is how a
+// signed or hash-checked carrier turns into a 400 that names a field the config
+// never mentions.
+func echoesReasoningFrom(d Dialect, capturedFrom string) bool {
+	return capturedFrom == "" || capturedFrom == reasoningField(d)
+}
 
 // reasoningField returns the message key that carries this dialect's reasoning
 // payload. The zero-value Dialect answers like DialectOpenAI.

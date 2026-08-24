@@ -55,6 +55,16 @@ type Message struct {
 	// (DeepSeek) reject altered payloads, so the bytes that came off the wire
 	// are the bytes that go back.
 	Reasoning json.RawMessage
+	// ReasoningField names the wire key Reasoning was captured from, for the
+	// clients that can read the payload from more than one key. Empty means
+	// the message did not come from a wire capture (a caller-built message, a
+	// fake provider) and the client's own default key applies.
+	//
+	// CONTRACT: it exists so store-and-echo stays SYMMETRIC. A payload is only
+	// ever echoed under the key it arrived on; one that arrived on a key with
+	// no request-side spelling is not echoed at all. Layers above copy the
+	// field with the message and never interpret it.
+	ReasoningField string
 }
 
 // ToolDef describes a tool offered to the model. Parameters is a JSON Schema

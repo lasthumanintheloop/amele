@@ -93,7 +93,7 @@ What each dialect makes of the same config, on the OpenAI-compatible wire:
 | `deepseek` | `thinking: {"type":"enabled"}` + `reasoning_effort` (medium->high, xhigh->max); `none` -> `thinking: {"type":"disabled"}` | `max_tokens` | `reasoning_content`, echoed back on **every** later request | passed through (ignored while thinking) | `json_object` + validate + retry | ignored (undocumented, observed) |
 | `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through, `temperature` capped at 1 | `json_object` + validate + retry | not documented; assume rejected (400) |
 | `kimi` | `reasoning_effort` (medium->high, xhigh->max), no thinking object | `max_completion_tokens` | `reasoning_content`, echoed back | **config error**: the K-series fixes `temperature`/`top_p` | attempted, then fallback | not documented; assume rejected (400) |
-| `groq` | `reasoning_effort` (verbatim) | `max_completion_tokens` | captured if present, echoed back | passed through | `json_schema` sent, then fallback - native support **unverified** | not documented; assume rejected (400) |
+| `groq` | `reasoning_effort` (verbatim) | `max_completion_tokens` | `reasoning_content` echoed back; a bare `reasoning` is captured for the log only | passed through | `json_schema` sent, then fallback - native support **unverified** | not documented; assume rejected (400) |
 | `openrouter` | `reasoning: {"effort": ...}` (verbatim; `budget_tokens` -> `reasoning: {"max_tokens": N}`) | `max_tokens` | `reasoning_details` array, echoed back verbatim and in order | passed through (the gateway drops what the model cannot take) | native `json_schema` - but see [OpenRouter](#openrouter) | passed through to the upstream provider |
 
 Three rules are worth stating outside the table.
@@ -256,6 +256,15 @@ per-model table. If the model does not know your value, Groq's own 400 names
 it. `output.schema` is in the same position: whether a Groq-hosted model
 enforces a schema natively is unverified here, so amele sends it and falls back
 - see [Structured output](#structured-output).
+
+Reasoning comes back under `reasoning_content` if the model uses that spelling,
+and otherwise under the bare `reasoning` field Groq's documentation describes
+(also unverified here). A payload read from `reasoning` is **captured but not
+echoed**: it counts in the session log's `reasoning_bytes`, so the turn's cost
+is visible, but nothing sends it back - no source establishes a request-side
+spelling for that key, and this dialect's unknown-field policy is "assume
+rejected". A payload read from `reasoning_content` is echoed as on every other
+dialect.
 
 ### OpenRouter
 

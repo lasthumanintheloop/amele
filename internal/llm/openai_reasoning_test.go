@@ -223,6 +223,9 @@ func TestNoReasoningNoKey(t *testing.T) {
 		{"field absent", ""},
 		{"field null", `"reasoning_content":null,`},
 		{"details null", `"reasoning_details":null,`},
+		// groq reads a plain `reasoning` field as a fallback carrier; a null
+		// one is still "no reasoning" and must not become a four-byte payload.
+		{"plain reasoning null", `"reasoning":null,`},
 	}
 
 	for _, tt := range tests {
@@ -260,6 +263,84 @@ func TestNoReasoningNoKey(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestGroqPlainReasoningCapture covers the one dialect that answers with a
+// bare `reasoning` field (Groq's documented spelling; unverified here). Two
+// halves, and both matter:
+//
+//   - reasoning_content stays the PRIMARY carrier, so a Groq-hosted model that
+//     uses that spelling keeps the round-trip it has today;
+//   - a payload captured from `reasoning` is observable (reasoning_bytes in the
+//     session log) but is NOT echoed, because no research fact establishes a
+//     request-side spelling for it and this dialect's unknown-field policy is
+//     "assume rejected". Store-and-echo stays symmetric: the echo only ever
+//     uses the key the payload was captured from.
+func TestGroqPlainReasoningCapture(t *testing.T) {
+	const plain = `"groq thought about it"`
+	tests := []struct {
+		name string
+		// extra is the reasoning part of the response message.
+		extra string
+		// wantCarrier is what Message.Reasoning must hold afterwards.
+		wantCarrier string
+		// wantEcho, when non-empty, must appear in the follow-up request.
+		wantEcho string
+	}{
+		{
+			name:        "reasoning_content wins and is echoed",
+			extra:       `"reasoning_content":` + reasoningPayload + `,"reasoning":` + plain + `,`,
+			wantCarrier: reasoningPayload,
+			wantEcho:    `"reasoning_content":` + reasoningPayload,
+		},
+		{
+			name:        "plain reasoning is captured but not echoed",
+			extra:       `"reasoning":` + plain + `,`,
+			wantCarrier: plain,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, recorded := recordingServer(t, toolCallResponse(tt.extra), okBody("done"))
+			client := &OpenAIClient{BaseURL: srv.URL + "/v1", Dialect: DialectGroq}
+
+			first, err := client.Chat(context.Background(), Request{
+				Model:    "m",
+				Messages: []Message{{Role: RoleUser, Content: "scan app.log"}},
+			})
+			if err != nil {
+				t.Fatalf("first Chat: %v", err)
+			}
+			if got := string(first.Message.Reasoning); got != tt.wantCarrier {
+				t.Fatalf("captured reasoning:\ngot:  %s\nwant: %s", got, tt.wantCarrier)
+			}
+
+			if _, err := client.Chat(context.Background(), Request{
+				Model: "m",
+				Messages: []Message{
+					{Role: RoleUser, Content: "scan app.log"},
+					first.Message,
+					{Role: RoleTool, ToolCallID: "call_1", Content: "ERROR disk full"},
+				},
+			}); err != nil {
+				t.Fatalf("second Chat: %v", err)
+			}
+			body := (*recorded)[1]
+			if tt.wantEcho == "" {
+				if bytes.Contains(body, []byte("reasoning")) {
+					t.Errorf("a payload with no request-side spelling must not be echoed: %s", body)
+				}
+				return
+			}
+			if !bytes.Contains(body, []byte(tt.wantEcho)) {
+				t.Errorf("echo lost the payload.\ngot:  %s\nwant to contain: %s", body, tt.wantEcho)
+			}
+			if bytes.Contains(body, []byte(plain)) {
+				t.Errorf("the secondary spelling must not travel back: %s", body)
+			}
+		})
 	}
 }
 

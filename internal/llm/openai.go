@@ -184,8 +184,13 @@ type oaMessage struct {
 	// is left alone rather than turned off globally for this one field.
 	ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
 	ReasoningDetails json.RawMessage `json:"reasoning_details,omitempty"`
-	ToolCalls        []oaToolCall    `json:"tool_calls,omitempty"`
-	ToolCallID       string          `json:"tool_call_id,omitempty"`
+	// Reasoning is the bare `reasoning` field, RESPONSE-ONLY: it is decoded
+	// (groq's documented spelling, read as a fallback - capturesPlainReasoning)
+	// and never written, because toWire builds every request message from
+	// scratch and no source establishes a request-side meaning for the key.
+	Reasoning  json.RawMessage `json:"reasoning,omitempty"`
+	ToolCalls  []oaToolCall    `json:"tool_calls,omitempty"`
+	ToolCallID string          `json:"tool_call_id,omitempty"`
 }
 
 // reasoningRef points at the field of msg that carries reasoning for this
@@ -196,6 +201,24 @@ func reasoningRef(d Dialect, msg *oaMessage) *json.RawMessage {
 		return &msg.ReasoningDetails
 	}
 	return &msg.ReasoningContent
+}
+
+// captureReasoning picks this dialect's reasoning payload off a response
+// message and returns it with the key it came from (both zero when the message
+// carries none).
+//
+// The dialect's own carrier wins; the bare `reasoning` field is consulted only
+// as a fallback and only where the dialect documents it (capturesPlainReasoning).
+// Order matters: a provider that sends both a structured carrier and a
+// plaintext summary must round-trip the structured one.
+func captureReasoning(d Dialect, wire *oaMessage) (json.RawMessage, string) {
+	if raw := *reasoningRef(d, wire); carriesReasoning(raw) {
+		return raw, reasoningField(d)
+	}
+	if capturesPlainReasoning(d) && carriesReasoning(wire.Reasoning) {
+		return wire.Reasoning, fieldReasoning
+	}
+	return nil, ""
 }
 
 // carriesReasoning reports whether a wire value is a real payload rather than
@@ -426,10 +449,10 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	// (400 otherwise)" - research §"Load-bearing quirks" #2), and Kimi K3 and
 	// GLM-5.3 cannot be turned off at all. A client that only captured when a
 	// reasoning knob was set would break the plainest config there is.
-	// The bytes are stored as they arrived; nothing here parses them.
-	if raw := *reasoningRef(c.Dialect, &choice.Message); carriesReasoning(raw) {
-		msg.Reasoning = raw
-	}
+	// The bytes are stored as they arrived; nothing here parses them, and the
+	// key they arrived on travels with them so the echo cannot pick another
+	// one (see echoesReasoningFrom).
+	msg.Reasoning, msg.ReasoningField = captureReasoning(c.Dialect, &choice.Message)
 	for _, tc := range choice.Message.ToolCalls {
 		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 			ID:        tc.ID,
@@ -531,8 +554,10 @@ func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessag
 		//
 		// Only assistant messages carry it. A carrier on any other role is a
 		// bug upstream, and echoing it would hand a strict provider an unknown
-		// field on a message shape that never has one.
-		if m.Role == RoleAssistant && carriesReasoning(m.Reasoning) {
+		// field on a message shape that never has one. A payload captured from
+		// a key this dialect does not write back is dropped here, not moved to
+		// another key (echoesReasoningFrom).
+		if m.Role == RoleAssistant && carriesReasoning(m.Reasoning) && echoesReasoningFrom(c.Dialect, m.ReasoningField) {
 			*reasoningRef(c.Dialect, &wm) = m.Reasoning
 		}
 		for _, tc := range m.ToolCalls {
