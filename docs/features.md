@@ -1,8 +1,9 @@
 # Structured output, permissions, shell and chat
 
-Beyond the core `run` + `validate`, four features round out the agent: structured
-output, permission profiles, a builtin `shell` tool, and an interactive `chat`
-mode. Everything below is configured in the same single YAML file.
+Beyond the core `run` + `validate`, five features round out the agent: structured
+output, permission profiles, a builtin `shell` tool, an interactive `chat`
+mode, and parallel tool calls. Everything below is configured in the same single
+YAML file.
 
 Exit codes are unchanged and frozen
 ([contract](contracts/exit-codes.md)):
@@ -211,6 +212,45 @@ history keeps your message and the model's *final answer*; the intermediate
 tool calls and their results are dropped. The model sees its own conclusions
 but not its scratch work - coherent for conversation, and it keeps the context
 small. Full transcript continuity is on the roadmap.
+
+## Parallel tool calls (`tools.parallel`)
+
+Models ask for several tools in one turn - three file reads, two searches, a
+fetch and a grep. amele runs them **at the same time**, so the turn costs the
+slowest call instead of the sum of all of them.
+
+It is on by default. Turn it off per config:
+
+```yaml
+tools:
+  parallel: false   # one tool call at a time (default: true)
+```
+
+**The recorded order never changes.** Whatever order the tools finish in, the
+session log, the message history sent back to the model and the `-v` progress
+lines all appear in the order the *model asked for the calls*
+([JSONL contract](contracts/jsonl-events.md#ordering-guarantees)). Two runs of
+the same recorded conversation therefore produce the same file - concurrency
+buys latency, never a different transcript.
+
+**When amele falls back to one at a time**, automatically:
+
+- the turn has only one tool call (nothing to overlap);
+- `tools.parallel: false`;
+- **any** call in the turn is governed by an `ask` permission. Two approval
+  questions racing for one terminal would be unanswerable: you could not tell
+  which call you just granted. One `ask` in the turn puts the whole turn back
+  on the sequential path, and the questions arrive one after the other, in
+  call order.
+
+Per-tool timeouts are unchanged: each subprocess, shell command and MCP call
+keeps its own clock, and `limits.timeout` still bounds the whole run.
+
+**What to check before leaving it on.** amele's own tools are independent by
+construction (a separate process or request per call), but *your* tools might
+not be: two subprocess tools appending to the same file, a script with a lock
+file, an MCP server that serializes requests badly. Those are the cases
+`parallel: false` exists for.
 
 ## Session logs
 

@@ -200,9 +200,28 @@ truthful partial accounting.
   `ok` false when the reconnect itself failed. The
   orderly shutdown emits a `mcp_disconnect` (reason `run_end`) for every
   still-connected server before `run_end`.
-- Within a turn: the `llm_response` comes first, then its tool calls as
-  `tool_call` immediately followed by the matching `tool_result`, in dispatch
-  order. Correlation is by `tool_call_id`, not by position.
+- Within a turn: the `llm_response` comes first, then its tool calls. Both
+  `tool_call` and `tool_result` events appear in the order the model requested
+  the calls in that `llm_response` (the same order as its `tool_call_ids`),
+  whether the calls ran one after the other or side by side. Correlation is by
+  `tool_call_id`, not by position.
+- Two shapes are possible for the tool events of one turn, and a consumer must
+  accept both:
+  - **sequential dispatch** - each `tool_call` is immediately followed by its
+    own `tool_result` (`call c1, result c1, call c2, result c2`). This is what
+    a single-call turn, `tools.parallel: false`, or any turn containing an
+    `ask`-governed call produces;
+  - **parallel dispatch** (default since v0.2, `tools.parallel`) - every
+    `tool_call` of the turn is logged first, in call order, then every
+    `tool_result`, also in call order (`call c1, call c2, result c1,
+    result c2`).
+
+  In both shapes every `tool_call` is answered by exactly one `tool_result`,
+  even on the turn that aborts the run. What changes is only the interleaving;
+  the order *within* each group is the model's call order, never completion
+  order, so a log does not record which call happened to finish first. `ts`
+  stays non-decreasing in both shapes: the events are written when they are
+  published, not when the tool returned.
 
 ## Turn numbering
 
