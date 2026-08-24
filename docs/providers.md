@@ -38,6 +38,9 @@ provider:
     budget_tokens: 8192       # a token count instead of a level
   temperature: 0.2
   top_p: 0.9
+  retry:
+    max_attempts: 5           # total tries per call, 1 disables retrying
+    initial_backoff: 2s       # first wait; doubles for each attempt after
   params:                     # escape hatch: merged verbatim into the body
     provider: {require_parameters: true}   # e.g. an OpenRouter routing rule
 ```
@@ -51,13 +54,34 @@ provider:
 | `reasoning.budget_tokens` | none | A token budget instead of a level. Only the anthropic wire and the `openrouter` dialect can carry one; anywhere else it is a config error (exit 2) rather than a silently dropped field. |
 | `temperature` | none | `[0, 2]`, narrowed to `[0, 1]` on the anthropic wire and on the `glm` dialect. Unset means the provider decides - which is not the same as `0`. |
 | `top_p` | none | `(0, 1]`. `0` is rejected rather than clamped: an empty nucleus is a 400, not greedy decoding. |
+| `retry.max_attempts` | `3` | Total tries for one provider call (1 initial + retries), so `1` disables retrying. Accepted range 1..10; `0` (or omitted) means the default. |
+| `retry.initial_backoff` | `1s` | The wait before the second attempt; each further attempt doubles it. Accepted range `100ms`..`60s`; empty (or omitted) means the default. |
 | `params` | none | Arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for. Keys amele writes itself (`model`, `messages`, `tools`, `tool_choice`, `response_format`, `max_tokens`, `max_completion_tokens`, `reasoning`, `reasoning_effort`, `thinking`, `temperature`, `top_p`, `stream`, `output_config`, `system`) are a config error, so `params` can extend a request but never rewrite one. |
 
 `provider.max_output_tokens`, `provider.reasoning.effort`,
 `provider.temperature` and `provider.top_p` are in the `--set` override
 allowlist, so one config can be swept over several settings from a shell loop.
-`provider.dialect`, `provider.reasoning.budget_tokens` and `provider.params`
-are deliberately not ([cli.md](contracts/cli.md#set)).
+`provider.dialect`, `provider.reasoning.budget_tokens`, `provider.retry.*` and
+`provider.params` are deliberately not ([cli.md](contracts/cli.md#set)).
+
+### Retries
+
+A 429, a 5xx or a dropped connection is retried; everything else is returned to
+you as it is. **Which** failures are retried is not configurable, because that
+list is not a matter of taste: a 400 is a request the provider will refuse just
+as firmly on the next attempt, and retrying it would only spend your budget
+slower. What you can set is the rhythm - `retry.max_attempts` tries in total
+(`1` means "never retry") with `retry.initial_backoff` before the second one,
+doubled for each attempt after that: `2s` gives 2s, 4s, 8s. A `Retry-After`
+header from the provider **stretches** an individual wait - never shrinks it,
+and never past 60s - because retrying earlier than the rate limiter allows
+burns an attempt for nothing. Both wires share the policy: the same block
+applies whether `type` is `openai` or `anthropic`. When the attempts run out,
+the run ends as a provider error (exit 5), so a longer ladder trades latency
+for surviving a rate-limit window. `limits.timeout` stays the wall-clock kill
+switch above all of it: a backoff wait is cut short when the run deadline
+fires, and the run then ends as a budget timeout (exit 3), not as a provider
+error.
 
 ## The dialect table
 

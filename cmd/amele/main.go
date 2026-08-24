@@ -2591,6 +2591,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 // panicked on or ignored - falling back to the openai mapping would silently
 // reshape every request of the run.
 func buildProvider(cfg *config.Config) (llm.Provider, error) {
+	maxAttempts, initialBackoff := retryPolicy(cfg.Provider.Retry)
 	if cfg.Provider.Type == config.ProviderTypeAnthropic {
 		// The dialect names a variation of the OpenAI-compatible wire and is
 		// documented as ignored here (config.schema.json), so it is not parsed
@@ -2600,6 +2601,8 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 			BaseURL:         cfg.Provider.BaseURL,
 			APIKey:          cfg.Provider.APIKey,
 			RequestTimeout:  cfg.Provider.RequestTimeout.Std(),
+			MaxAttempts:     maxAttempts,
+			InitialBackoff:  initialBackoff,
 			MaxOutputTokens: cfg.Provider.MaxOutputTokens,
 		}, nil
 	}
@@ -2612,7 +2615,20 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 		APIKey:         cfg.Provider.APIKey,
 		Dialect:        dialect,
 		RequestTimeout: cfg.Provider.RequestTimeout.Std(),
+		MaxAttempts:    maxAttempts,
+		InitialBackoff: initialBackoff,
 	}, nil
+}
+
+// retryPolicy unpacks the optional provider.retry block for both clients. An
+// absent block (and a block that leaves a knob at zero) yields zero values,
+// which each client reads as "my default": the wiring never invents a number,
+// so the defaults live in exactly one place - the llm package.
+func retryPolicy(r *config.RetryConfig) (maxAttempts int, initialBackoff time.Duration) {
+	if r == nil {
+		return 0, 0
+	}
+	return r.MaxAttempts, r.InitialBackoff.Std()
 }
 
 // providerTuning translates the config's provider knobs into the neutral

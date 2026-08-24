@@ -101,6 +101,15 @@ Within a frozen version, changes must be additive and backwards-compatible:
   The `--set` allowlist gains `provider.max_output_tokens`,
   `provider.reasoning.effort`, `provider.temperature` and `provider.top_p`
   (cli.md); no key was removed.
+- **2026-08-24 - config schema: `provider.retry`.** `provider` gains one more
+  optional block, `retry`, with `max_attempts` (0..10; 0 or omitted means the
+  default 3, 1 disables retrying) and `initial_backoff` (a duration; empty or
+  omitted means the default 1s, accepted range 100ms..60s). Additive: both keys
+  are optional, `additionalProperties: false` still holds, and a config without
+  the block retries exactly as every previous release did (3 attempts, 1s/2s
+  backoff, `Retry-After` honored up to 60s). Migration: none required. The
+  retryable failure classes (429, 5xx, network) are NOT configurable, and the
+  `--set` allowlist is unchanged.
 
 ## Schema versioning note (`$id`)
 

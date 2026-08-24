@@ -474,16 +474,20 @@ provider:
   base_url: https://api.example.com/v1
 `
 	rejected := map[string]string{
-		"unknown dialect":       "  dialect: gemini\n",
-		"dialect case":          "  dialect: DeepSeek\n",
-		"unknown effort":        "  reasoning:\n    effort: insane\n",
-		"negative budget":       "  reasoning:\n    budget_tokens: -1\n",
-		"unknown reasoning key": "  reasoning:\n    depth: high\n",
-		"temperature too high":  "  temperature: 2.5\n",
-		"temperature negative":  "  temperature: -0.5\n",
-		"top_p zero":            "  top_p: 0\n",
-		"top_p above one":       "  top_p: 1.5\n",
-		"misspelled key":        "  temprature: 0.5\n",
+		"unknown dialect":           "  dialect: gemini\n",
+		"dialect case":              "  dialect: DeepSeek\n",
+		"unknown effort":            "  reasoning:\n    effort: insane\n",
+		"negative budget":           "  reasoning:\n    budget_tokens: -1\n",
+		"unknown reasoning key":     "  reasoning:\n    depth: high\n",
+		"temperature too high":      "  temperature: 2.5\n",
+		"temperature negative":      "  temperature: -0.5\n",
+		"top_p zero":                "  top_p: 0\n",
+		"top_p above one":           "  top_p: 1.5\n",
+		"misspelled key":            "  temprature: 0.5\n",
+		"negative attempts":         "  retry:\n    max_attempts: -1\n",
+		"attempts above ten":        "  retry:\n    max_attempts: 11\n",
+		"unknown retry key":         "  retry:\n    max_retries: 4\n",
+		"backoff is not a duration": "  retry:\n    initial_backoff: soon\n",
 	}
 	for name, tail := range rejected {
 		t.Run(name, func(t *testing.T) {
@@ -501,6 +505,9 @@ provider:
     budget_tokens: 8192
   temperature: 0.2
   top_p: 0.9
+  retry:
+    max_attempts: 5
+    initial_backoff: 500ms
   params:
     verbosity: low
     provider:
@@ -511,6 +518,19 @@ provider:
 		}
 	})
 
+	// The runtime reads 0 (and an empty duration) as "omitted, use the
+	// default", so the schema must not red-squiggle a config `amele validate`
+	// accepts.
+	t.Run("zero retry knobs mean the defaults", func(t *testing.T) {
+		const doc = head + `  retry:
+    max_attempts: 0
+    initial_backoff: ""
+`
+		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+			t.Errorf("zero retry knobs do not validate:\n%s", feedback)
+		}
+	})
+
 	// The headless idiom: budgets and sampling filled from the environment.
 	// The schema must not flag the exact form the project pushes.
 	t.Run("env references in numeric tuning fields", func(t *testing.T) {
@@ -518,6 +538,9 @@ provider:
     budget_tokens: ${BUDGET}
   temperature: ${TEMP}
   top_p: ${TOPP}
+  retry:
+    max_attempts: ${ATTEMPTS}
+    initial_backoff: ${BACKOFF}
 `
 		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
 			t.Errorf("config with ${VAR} in tuning fields does not validate:\n%s", feedback)

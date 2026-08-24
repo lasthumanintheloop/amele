@@ -59,6 +59,11 @@ type AnthropicClient struct {
 	RequestTimeout time.Duration
 	// MaxAttempts overrides defaultMaxAttempts when > 0.
 	MaxAttempts int
+	// InitialBackoff is the wait before the second attempt, doubled for every
+	// attempt after that. Zero means defaultInitialBackoff (1s). Wired from
+	// the config's provider.retry.initial_backoff, same semantics as
+	// OpenAIClient.
+	InitialBackoff time.Duration
 	// Sleep is injectable for tests; nil means context-aware sleeping.
 	// Determinism rule (docs/engineering.md §5.4): time-dependent behavior must be
 	// injectable.
@@ -274,15 +279,11 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 	dropped := false
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
-			// Exponential backoff: 1s, 2s, 4s... stretched (never shrunk)
-			// to the provider's Retry-After when one was sent, and capped
-			// by the caller's context deadline (sleep aborts when ctx is
-			// done).
-			delay := time.Duration(1<<(attempt-2)) * time.Second
-			if retryAfter > delay {
-				delay = min(retryAfter, maxRetryAfter)
-			}
-			if err := c.sleep(ctx, delay); err != nil {
+			// Exponential backoff from InitialBackoff (1s, 2s, 4s... by
+			// default), stretched to the provider's Retry-After when one was
+			// sent, and bounded by the caller's context deadline (sleep aborts
+			// when ctx is done).
+			if err := c.sleep(ctx, backoffDelay(c.InitialBackoff, attempt, retryAfter)); err != nil {
 				return nil, fmt.Errorf("%w: %v (last error: %v)", ErrProvider, err, lastErr)
 			}
 		}

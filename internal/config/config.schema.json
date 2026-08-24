@@ -71,6 +71,24 @@
           "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
           "description": "Nucleus sampling, greater than 0 and at most 1. Omitted means the provider decides. Rejected outright on the kimi dialect (openai wire only), whose K-series models fix sampling. May also be a whole-value ${VAR} environment reference resolved at load time."
         },
+        "retry": {
+          "type": "object",
+          "description": "How a transient provider failure is retried. WHICH failures are retried is not configurable: 429, 5xx and network errors are transient by definition, and anything else is a request the provider would refuse just as firmly on the next attempt. An absent block means the client defaults (3 attempts, 1s initial backoff).",
+          "additionalProperties": false,
+          "properties": {
+            "max_attempts": {
+              "type": ["integer", "string"],
+              "minimum": 0,
+              "maximum": 10,
+              "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+              "description": "Total tries for one provider call (1 initial + retries), so 1 disables retrying. 0 (or omitted) means the default 3; values above 10 are a config error. May also be a whole-value ${VAR} environment reference resolved at load time."
+            },
+            "initial_backoff": {
+              "$ref": "#/$defs/duration",
+              "description": "Wait before the second attempt, doubled for each attempt after that, e.g. \"200ms\". Empty or omitted means the default (1s); accepted range 100ms..60s, enforced at load time. A provider's Retry-After header still stretches an individual wait (capped at 60s)."
+            }
+          }
+        },
         "params": {
           "type": "object",
           "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself - model, messages, tools, tool_choice, response_format, max_tokens, max_completion_tokens, reasoning, reasoning_effort, thinking, temperature, top_p, stream, output_config, system - are rejected at load time, so params can extend a request but never rewrite one. Values must be JSON-serializable."

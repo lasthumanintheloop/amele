@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -408,6 +409,58 @@ func TestAnthropicRetryAfterHonored(t *testing.T) {
 	}
 	if len(delays) != 1 || delays[0] != 7*time.Second {
 		t.Errorf("delays: got %v want [7s]", delays)
+	}
+}
+
+// anthropicRetryTwiceServer answers the first two calls with 429 and then
+// succeeds, so a test observes exactly two backoff waits.
+func anthropicRetryTwiceServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	var calls int
+	return anthropicServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		calls++
+		if calls <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(anOKBody("ok")))
+	})
+}
+
+// TestAnthropicBackoffHonorsInitialBackoff: the native wire honors the same
+// configured retry rhythm as the OpenAI-compatible one - a policy that applied
+// to only one of the two clients would be a trap when a config switches wires.
+func TestAnthropicBackoffHonorsInitialBackoff(t *testing.T) {
+	srv := anthropicRetryTwiceServer(t)
+
+	var delays []time.Duration
+	client := &AnthropicClient{
+		BaseURL:        srv.URL,
+		InitialBackoff: 200 * time.Millisecond,
+		Sleep:          recordDelays(&delays),
+	}
+	if _, err := client.Chat(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{200 * time.Millisecond, 400 * time.Millisecond}
+	if !slices.Equal(delays, want) {
+		t.Errorf("delays: got %v want %v", delays, want)
+	}
+}
+
+// TestAnthropicBackoffDefaultsUnchanged: no InitialBackoff means the 1s/2s
+// ladder this client has always used.
+func TestAnthropicBackoffDefaultsUnchanged(t *testing.T) {
+	srv := anthropicRetryTwiceServer(t)
+
+	var delays []time.Duration
+	client := &AnthropicClient{BaseURL: srv.URL, Sleep: recordDelays(&delays)}
+	if _, err := client.Chat(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}); err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second}
+	if !slices.Equal(delays, want) {
+		t.Errorf("delays: got %v want %v", delays, want)
 	}
 }
 

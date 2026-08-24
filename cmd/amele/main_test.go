@@ -2594,6 +2594,59 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	}
 }
 
+// TestBuildProviderWiresRetry pins the retry policy on BOTH clients: the
+// config's knobs must reach whichever wire is selected, and a config without a
+// retry block must leave both clients on their own defaults (zero values) -
+// that is what keeps the addition invisible to every config written before it.
+func TestBuildProviderWiresRetry(t *testing.T) {
+	base := config.ProviderConfig{BaseURL: "https://x.example.com", APIKey: "k"}
+
+	t.Run("no retry block leaves the client defaults", func(t *testing.T) {
+		openai, err := buildProvider(&config.Config{Provider: base})
+		if err != nil {
+			t.Fatalf("buildProvider: %v", err)
+		}
+		if c := openai.(*llm.OpenAIClient); c.MaxAttempts != 0 || c.InitialBackoff != 0 {
+			t.Errorf("openai retry knobs: got %d/%v, want the zero values", c.MaxAttempts, c.InitialBackoff)
+		}
+
+		anth := base
+		anth.Type = config.ProviderTypeAnthropic
+		client, err := buildProvider(&config.Config{Provider: anth})
+		if err != nil {
+			t.Fatalf("buildProvider anthropic: %v", err)
+		}
+		if c := client.(*llm.AnthropicClient); c.MaxAttempts != 0 || c.InitialBackoff != 0 {
+			t.Errorf("anthropic retry knobs: got %d/%v, want the zero values", c.MaxAttempts, c.InitialBackoff)
+		}
+	})
+
+	t.Run("retry block reaches both clients", func(t *testing.T) {
+		retry := &config.RetryConfig{MaxAttempts: 5, InitialBackoff: config.Duration(250 * time.Millisecond)}
+
+		oaCfg := base
+		oaCfg.Retry = retry
+		openai, err := buildProvider(&config.Config{Provider: oaCfg})
+		if err != nil {
+			t.Fatalf("buildProvider: %v", err)
+		}
+		if c := openai.(*llm.OpenAIClient); c.MaxAttempts != 5 || c.InitialBackoff != 250*time.Millisecond {
+			t.Errorf("openai retry knobs not wired: %d/%v", c.MaxAttempts, c.InitialBackoff)
+		}
+
+		anCfg := base
+		anCfg.Type = config.ProviderTypeAnthropic
+		anCfg.Retry = retry
+		client, err := buildProvider(&config.Config{Provider: anCfg})
+		if err != nil {
+			t.Fatalf("buildProvider anthropic: %v", err)
+		}
+		if c := client.(*llm.AnthropicClient); c.MaxAttempts != 5 || c.InitialBackoff != 250*time.Millisecond {
+			t.Errorf("anthropic retry knobs not wired: %d/%v", c.MaxAttempts, c.InitialBackoff)
+		}
+	})
+}
+
 // TestExplainCommand covers the explain wiring: a valid config prints the
 // report to stdout and exits 0 without any provider traffic (the zero-body
 // capturing server fails the test on any request), and every config problem is

@@ -281,6 +281,128 @@ func TestChatRetryAfterCapped(t *testing.T) {
 	}
 }
 
+// TestBackoffDelay is the unit table for the ladder both clients share: the
+// base, the doubling, the Retry-After stretch and its cap in one place.
+func TestBackoffDelay(t *testing.T) {
+	tests := []struct {
+		name       string
+		initial    time.Duration
+		attempt    int
+		retryAfter time.Duration
+		want       time.Duration
+	}{
+		{"default base, first retry", 0, 2, 0, time.Second},
+		{"default base, second retry", 0, 3, 0, 2 * time.Second},
+		{"default base, third retry", 0, 4, 0, 4 * time.Second},
+		{"configured base", 200 * time.Millisecond, 2, 0, 200 * time.Millisecond},
+		{"configured base doubles", 200 * time.Millisecond, 4, 0, 800 * time.Millisecond},
+		{"retry-after stretches", 200 * time.Millisecond, 2, 7 * time.Second, 7 * time.Second},
+		{"retry-after never shrinks", 10 * time.Second, 2, time.Second, 10 * time.Second},
+		{"retry-after capped", 0, 2, time.Hour, maxRetryAfter},
+		// Unreachable through the loops (they only call this from attempt 2)
+		// but pinned: a negative shift count would be a runtime panic.
+		{"attempt below the ladder", 200 * time.Millisecond, 1, 0, 200 * time.Millisecond},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := backoffDelay(tt.initial, tt.attempt, tt.retryAfter); got != tt.want {
+				t.Errorf("backoffDelay(%v, %d, %v) = %v, want %v", tt.initial, tt.attempt, tt.retryAfter, got, tt.want)
+			}
+		})
+	}
+}
+
+// recordDelays captures the backoff waits a retry loop asks for, so a test can
+// assert the SEQUENCE and not merely the number of sleeps.
+func recordDelays(delays *[]time.Duration) func(context.Context, time.Duration) error {
+	return func(_ context.Context, d time.Duration) error {
+		*delays = append(*delays, d)
+		return nil
+	}
+}
+
+// retryTwiceServer answers the first two calls with 429 and then succeeds, so a
+// test observes exactly two backoff waits.
+func retryTwiceServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	var calls int
+	return chatServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		calls++
+		if calls <= 2 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(okBody("ok")))
+	})
+}
+
+// TestChatBackoffHonorsInitialBackoff: the exponential sequence is based on
+// InitialBackoff, so a config that wants a tighter (or looser) retry rhythm
+// gets 200ms/400ms instead of the built-in 1s/2s.
+func TestChatBackoffHonorsInitialBackoff(t *testing.T) {
+	srv := retryTwiceServer(t)
+
+	var delays []time.Duration
+	client := &OpenAIClient{
+		BaseURL:        srv.URL + "/v1",
+		InitialBackoff: 200 * time.Millisecond,
+		Sleep:          recordDelays(&delays),
+	}
+	if _, err := client.Chat(context.Background(), Request{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{200 * time.Millisecond, 400 * time.Millisecond}
+	if !slices.Equal(delays, want) {
+		t.Errorf("delays: got %v want %v", delays, want)
+	}
+}
+
+// TestChatBackoffDefaultsUnchanged: a client that sets no InitialBackoff (the
+// shape cmd builds for a config without a retry block) keeps the 1s/2s ladder
+// every previous release had.
+func TestChatBackoffDefaultsUnchanged(t *testing.T) {
+	srv := retryTwiceServer(t)
+
+	var delays []time.Duration
+	client := &OpenAIClient{BaseURL: srv.URL + "/v1", Sleep: recordDelays(&delays)}
+	if _, err := client.Chat(context.Background(), Request{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []time.Duration{time.Second, 2 * time.Second}
+	if !slices.Equal(delays, want) {
+		t.Errorf("delays: got %v want %v", delays, want)
+	}
+}
+
+// TestChatRetryAfterStillStretchesCustomBackoff: the provider's Retry-After
+// wish outranks a short configured backoff. Retrying earlier than the rate
+// limiter allows only burns the attempt budget for nothing.
+func TestChatRetryAfterStillStretchesCustomBackoff(t *testing.T) {
+	var calls int
+	srv := chatServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		calls++
+		if calls == 1 {
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(okBody("ok")))
+	})
+
+	var delays []time.Duration
+	client := &OpenAIClient{
+		BaseURL:        srv.URL + "/v1",
+		InitialBackoff: 200 * time.Millisecond,
+		Sleep:          recordDelays(&delays),
+	}
+	if _, err := client.Chat(context.Background(), Request{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(delays) != 1 || delays[0] != 7*time.Second {
+		t.Errorf("delays: got %v want [7s]", delays)
+	}
+}
+
 func TestChatContextCancel(t *testing.T) {
 	srv := chatServer(t, func(w http.ResponseWriter, _ map[string]any) {
 		w.WriteHeader(http.StatusInternalServerError) // would retry...

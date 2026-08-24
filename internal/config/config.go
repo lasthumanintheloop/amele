@@ -154,6 +154,10 @@ type ProviderConfig struct {
 	// TopP is nucleus sampling, in (0, 1]. Pointer for the same reason as
 	// Temperature: absent means "the provider decides".
 	TopP *float64 `yaml:"top_p"`
+	// Retry tunes how a transient provider failure (429, 5xx, a dropped
+	// connection) is retried. A nil block means the client defaults, which is
+	// what every config written before the block existed gets.
+	Retry *RetryConfig `yaml:"retry"`
 	// Params is the escape hatch: arbitrary keys merged verbatim into the
 	// request body root, for provider extras amele has no neutral field for.
 	// Keys amele writes itself are rejected at validation time (see
@@ -177,6 +181,36 @@ type ReasoningConfig struct {
 	// validation error rather than a silently dropped field.
 	BudgetTokens int `yaml:"budget_tokens"`
 }
+
+// RetryConfig tunes the transient-failure retry loop both provider clients
+// share. WHICH failures are retried is not configurable: 429, 5xx and network
+// errors are transient by definition, and everything else is a request the
+// provider will refuse just as firmly on the next attempt.
+type RetryConfig struct {
+	// MaxAttempts is the TOTAL number of tries for one provider call (1
+	// initial + retries), so 1 disables retrying. Zero means the client
+	// default (3).
+	MaxAttempts int `yaml:"max_attempts"`
+	// InitialBackoff is the wait before the second attempt; each further
+	// attempt doubles it. Zero means the client default (1s). A provider's
+	// Retry-After header still stretches an individual wait (capped at 60s):
+	// retrying earlier than the rate limiter allows only burns the attempt
+	// budget.
+	InitialBackoff Duration `yaml:"initial_backoff"`
+}
+
+// The bounds on provider.retry. They are wide enough for every rhythm an
+// operator has a reason to ask for and narrow enough that a slipped digit
+// (max_attempts: 100, initial_backoff: 10m) cannot turn one rate-limited turn
+// into an unattended run that looks hung. They bound each knob, not their
+// product: the wall-clock kill switch for a whole run stays limits.timeout,
+// which cuts a backoff wait short like any other wait.
+const (
+	retryMinAttempts = 1
+	retryMaxAttempts = 10
+	retryMinBackoff  = 100 * time.Millisecond
+	retryMaxBackoff  = 60 * time.Second
+)
 
 // effortValues lists the accepted provider.reasoning.effort spellings, in
 // increasing depth, for validation and for error messages.
@@ -958,7 +992,29 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 	if c.Provider.MaxOutputTokens < 0 {
 		add("provider.max_output_tokens must not be negative")
 	}
+	c.validateRetry(add)
 	c.validateProviderTuning(add)
+}
+
+// validateRetry checks the retry policy bounds. Zero is "omitted" for both
+// fields - the struct cannot tell an absent key from a written 0, and every
+// other budget in this file spells "use the default" that way - so only a value
+// the operator actually chose is range-checked.
+func (c *Config) validateRetry(add func(format string, args ...any)) {
+	r := c.Provider.Retry
+	if r == nil {
+		return
+	}
+	if r.MaxAttempts != 0 && (r.MaxAttempts < retryMinAttempts || r.MaxAttempts > retryMaxAttempts) {
+		add("provider.retry.max_attempts must be between %d and %d (got %d; omit for the default 3, or set 1 to disable retrying)",
+			retryMinAttempts, retryMaxAttempts, r.MaxAttempts)
+	}
+	// The bounds are spelled literally rather than formatted from the constants
+	// above: time.Duration.String() renders the ceiling as "1m0s", and an error
+	// message must show the units the operator typed in the file.
+	if backoff := r.InitialBackoff.Std(); backoff != 0 && (backoff < retryMinBackoff || backoff > retryMaxBackoff) {
+		add("provider.retry.initial_backoff must be between 100ms and 60s (got %s; omit for the default 1s)", backoff)
+	}
 }
 
 // validateProviderTuning checks the dialect and the knobs whose legality

@@ -43,11 +43,39 @@ const defaultMaxAttempts = 3
 // not set provider.request_timeout.
 const defaultRequestTimeout = 120 * time.Second
 
+// defaultInitialBackoff is the wait before the second attempt when the config
+// does not set provider.retry.initial_backoff.
+const defaultInitialBackoff = time.Second
+
 // maxRetryAfter caps how long a provider's Retry-After header can stretch one
 // backoff wait. Without a cap a misbehaving proxy could stall the run until
 // the run timeout fires - which would then misattribute the provider problem
 // to the user's budget (exit 3).
 const maxRetryAfter = 60 * time.Second
+
+// backoffDelay returns how long to wait before attempt (>= 2): an exponential
+// ladder rooted at initial (0 means defaultInitialBackoff), stretched - never
+// shrunk - to the provider's Retry-After wish when one was sent, and that
+// stretch capped at maxRetryAfter.
+//
+// Shared by both clients on purpose: a retry rhythm that differed between the
+// OpenAI-compatible and the native Anthropic wire would be a trap for a config
+// that switches wires, and provider.retry configures exactly one behavior.
+func backoffDelay(initial time.Duration, attempt int, retryAfter time.Duration) time.Duration {
+	if initial <= 0 {
+		initial = defaultInitialBackoff
+	}
+	// The ladder starts at initial on the first retry (attempt 2). The shift is
+	// clamped rather than trusting the caller: a negative shift count is a
+	// runtime panic in Go, and library code must not panic
+	// (docs/engineering.md §5.3).
+	shift := max(attempt-2, 0)
+	delay := initial << shift
+	if retryAfter > delay {
+		delay = min(retryAfter, maxRetryAfter)
+	}
+	return delay
+}
 
 // OpenAIClient talks to any OpenAI-compatible /chat/completions endpoint.
 // That single wire format covers OpenAI, Ollama, vLLM, Groq, OpenRouter and
@@ -73,6 +101,10 @@ type OpenAIClient struct {
 	RequestTimeout time.Duration
 	// MaxAttempts overrides defaultMaxAttempts when > 0.
 	MaxAttempts int
+	// InitialBackoff is the wait before the second attempt, doubled for every
+	// attempt after that. Zero means defaultInitialBackoff (1s). Wired from
+	// the config's provider.retry.initial_backoff.
+	InitialBackoff time.Duration
 	// Sleep is injectable for tests; nil means context-aware sleeping.
 	// Determinism rule (docs/engineering.md §5.4): time-dependent behavior must be
 	// injectable.
@@ -287,15 +319,11 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	dropped := false
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
-			// Exponential backoff: 1s, 2s, 4s... stretched (never shrunk)
-			// to the provider's Retry-After when one was sent, and capped
-			// by the caller's context deadline (sleep aborts when ctx is
-			// done).
-			delay := time.Duration(1<<(attempt-2)) * time.Second
-			if retryAfter > delay {
-				delay = min(retryAfter, maxRetryAfter)
-			}
-			if err := c.sleep(ctx, delay); err != nil {
+			// Exponential backoff from InitialBackoff (1s, 2s, 4s... by
+			// default), stretched to the provider's Retry-After when one was
+			// sent, and bounded by the caller's context deadline (sleep aborts
+			// when ctx is done).
+			if err := c.sleep(ctx, backoffDelay(c.InitialBackoff, attempt, retryAfter)); err != nil {
 				return nil, fmt.Errorf("%w: %v (last error: %v)", ErrProvider, err, lastErr)
 			}
 		}

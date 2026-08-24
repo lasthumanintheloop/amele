@@ -1684,6 +1684,123 @@ func TestValidateProviderTuning(t *testing.T) {
 	}
 }
 
+// TestValidateProviderRetry is the rule table for the retry policy. The bounds
+// exist because both knobs multiply: a large max_attempts with a large
+// initial_backoff turns one rate-limited turn into a wait longer than most cron
+// windows, and the operator would see it as a hung run, not as a setting.
+func TestValidateProviderRetry(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name    string
+		retry   *RetryConfig
+		wantSub string // "" means the config must validate
+	}{
+		{"no retry block", nil, ""},
+		{"empty retry block means defaults", &RetryConfig{}, ""},
+
+		// Zero is "omitted" for both fields: the struct cannot tell an absent
+		// key from a written 0, and every other budget in this file spells
+		// "use the default" that way (limits.timeout, request_timeout).
+		{"explicit zero attempts is the default", &RetryConfig{MaxAttempts: 0}, ""},
+		{"explicit zero backoff is the default", &RetryConfig{InitialBackoff: 0}, ""},
+
+		{"one attempt disables retrying", &RetryConfig{MaxAttempts: 1}, ""},
+		{"ten attempts is the ceiling", &RetryConfig{MaxAttempts: 10}, ""},
+		{"eleven attempts", &RetryConfig{MaxAttempts: 11}, "provider.retry.max_attempts"},
+		{"negative attempts", &RetryConfig{MaxAttempts: -1}, "provider.retry.max_attempts"},
+
+		{"backoff at the floor", &RetryConfig{InitialBackoff: Duration(100 * time.Millisecond)}, ""},
+		{"backoff at the ceiling", &RetryConfig{InitialBackoff: Duration(60 * time.Second)}, ""},
+		{"backoff below the floor", &RetryConfig{InitialBackoff: Duration(50 * time.Millisecond)}, "provider.retry.initial_backoff"},
+		{"backoff above the ceiling", &RetryConfig{InitialBackoff: Duration(90 * time.Second)}, "provider.retry.initial_backoff"},
+		{"negative backoff", &RetryConfig{InitialBackoff: Duration(-time.Second)}, "provider.retry.initial_backoff"},
+
+		{"both knobs set", &RetryConfig{MaxAttempts: 5, InitialBackoff: Duration(2 * time.Second)}, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tuningBase(dir)
+			cfg.Provider.Retry = tt.retry
+			err := cfg.Validate()
+			if tt.wantSub == "" {
+				if err != nil {
+					t.Fatalf("config must validate, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected a violation")
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error should wrap ErrInvalid: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not mention %q", err, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestValidateProviderRetryMessagesAreActionable pins the two messages
+// themselves: an out-of-range value is only fixable if the error states the
+// accepted range and the default the operator gets by deleting the key.
+func TestValidateProviderRetryMessagesAreActionable(t *testing.T) {
+	cfg := tuningBase(t.TempDir())
+	cfg.Provider.Retry = &RetryConfig{MaxAttempts: 99, InitialBackoff: Duration(5 * time.Millisecond)}
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected violations")
+	}
+	for _, want := range []string{
+		"provider.retry.max_attempts", "1 and 10", "default 3",
+		"provider.retry.initial_backoff", "100ms and 60s", "default 1s",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestLoadProviderRetry pins the YAML surface: the block round-trips from the
+// file into the struct, durations included, and a config that omits it keeps a
+// nil block - "the client decides" must stay distinguishable from "the file
+// asked for zero".
+func TestLoadProviderRetry(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+  api_key: ${API_KEY}
+  retry:
+    max_attempts: 5
+    initial_backoff: 250ms
+`)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.Retry == nil {
+		t.Fatal("retry block was dropped")
+	}
+	if cfg.Provider.Retry.MaxAttempts != 5 {
+		t.Errorf("max_attempts = %d, want 5", cfg.Provider.Retry.MaxAttempts)
+	}
+	if got := cfg.Provider.Retry.InitialBackoff.Std(); got != 250*time.Millisecond {
+		t.Errorf("initial_backoff = %v, want 250ms", got)
+	}
+
+	plain, err := Load(writeConfig(t, dir, minimalYAML), envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load minimal: %v", err)
+	}
+	if plain.Provider.Retry != nil {
+		t.Errorf("a config without a retry block gained one: %+v", plain.Provider.Retry)
+	}
+}
+
 // TestValidateSamplingWireBeatsDialect pins WHICH rule answers when both could
 // narrow the temperature range. The wire wins: with type anthropic the dialect
 // is documented as ignored (config.schema.json), so an operator who left a
