@@ -579,7 +579,7 @@ func TestParallelDeniedCallAborts(t *testing.T) {
 		return Ruling{Decision: Allow}, nil
 	}
 
-	events, _, err := runWithEvents(t, context.Background(), l)
+	events, res, err := runWithEvents(t, context.Background(), l)
 	if err == nil {
 		t.Fatal("expected the run to abort on the denial")
 	}
@@ -588,6 +588,14 @@ func TestParallelDeniedCallAborts(t *testing.T) {
 	}
 	if peak := meter.Peak(); peak != 1 {
 		t.Errorf("the denied call must not have run: peak %d want 1", peak)
+	}
+	// The summary must agree with the log it summarizes. c2 was already in
+	// flight when c1's ruling aborted the run, so its tool_result is in the
+	// file; a count driven by the truncated message history reported 0 tool
+	// calls next to two tool_result events. c1 is not counted, exactly as the
+	// sequential path does not count the call it aborted on.
+	if res.ToolCalls != 1 {
+		t.Errorf("run_end tool_calls: got %d want 1 (the call that ran before the abort)", res.ToolCalls)
 	}
 }
 

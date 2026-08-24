@@ -409,9 +409,14 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 		// Outputs come back positionally: whether the calls ran one after the
 		// other or side by side, outputs[i] answers ToolCalls[i], and a run
 		// that aborted mid-turn returns the outputs it managed to produce.
-		outputs, err := l.dispatchCalls(ctx, l.TurnBase+turn, resp.Message.ToolCalls)
+		outputs, published, err := l.dispatchCalls(ctx, l.TurnBase+turn, resp.Message.ToolCalls)
+		// CONTRACT: run_end.tool_calls counts what the LOG says ran, not what
+		// the model was told about. On the abort path those two diverge: a call
+		// that was already in flight is published and then withheld from the
+		// history, and counting the history undercounted the tool_result events
+		// sitting in the same file.
+		res.ToolCalls += published
 		for i, output := range outputs {
-			res.ToolCalls++
 			messages = append(messages, llm.Message{
 				Role:       llm.RoleTool,
 				Content:    output,
@@ -544,15 +549,22 @@ type callResult struct {
 // dispatchCalls runs one turn's tool calls and returns their outputs
 // positionally: outputs[i] answers calls[i]. A non-nil error aborts the run,
 // and the outputs returned alongside it are the ones that must still be
-// counted and appended (the sequential loop's behavior, preserved).
+// appended to the history (the sequential loop's behavior, preserved).
+//
+// published is how many results were reported to the session, excluding the
+// one that aborted the run. It is returned SEPARATELY from the outputs because
+// the two answer different questions: outputs is what the model gets to see
+// next, published is what the log already says happened. They only differ on
+// the parallel abort path, where calls that were already in flight are logged
+// but never reach the model.
 //
 // turn is the session-numbered turn (TurnBase already applied) and is used for
 // progress events only - the loop's own budget counts elsewhere.
-func (l *Loop) dispatchCalls(ctx context.Context, turn int, calls []llm.ToolCall) ([]string, error) {
+func (l *Loop) dispatchCalls(ctx context.Context, turn int, calls []llm.ToolCall) (outputs []string, published int, err error) {
 	if l.parallelizable(calls) {
 		return l.dispatchParallel(ctx, turn, calls)
 	}
-	outputs := make([]string, 0, len(calls))
+	outputs = make([]string, 0, len(calls))
 	for _, call := range calls {
 		l.announce(turn, call)
 		r := l.approveCall(ctx, turn, call)
@@ -562,11 +574,12 @@ func (l *Loop) dispatchCalls(ctx context.Context, turn int, calls []llm.ToolCall
 		}
 		output, err := l.publish(call, *r)
 		if err != nil {
-			return outputs, err
+			return outputs, published, err
 		}
+		published++
 		outputs = append(outputs, output)
 	}
-	return outputs, nil
+	return outputs, published, nil
 }
 
 // parallelizable reports whether this turn's calls may run concurrently. All
@@ -632,7 +645,7 @@ const maxParallelToolCalls = 8
 // which wave they ran in, and results are slotted by index, so a turn wider
 // than maxParallelToolCalls produces exactly the events an unbounded
 // dispatcher would - only spread over more waves.
-func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolCall) ([]string, error) {
+func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolCall) (outputs []string, published int, err error) {
 	// Announced up front, in call order: the tool_call events say what the
 	// MODEL asked for, and that fact is known before any tool runs.
 	for _, call := range calls {
@@ -682,21 +695,26 @@ func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolC
 	}
 	wg.Wait()
 
-	outputs := make([]string, 0, len(calls))
+	outputs = make([]string, 0, len(calls))
 	var failure error
 	for i, call := range calls {
-		output, err := l.publish(call, results[i])
-		if err != nil {
+		output, pubErr := l.publish(call, results[i])
+		if pubErr != nil {
 			// The first failure in CALL order is the run's failure - not the
 			// first in completion order, which would make the exit code depend
 			// on tool latency. The remaining results are still logged: those
 			// tools ran, and a tool_call without its tool_result would be a
 			// hole in the audit trail.
 			if failure == nil {
-				failure = err
+				failure = pubErr
 			}
 			continue
 		}
+		// Counted whether or not the run is already over: this call ran and
+		// its tool_result is in the file, so a summary that skipped it would
+		// contradict the log it summarizes. The abort short-circuit below
+		// governs the HISTORY only.
+		published++
 		if failure == nil {
 			// After a failure the run is over, so later outputs are not
 			// appended to the history - the sequential path would never have
@@ -704,7 +722,7 @@ func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolC
 			outputs = append(outputs, output)
 		}
 	}
-	return outputs, failure
+	return outputs, published, failure
 }
 
 // announce logs the tool_call event and the "model requested" progress line.
