@@ -379,7 +379,9 @@ provider; what differs is who enforces it.
   the schema itself. No capability probe is involved: sending a `json_schema`
   those endpoints cannot accept would buy a guaranteed 400 and a second
   round-trip on **every turn**, and the repeat would then carry no JSON
-  instruction at all.
+  instruction at all. An endpoint that refuses `response_format` *entirely*
+  still degrades the same way the fallback below does - one immediate repeat
+  without the field - so a strict proxy costs the JSON hint, not the run.
 - **By fallback** on `kimi`, whose support is ambiguous (below). When the
   endpoint answers a schema-carrying request with a 400 naming the field, amele
   repeats that one request without it - once, immediately, costing no retry

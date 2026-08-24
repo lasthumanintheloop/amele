@@ -335,14 +335,18 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	// dropped remembers that this response was produced WITHOUT provider-native
 	// schema enforcement. On the json_object dialects it is known before the
 	// first request: that mode carries no schema at all, so there is nothing to
-	// probe for and no 400 to spend a round-trip on.
+	// probe for.
+	//
+	// The stripped body is built for json_object too. Skipping the SCHEMA probe
+	// must not cost the degradation path: an endpoint that refuses
+	// response_format outright - an older self-hosted build, a strict proxy -
+	// would otherwise turn a run the local validate+retry layer could have
+	// completed (exit 0) into a provider error (exit 5). It stays free when the
+	// endpoint is healthy, because the extra round-trip fires only on a real 400.
 	var fallbackBody []byte
 	dropped := false
-	switch {
-	case wire.ResponseFormat == nil:
-	case wire.ResponseFormat.JSONSchema == nil:
-		dropped = true
-	default:
+	if wire.ResponseFormat != nil {
+		dropped = wire.ResponseFormat.JSONSchema == nil
 		wire.ResponseFormat = nil
 		fallbackBody, err = encodeBody(wire, fields)
 		if err != nil {

@@ -704,6 +704,54 @@ func TestChatJSONObjectDialectSkipsTheProbe(t *testing.T) {
 	}
 }
 
+// TestChatJSONObjectDialectStillDegrades: skipping the json_schema PROBE must
+// not cost the degradation path. An endpoint behind a json_object dialect that
+// refuses response_format outright - an older self-hosted build, a proxy that
+// strips nothing and validates everything - would otherwise turn a run that
+// the local validate+retry layer could have completed (exit 0) into a provider
+// error (exit 5).
+//
+// It costs nothing when the endpoint is healthy: the stripped body is built
+// up-front, but the second round-trip happens only on an actual 400.
+func TestChatJSONObjectDialectStillDegrades(t *testing.T) {
+	var hadFormat []bool
+	srv := chatServer(t, func(w http.ResponseWriter, req map[string]any) {
+		_, present := req["response_format"]
+		hadFormat = append(hadFormat, present)
+		if present {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error": {"message": "response_format is not supported by this endpoint"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(okBody(`{"ok":true}`)))
+	})
+
+	var sleeps int
+	client := &OpenAIClient{BaseURL: srv.URL + "/v1", Dialect: DialectDeepSeek, Sleep: noSleep(t, &sleeps)}
+	resp, err := client.Chat(context.Background(), Request{
+		Model:          "m",
+		Messages:       []Message{{Role: RoleUser, Content: "x"}},
+		ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
+	})
+	if err != nil {
+		t.Fatalf("a refused response_format must degrade, not fail the run: %v", err)
+	}
+	if resp.Message.Content != `{"ok":true}` {
+		t.Errorf("content: %q", resp.Message.Content)
+	}
+	if want := []bool{true, false}; !slices.Equal(hadFormat, want) {
+		t.Errorf("response_format per request: got %v, want %v", hadFormat, want)
+	}
+	if sleeps != 0 {
+		t.Errorf("the degradation must not sleep on backoff, got %d sleeps", sleeps)
+	}
+	// Already true before the fallback on this dialect (json_object carries no
+	// schema); it must survive the stripped repeat.
+	if !resp.SchemaEnforcementDropped {
+		t.Error("degraded response must be flagged SchemaEnforcementDropped")
+	}
+}
+
 // TestChatSchemaEnforcementNotDropped: a provider that ACCEPTS
 // response_format produced a natively-constrained answer, so the flag stays
 // false - and so does a request that asked for no schema at all (there was
