@@ -386,9 +386,9 @@ func anWireCases() []anWireCase {
 				Temperature: ptr(0.0),
 				TopP:        ptr(0.9),
 				Extra: map[string]json.RawMessage{
-					"metadata":    json.RawMessage(`{"user_id":"abc"}`),
-					"top_k":       json.RawMessage(` 40 `),
-					"stop_sequen": json.RawMessage(`["END"]`),
+					"metadata":       json.RawMessage(`{"user_id":"abc"}`),
+					"top_k":          json.RawMessage(` 40 `),
+					"stop_sequences": json.RawMessage(`["END"]`),
 				},
 			},
 		},

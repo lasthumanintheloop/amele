@@ -35,7 +35,8 @@ provider:
   max_output_tokens: 8192     # the per-request output ceiling
   reasoning:
     effort: high              # none | low | medium | high | xhigh | max
-    budget_tokens: 8192       # a token count instead of a level
+    budget_tokens: 8192       # a token count instead of a level;
+                              # anthropic wire / openrouter only
   temperature: 0.2
   top_p: 0.9
   retry:
@@ -120,7 +121,7 @@ What each dialect makes of the same config, on the OpenAI-compatible wire:
 | --- | --- | --- | --- | --- | --- | --- |
 | `openai` | `reasoning_effort` (verbatim) | `max_completion_tokens` | nothing returned on this API | passed through | native `response_format: json_schema` | rejected (400) |
 | `deepseek` | `thinking: {"type":"enabled"}` + `reasoning_effort` (medium->high, xhigh->max); `none` -> `thinking: {"type":"disabled"}` | `max_tokens` | `reasoning_content`, echoed back on **every** later request | passed through (ignored while thinking) | `json_object` + validate + retry | ignored (undocumented, observed) |
-| `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through, `temperature` capped at 1 | `json_object` + validate + retry | not documented; assume rejected (400) |
+| `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through; `temperature` outside `[0, 1]` is a validate error (exit 2) | `json_object` + validate + retry | not documented; assume rejected (400) |
 | `kimi` | `reasoning_effort` (medium->high, xhigh->max), no thinking object | `max_completion_tokens` | `reasoning_content`, echoed back | **config error**: the K-series fixes `temperature`/`top_p` | attempted, then fallback | not documented; assume rejected (400) |
 | `groq` | `reasoning_effort` (verbatim) | `max_completion_tokens` | `reasoning_content` echoed back; a bare `reasoning` is captured for the log only | passed through | `json_schema` sent, then fallback - native support **unverified** | not documented; assume rejected (400) |
 | `openrouter` | `reasoning: {"effort": ...}` (verbatim; `budget_tokens` -> `reasoning: {"max_tokens": N}`) | `max_tokens` | `reasoning_details` array, echoed back verbatim and in order | passed through (the gateway drops what the model cannot take) | native `json_schema` - but see [OpenRouter](#openrouter) | passed through to the upstream provider |
@@ -382,10 +383,10 @@ provider; what differs is who enforces it.
   instruction at all. An endpoint that refuses `response_format` *entirely*
   still degrades the same way the fallback below does - one immediate repeat
   without the field - so a strict proxy costs the JSON hint, not the run.
-- **By fallback** on `kimi`, whose support is ambiguous (below). When the
-  endpoint answers a schema-carrying request with a 400 naming the field, amele
-  repeats that one request without it - once, immediately, costing no retry
-  budget - and enforces the schema itself.
+- **By fallback** on `kimi` and `groq`, whose support is unverified (below).
+  When the endpoint answers a schema-carrying request with a 400 naming the
+  field, amele repeats that one request without it - once, immediately, costing
+  no retry budget - and enforces the schema itself.
 
 "Enforces the schema itself" means the same thing in both cases: the answer is
 validated against `output.schema` and violations are fed back to the model for

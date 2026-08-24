@@ -1,1 +1,1 @@
-{"model":"claude-sonnet-5","max_tokens":8192,"system":"you are a log sentry","messages":[{"role":"user","content":[{"type":"text","text":"scan today's log"}]}],"temperature":0,"top_p":0.9,"metadata":{"user_id":"abc"},"stop_sequen":["END"],"top_k":40}
+{"model":"claude-sonnet-5","max_tokens":8192,"system":"you are a log sentry","messages":[{"role":"user","content":[{"type":"text","text":"scan today's log"}]}],"temperature":0,"top_p":0.9,"metadata":{"user_id":"abc"},"stop_sequences":["END"],"top_k":40}
