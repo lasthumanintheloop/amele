@@ -1065,10 +1065,14 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 // carry for the ACTIVE target: what that dialect/wire writes itself, plus the
 // keys amele reserves on every target.
 //
-// It returns nil when the dialect did not parse - which key is owned is a
-// dialect question, so it is unanswerable then, and the same one-error rule the
-// other dialect-dependent rules follow applies: the dialect is reported once
-// instead of piling on a collision the operator cannot act on yet.
+// When the dialect did not parse it returns the reserved keys ALONE. Which key
+// a dialect writes is a dialect question and is unanswerable then, so the same
+// one-error rule the other dialect-dependent rules follow applies: the dialect
+// is reported once instead of piling on a collision the operator cannot act on
+// yet. The reserved keys are not a dialect question - they are refused on every
+// target, because amele's own machinery cannot survive them - so withholding
+// them would cost the operator a second validate round for a violation that was
+// already answerable, and validate's contract is one pass, every violation.
 func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
 	if c.Provider.Type == ProviderTypeAnthropic {
 		// The dialect is not consulted on this wire, so a leftover (even an
@@ -1076,7 +1080,9 @@ func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
 		return slices.Concat(llm.AnthropicOwnedWireFields(), reservedWireFields)
 	}
 	if !known {
-		return nil
+		// Cloned, like the Concat branches allocate: handing out the package
+		// var would make a shared list writable through a return value.
+		return slices.Clone(reservedWireFields)
 	}
 	return slices.Concat(llm.OwnedWireFields(dialect), reservedWireFields)
 }

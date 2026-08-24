@@ -1947,11 +1947,16 @@ func TestValidateParamsOwnedKeysAreDialectScoped(t *testing.T) {
 	}
 }
 
-// TestValidateParamsSkipsCollisionsOnUnknownDialect: which keys are owned is
-// now a dialect question, so an unparseable dialect makes it unanswerable. The
+// TestValidateParamsSkipsCollisionsOnUnknownDialect: which keys a DIALECT owns
+// is a dialect question, so an unparseable dialect makes it unanswerable. The
 // dialect itself is reported (once); guessing a collision on top would send the
 // operator to the wrong line, exactly as the other dialect-dependent rules
 // already decided.
+//
+// The reserved keys are the exception and are reported in the same pass: they
+// are refused on EVERY target - amele's own machinery cannot survive them - so
+// the dialect has no say, and withholding them would cost the operator a second
+// validate round for a violation that was already answerable.
 func TestValidateParamsSkipsCollisionsOnUnknownDialect(t *testing.T) {
 	cfg := tuningBase(t.TempDir())
 	cfg.Provider.Dialect = "kimi-k3"
@@ -1962,7 +1967,15 @@ func TestValidateParamsSkipsCollisionsOnUnknownDialect(t *testing.T) {
 		t.Fatalf("violations do not report the dialect:\n%s", joined)
 	}
 	if strings.Contains(joined, "provider.params key") {
-		t.Errorf("collision reported against a dialect that did not parse:\n%s", joined)
+		t.Errorf("dialect-owned collision reported against a dialect that did not parse:\n%s", joined)
+	}
+	// Both reserved keys surface in the same pass as the dialect violation.
+	cfg.Provider.Params = map[string]any{"stream": true, "tool_choice": "required"}
+	joined = strings.Join(cfg.Violations(), "\n")
+	for _, key := range []string{"stream", "tool_choice"} {
+		if !strings.Contains(joined, "provider.params key "+strconv.Quote(key)) {
+			t.Errorf("reserved key %q was not reported on an unparseable dialect:\n%s", key, joined)
+		}
 	}
 	// The dialect-independent params rule still fires in the same pass.
 	cfg.Provider.Params = map[string]any{"bad": math.NaN()}
