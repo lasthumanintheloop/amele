@@ -125,6 +125,43 @@ output:
 	}
 }
 
+// TestSchemaProviderTypeGemini pins the published enum against the runtime:
+// `type: gemini` is a valid third wire value in the schema editors consume, a
+// near-miss spelling is not, and the schema does not yet describe anything the
+// runtime cannot accept - the vertex block is a later slice, so mentioning it
+// here would promise a key `amele validate` rejects as unknown.
+func TestSchemaProviderTypeGemini(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const doc = `
+model: gemini-3-pro
+provider:
+  type: gemini
+  api_key: ${GEMINI_API_KEY}
+  reasoning:
+    budget_tokens: 8192
+`
+	if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+		t.Errorf("a gemini provider block does not validate:\n%s", feedback)
+	}
+
+	const misspelled = `
+model: gemini-3-pro
+provider:
+  type: Gemini
+`
+	if _, _, ok := validator.Validate(yamlToJSON(t, []byte(misspelled))); ok {
+		t.Error("schema accepts provider.type \"Gemini\" although the runtime rejects it")
+	}
+
+	if bytes.Contains(SchemaJSONBytes(), []byte("vertex")) {
+		t.Error("the schema mentions vertex, a key the runtime does not accept yet")
+	}
+}
+
 // yamlToJSON decodes a config YAML document and re-encodes it as JSON, the
 // form the schema validator consumes. Both steps must succeed for the test to
 // mean anything, so a failure is fatal rather than reported.

@@ -886,8 +886,8 @@ func TestValidateErrors(t *testing.T) {
 			// The message must list the valid values so a typo is fixable
 			// without reading the docs.
 			"invalid provider type",
-			func(c *Config) { c.Provider.Type = "gemini" },
-			"openai, anthropic",
+			func(c *Config) { c.Provider.Type = "bedrock" },
+			"openai, anthropic, gemini",
 		},
 		{
 			"missing base_url with explicit openai type",
@@ -1154,6 +1154,67 @@ provider:
 	}
 }
 
+// TestProviderTypeGemini pins the third wire value: `type: gemini` round-trips,
+// base_url is optional (the client knows the fixed AI Studio host, exactly as
+// on the anthropic path), and an explicit host override stays valid - proxies
+// in front of the Gemini API are a supported deployment.
+func TestProviderTypeGemini(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, `
+model: gemini-3-pro
+provider:
+  type: gemini
+  api_key: ${API_KEY}
+  max_output_tokens: 4096
+`)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.Type != ProviderTypeGemini {
+		t.Errorf("type: got %q want %q", cfg.Provider.Type, ProviderTypeGemini)
+	}
+	if cfg.Provider.MaxOutputTokens != 4096 {
+		t.Errorf("max_output_tokens: got %d want 4096", cfg.Provider.MaxOutputTokens)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("gemini without base_url must validate: %v", err)
+	}
+
+	cfg.Provider.BaseURL = "https://proxy.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("gemini with explicit base_url must validate: %v", err)
+	}
+}
+
+// TestGeminiWireRejectsDialect pins the message, not just the refusal: the
+// dialect names a variation of the OPENAI wire, so on the gemini wire its value
+// is never parsed - whatever it spells, the fix is to delete the line. A config
+// that also misspells it must therefore hear about the wire, not about the
+// dialect vocabulary, which would send the operator to correct a key that has
+// to go.
+func TestGeminiWireRejectsDialect(t *testing.T) {
+	for _, dialect := range []string{"kimi", "not-a-dialect"} {
+		t.Run(dialect, func(t *testing.T) {
+			cfg := tuningBase(t.TempDir())
+			cfg.Provider.Type = ProviderTypeGemini
+			cfg.Provider.BaseURL = ""
+			cfg.Provider.Dialect = dialect
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("a dialect on the gemini wire must be refused")
+			}
+			if !strings.Contains(err.Error(), "remove it for type gemini") {
+				t.Errorf("error %q does not tell the operator to remove the dialect", err)
+			}
+			if strings.Contains(err.Error(), "unknown dialect") {
+				t.Errorf("error %q blames the dialect vocabulary; on this wire the key itself is wrong", err)
+			}
+		})
+	}
+}
+
 // TestProviderTypeOpenAIParity: "" and "openai" are the same OpenAI-compatible
 // path - both accept a valid base_url and both keep requiring one.
 func TestProviderTypeOpenAIParity(t *testing.T) {
@@ -1408,7 +1469,7 @@ func TestValidateProviderTuning(t *testing.T) {
 		{
 			"budget_tokens on the openai dialect",
 			func(c *Config) { c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192} },
-			"budget_tokens is only mapped for anthropic wire or openrouter dialect",
+			"budget_tokens is only mapped for the anthropic or gemini wire, or the openrouter dialect",
 		},
 		{
 			"budget_tokens on the deepseek dialect",
@@ -1416,7 +1477,7 @@ func TestValidateProviderTuning(t *testing.T) {
 				c.Provider.Dialect = "deepseek"
 				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
 			},
-			"budget_tokens is only mapped for anthropic wire or openrouter dialect",
+			"budget_tokens is only mapped for the anthropic or gemini wire, or the openrouter dialect",
 		},
 		{
 			"budget_tokens on the openrouter dialect",
@@ -1434,6 +1495,92 @@ func TestValidateProviderTuning(t *testing.T) {
 				// Below the cap the client sends when max_output_tokens is
 				// unset - see the implicit-cap cases under Rule 9.
 				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 4096}
+			},
+			"",
+		},
+
+		// Rule 3b: the gemini wire carries a thinkingBudget of its own
+		// (thinkingConfig.thinkingBudget on the 2.5-era models), so a budget
+		// alone is a mapped, legal request there - and the LEVEL and the count
+		// are alternatives: the API 400s when both fields arrive.
+		{
+			"budget_tokens on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
+		{
+			"effort alone on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "high"}
+			},
+			"",
+		},
+		{
+			"effort and budget_tokens together on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "high", BudgetTokens: 8192}
+			},
+			"gemini accepts thinkingLevel or thinkingBudget, not both",
+		},
+		{
+			// The pair is a relation between two gemini-wire fields, so an
+			// illegal dialect (itself reported) must not swallow it: validate
+			// owes one pass, every violation.
+			"effort and budget_tokens together survive a dialect on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Dialect = "kimi"
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "high", BudgetTokens: 8192}
+			},
+			"gemini accepts thinkingLevel or thinkingBudget, not both",
+		},
+		{
+			// The same pair is legal on the openrouter gateway, which converts
+			// the budget itself: this rule is about the gemini wire only.
+			"effort and budget_tokens together is not the openrouter rule",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "high", BudgetTokens: 8192}
+			},
+			"",
+		},
+		{
+			// Deliberately NOT a rule: "none" maps to thinkingBudget 0 on the
+			// 2.5-era models and is refused by the Gemini 3 generation, and
+			// validate cannot know which generation a model string names. It
+			// stays a runtime error with a mapped message (spec §Mapping),
+			// because refusing it here would reject a combination that works.
+			"effort none on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{Effort: "none"}
+			},
+			"",
+		},
+		{
+			"dialect on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Dialect = "deepseek"
+			},
+			"provider.dialect: \"deepseek\" applies to the openai wire; remove it for type gemini",
+		},
+		{
+			"gemini without a dialect",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
 			},
 			"",
 		},
@@ -1541,6 +1688,48 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) { c.Provider.Params = map[string]any{"verbosity": "low", "clear_thinking": false} },
 			"",
 		},
+		{
+			// The gemini wire owns a different set of body keys than the openai
+			// one, in both spellings the API accepts.
+			"params collides with a gemini owned field",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Params = map[string]any{"generationConfig": map[string]any{"topK": 5}}
+			},
+			`provider.params key "generationConfig"`,
+		},
+		{
+			"params collides with a gemini owned field in snake_case",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Params = map[string]any{"safety_settings": []any{}}
+			},
+			`provider.params key "safety_settings"`,
+		},
+		{
+			// ... and an openai-wire key amele never writes on this wire stays
+			// reachable, exactly as thinking does on kimi.
+			"params messages is allowed on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Params = map[string]any{"messages": []any{}}
+			},
+			"",
+		},
+		{
+			// The reserved keys are refused on EVERY target: amele's transport
+			// reads a single JSON body and its loop owns the tool protocol.
+			"params stream is refused on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Params = map[string]any{"stream": true}
+			},
+			`provider.params key "stream"`,
+		},
 
 		// Rule 7: ranges. They are total for the dialect, so they belong in
 		// validate rather than in a runtime error message.
@@ -1584,6 +1773,28 @@ func TestValidateProviderTuning(t *testing.T) {
 				c.Provider.Temperature = ptrFloat(1)
 			},
 			"",
+		},
+		{
+			// The gemini wire documents temperature 0..2 like the OpenAI
+			// baseline, so it keeps the baseline ceiling: Google's advice to
+			// leave Gemini 3 at 1.0 is a recommendation per model generation,
+			// not a total limit of the wire, and explain reports it as a note.
+			"gemini wire keeps the baseline temperature ceiling",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Temperature = ptrFloat(1.5)
+			},
+			"",
+		},
+		{
+			"gemini wire still refuses a temperature above the baseline",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.Temperature = ptrFloat(2.5)
+			},
+			"provider.temperature",
 		},
 		{
 			"glm dialect keeps the anthropic ceiling on the anthropic wire",

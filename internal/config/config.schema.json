@@ -11,20 +11,20 @@
     },
     "provider": {
       "type": "object",
-      "description": "The LLM endpoint the agent talks to: an OpenAI-compatible HTTP API (the default) or the native Anthropic Messages API, selected by type.",
+      "description": "The LLM endpoint the agent talks to: an OpenAI-compatible HTTP API (the default), the native Anthropic Messages API, or the native Google Gemini API, selected by type.",
       "additionalProperties": false,
       "properties": {
         "type": {
-          "enum": ["openai", "anthropic"],
-          "description": "Wire protocol: \"openai\" for OpenAI-compatible endpoints (also the meaning when omitted), \"anthropic\" for the native Anthropic Messages API."
+          "enum": ["openai", "anthropic", "gemini"],
+          "description": "Wire protocol: \"openai\" for OpenAI-compatible endpoints (also the meaning when omitted), \"anthropic\" for the native Anthropic Messages API, \"gemini\" for the native Google Gemini generateContent API. Each is its own wire family, not a variation of another: dialect describes the openai wire only."
         },
         "base_url": {
           "type": "string",
-          "description": "API root, e.g. \"https://api.openai.com/v1\". Required for OpenAI-compatible endpoints. With type \"anthropic\" it may be omitted (the client defaults to the official endpoint) and must NOT end with /v1 - the client appends /v1/messages itself."
+          "description": "API root, e.g. \"https://api.openai.com/v1\". Required for OpenAI-compatible endpoints. With type \"anthropic\" it may be omitted (the client defaults to the official endpoint) and must NOT end with /v1 - the client appends /v1/messages itself. With type \"gemini\" it may likewise be omitted (the client defaults to the fixed Gemini API host); a value overrides the host for proxied deployments."
         },
         "api_key": {
           "type": "string",
-          "description": "Bearer token for the provider. Must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are rejected at load time. An empty key is valid for local endpoints such as Ollama."
+          "description": "Credential for the provider - the bearer token on the openai and anthropic wires, the x-goog-api-key header with type \"gemini\". Must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are rejected at load time. An empty key is valid for local endpoints such as Ollama."
         },
         "request_timeout": {
           "$ref": "#/$defs/duration",
@@ -38,7 +38,7 @@
         },
         "dialect": {
           "enum": ["openai", "deepseek", "glm", "kimi", "groq", "openrouter"],
-          "description": "Variation of the OpenAI-compatible wire format this endpoint speaks, which decides how reasoning, sampling and the output cap are mapped onto the request. Omitted means \"openai\", the baseline. It is explicit rather than guessed from base_url: a wrong guess would send a knob to the wrong field name and surface only as a provider error later. Ignored when type is \"anthropic\"."
+          "description": "Variation of the OpenAI-compatible wire format this endpoint speaks, which decides how reasoning, sampling and the output cap are mapped onto the request. Omitted means \"openai\", the baseline. It is explicit rather than guessed from base_url: a wrong guess would send a knob to the wrong field name and surface only as a provider error later. Ignored when type is \"anthropic\", and rejected at load time when type is \"gemini\" - that is a different wire family, so a dialect there would name a mapping the request never takes."
         },
         "reasoning": {
           "type": "object",
@@ -53,7 +53,7 @@
               "type": ["integer", "string"],
               "minimum": 0,
               "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
-              "description": "Caps the thinking with a token count instead of a level. 0 (or omitted) means unset. Only budget-based targets can carry it: type \"anthropic\", or dialect \"openrouter\" (which converts it). Anywhere else it is a config error rather than a silently dropped field. May also be a whole-value ${VAR} environment reference resolved at load time."
+              "description": "Caps the thinking with a token count instead of a level. 0 (or omitted) means unset. Only budget-based targets can carry it: type \"anthropic\", type \"gemini\" (thinkingConfig.thinkingBudget), or dialect \"openrouter\" (which converts it). Anywhere else it is a config error rather than a silently dropped field. With type \"gemini\" it is an ALTERNATIVE to effort, never a companion: setting both is a config error, because the Gemini API refuses a request carrying thinkingLevel and thinkingBudget together. May also be a whole-value ${VAR} environment reference resolved at load time."
             }
           }
         },
@@ -91,7 +91,7 @@
         },
         "params": {
           "type": "object",
-          "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself ON THE ACTIVE TARGET are rejected at load time - model, messages, tools, response_format, temperature, top_p, the dialect's cap and reasoning spellings, and thinking/output_config/system on the anthropic wire - so params can extend a request but never rewrite one. stream and tool_choice are refused everywhere: amele's transport reads a single JSON body and its loop owns the tool protocol. A key the active target never writes (thinking on kimi) stays available. Values must be JSON-serializable."
+          "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself ON THE ACTIVE TARGET are rejected at load time - model, messages, tools, response_format, temperature, top_p, the dialect's cap and reasoning spellings, thinking/output_config/system on the anthropic wire, and contents/systemInstruction/tools/toolConfig/generationConfig/safetySettings/cachedContent (in either spelling) on the gemini wire - so params can extend a request but never rewrite one. stream and tool_choice are refused everywhere: amele's transport reads a single JSON body and its loop owns the tool protocol. A key the active target never writes (thinking on kimi) stays available. Values must be JSON-serializable."
         }
       }
     },

@@ -98,24 +98,32 @@ const (
 	ProviderTypeOpenAI = "openai"
 	// ProviderTypeAnthropic selects the native Anthropic Messages client.
 	ProviderTypeAnthropic = "anthropic"
+	// ProviderTypeGemini selects the native Google Gemini generateContent
+	// client. It is a THIRD wire family, not a variation of the OpenAI one:
+	// the request body, the reasoning knob and the tool protocol all differ,
+	// which is why Dialect (an openai-wire concept) is refused with it.
+	ProviderTypeGemini = "gemini"
 )
 
 // providerTypeValues lists the accepted provider.type spellings for error
 // messages.
-const providerTypeValues = "openai, anthropic"
+const providerTypeValues = "openai, anthropic, gemini"
 
 // ProviderConfig describes the LLM endpoint the agent talks to: an
-// OpenAI-compatible HTTP API (the default) or the native Anthropic
-// Messages API, selected by Type.
+// OpenAI-compatible HTTP API (the default), the native Anthropic Messages
+// API, or the native Google Gemini API, selected by Type.
 type ProviderConfig struct {
 	// Type selects the wire protocol: "" or "openai" for OpenAI-compatible
-	// endpoints, "anthropic" for the native Anthropic Messages API. Empty
-	// means openai so pre-existing configs keep working unchanged.
+	// endpoints, "anthropic" for the native Anthropic Messages API, "gemini"
+	// for the native Google Gemini generateContent API. Empty means openai so
+	// pre-existing configs keep working unchanged.
 	Type string `yaml:"type"`
 	// BaseURL is the API root, e.g. "https://api.openai.com/v1". With
 	// type anthropic it may be empty (the client defaults to the official
 	// endpoint) and must NOT include the /v1 suffix - the client appends
-	// /v1/messages itself.
+	// /v1/messages itself. With type gemini it may likewise be empty (the
+	// client defaults to the fixed AI Studio host); a value overrides the host
+	// for proxied deployments.
 	BaseURL string `yaml:"base_url"`
 	// APIKey is the bearer token. It is normally injected via ${ENV_VAR}
 	// interpolation; an empty key is valid for local endpoints (Ollama).
@@ -137,7 +145,9 @@ type ProviderConfig struct {
 	// endpoint speaks ("deepseek", "glm", "kimi", "groq", "openrouter"), which
 	// decides how the fields below are mapped onto the request. Empty means
 	// the OpenAI baseline, so configs written before dialects existed keep
-	// their behavior. It is explicit rather than sniffed from BaseURL:
+	// their behavior. It is ignored with type anthropic and refused with type
+	// gemini (see validateProviderTuning). It is explicit rather than sniffed
+	// from BaseURL:
 	// guessing wrong would send a knob to the wrong field name and the
 	// consequence would surface as a provider error much later.
 	Dialect string `yaml:"dialect"`
@@ -179,8 +189,10 @@ type ReasoningConfig struct {
 	Effort string `yaml:"effort"`
 	// BudgetTokens caps the thinking with a token count instead of a level.
 	// Zero means unset. Only budget-based targets can carry it (the Anthropic
-	// wire, or the openrouter gateway which converts it); elsewhere it is a
-	// validation error rather than a silently dropped field.
+	// wire, the Gemini wire's thinkingConfig.thinkingBudget, or the openrouter
+	// gateway which converts it); elsewhere it is a validation error rather
+	// than a silently dropped field. On the Gemini wire it is an ALTERNATIVE
+	// to Effort, never a companion: the API refuses a request carrying both.
 	BudgetTokens int `yaml:"budget_tokens"`
 }
 
@@ -236,6 +248,30 @@ var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
 //     stops when the model answers without calling one. A pinned "required"
 //     removes that stopping condition and every run ends at max_turns (exit 3).
 var reservedWireFields = []string{"stream", "tool_choice"}
+
+// geminiOwnedWireFields are the generateContent body-root keys the gemini
+// client writes itself, so provider.params must not carry them. Both spellings
+// are listed on purpose: the wire is camelCase but protobuf-JSON accepts the
+// snake_case form too, and a params key that reaches the body under EITHER
+// spelling would clobber a field amele owns.
+//
+// The model is not here because it is not a body field on this wire at all: it
+// lives in the request path.
+//
+// This list is a temporary home; Task 2 moves it beside the gemini wire structs
+// as llm.GeminiOwnedWireFields, where the same file that writes the fields owns
+// the list - the discipline llm.OwnedWireFields and llm.AnthropicOwnedWireFields
+// already follow. It lives here for now so the params escape hatch is
+// fail-closed on the gemini wire from the moment the type is accepted.
+var geminiOwnedWireFields = []string{
+	"contents",
+	"system_instruction", "systemInstruction",
+	"tools",
+	"tool_config", "toolConfig",
+	"generation_config", "generationConfig",
+	"safety_settings", "safetySettings",
+	"cached_content", "cachedContent",
+}
 
 // SubprocessTool declares an external executable the model may invoke as a
 // tool. The command is a fixed argv vector: there is no shell involved, so
@@ -981,7 +1017,7 @@ func (c *Config) Violations() []string {
 // each function under the complexity budget.
 func (c *Config) validateProvider(add func(format string, args ...any)) {
 	switch c.Provider.Type {
-	case "", ProviderTypeOpenAI, ProviderTypeAnthropic:
+	case "", ProviderTypeOpenAI, ProviderTypeAnthropic, ProviderTypeGemini:
 	default:
 		add("provider.type %q is not a valid provider type (%s, or omit for openai)", c.Provider.Type, providerTypeValues)
 	}
@@ -990,9 +1026,10 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 	if c.Provider.BaseURL == "" {
 		// base_url stays required on the OpenAI-compatible path: there is no
 		// canonical gateway address to default to (OpenAI, OpenRouter, Ollama
-		// all differ). The Anthropic path is exempt because the official
-		// endpoint is fixed and the client falls back to it on its own.
-		if !anthropic {
+		// all differ). The Anthropic and Gemini paths are exempt because each
+		// has ONE official host, fixed by its vendor, and the client falls back
+		// to it on its own.
+		if !anthropic && c.Provider.Type != ProviderTypeGemini {
 			add("provider.base_url is required")
 		}
 	} else if problem := baseURLProblem(c.Provider.BaseURL); problem != "" {
@@ -1046,19 +1083,39 @@ func (c *Config) validateRetry(add func(format string, args ...any)) {
 // CONFIGURATION at run time, but validate must not refuse a combination that
 // works either.
 func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
-	dialect, err := llm.ParseDialect(c.Provider.Dialect)
-	// A dialect that does not parse makes every dialect-dependent rule below
-	// unanswerable, so they are skipped rather than guessed at: reporting
-	// "kimi fixes sampling" for a config that says "kimi-k3" would send the
-	// operator to the wrong line. The dialect-independent rules still run, so
-	// one pass still reports everything actionable.
-	known := err == nil
-	if !known {
-		add("provider.dialect: %v", err)
-	}
+	dialect, known := c.tuningDialect(add)
 	c.validateReasoning(add, dialect, known)
 	c.validateSampling(add, dialect, known)
 	validateParams(add, c.Provider.Params, c.forbiddenParamsKeys(dialect, known))
+}
+
+// tuningDialect resolves the dialect the dialect-DEPENDENT rules are checked
+// against, reporting the field's own violations. The bool is whether those
+// rules may speak at all: a dialect that does not parse - or one written on a
+// wire that has none - makes every one of them unanswerable, so they are
+// skipped rather than guessed at. Reporting "kimi fixes sampling" for a config
+// that says "kimi-k3" would send the operator to the wrong line. The
+// dialect-INDEPENDENT rules still run, so one pass still reports everything
+// actionable.
+func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialect, bool) {
+	if c.Provider.Type == ProviderTypeGemini && c.Provider.Dialect != "" {
+		// The gemini wire is a family of its own, not a variation of the OpenAI
+		// one, so the VALUE is not parsed here: whatever it spells, the fix is
+		// to delete the line, and reporting the dialect vocabulary instead
+		// would send the operator to correct a key that has to go. Refused
+		// rather than ignored (the anthropic treatment) because the gemini wire
+		// is new: nothing was written against it before this rule existed, so
+		// strictness costs no working config and buys the operator certainty
+		// that no knob is being quietly dropped.
+		add("provider.dialect: %q applies to the openai wire; remove it for type gemini", c.Provider.Dialect)
+		return llm.DialectOpenAI, false
+	}
+	dialect, err := llm.ParseDialect(c.Provider.Dialect)
+	if err != nil {
+		add("provider.dialect: %v", err)
+		return dialect, false
+	}
+	return dialect, true
 }
 
 // forbiddenParamsKeys returns the request-body keys provider.params must not
@@ -1074,10 +1131,16 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 // them would cost the operator a second validate round for a violation that was
 // already answerable, and validate's contract is one pass, every violation.
 func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
-	if c.Provider.Type == ProviderTypeAnthropic {
+	switch c.Provider.Type {
+	case ProviderTypeAnthropic:
 		// The dialect is not consulted on this wire, so a leftover (even an
 		// unparseable) value cannot decide the answer.
 		return slices.Concat(llm.AnthropicOwnedWireFields(), reservedWireFields)
+	case ProviderTypeGemini:
+		// Same reasoning, and here the dialect is not even legal: an illegal
+		// one is reported on its own line and must not also cost the operator
+		// the params answer, which this wire can give without it.
+		return slices.Concat(geminiOwnedWireFields, reservedWireFields)
 	}
 	if !known {
 		// Cloned, like the Concat branches allocate: handing out the package
@@ -1107,14 +1170,19 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 	// the return cost the operator a second validate round for a violation the
 	// first pass already knew - against validate's one-pass contract.
 	c.validateThinkingBudgetFitsCap(add, r)
+	// Checked before the dialect early return for the same reason: it is a
+	// relation between two gemini-wire fields, and that wire refuses the
+	// dialect outright, so an illegal one cannot make the pair unanswerable.
+	c.validateGeminiThinkingChoice(add, r)
 	if !known {
 		return
 	}
 	// Everything else on the openai wire takes a LEVEL, not a count. Sending
 	// the budget anyway would be dropped by the endpoint (or 400 on the strict
 	// ones) while the config claims a bounded thinking cost.
-	if r.BudgetTokens > 0 && c.Provider.Type != ProviderTypeAnthropic && dialect != llm.DialectOpenRouter {
-		add("provider.reasoning.budget_tokens is only mapped for anthropic wire or openrouter dialect (use provider.reasoning.effort instead)")
+	if r.BudgetTokens > 0 && c.Provider.Type != ProviderTypeAnthropic &&
+		c.Provider.Type != ProviderTypeGemini && dialect != llm.DialectOpenRouter {
+		add("provider.reasoning.budget_tokens is only mapped for the anthropic or gemini wire, or the openrouter dialect (use provider.reasoning.effort instead)")
 	}
 	// Kimi's K-series thinks unconditionally; "none" has nothing to map to.
 	// Gated on the openai wire: the dialect describes an openai-wire variation
@@ -1159,14 +1227,35 @@ func (c *Config) validateThinkingBudgetFitsCap(add func(format string, args ...a
 	}
 }
 
+// validateGeminiThinkingChoice checks the one relation between the two thinking
+// fields on the gemini wire: they are ALTERNATIVES there. Effort maps to
+// generationConfig.thinkingConfig.thinkingLevel and BudgetTokens to
+// thinkingBudget, and the API answers a request carrying both with a 400.
+//
+// CONTRACT: a total rule of that wire, knowable from the file alone - so it is
+// an exit-2 config error rather than an exit-5 provider error on the first
+// unattended run.
+func (c *Config) validateGeminiThinkingChoice(add func(format string, args ...any), r *ReasoningConfig) {
+	if c.Provider.Type != ProviderTypeGemini {
+		return
+	}
+	// Zero budget means "unset", and an empty effort means "send no knob":
+	// only two values the operator actually chose are in conflict.
+	if r.Effort != "" && r.BudgetTokens > 0 {
+		add("provider.reasoning: gemini accepts thinkingLevel or thinkingBudget, not both (drop provider.reasoning.effort or provider.reasoning.budget_tokens)")
+	}
+}
+
 // dialectApplies reports whether the dialect-DEPENDENT rules may speak. They
 // may not on the anthropic wire: the dialect names a variation of the
 // OpenAI-compatible format, and the published schema documents it as ignored
 // when type is anthropic. Refusing `type: anthropic` + a leftover
-// `dialect: kimi` would blame a provider the config is not talking to. known
-// carries whether the dialect parsed at all.
+// `dialect: kimi` would blame a provider the config is not talking to. They may
+// not on the gemini wire either, for the stronger reason that a dialect is
+// refused there outright - so no dialect-shaped rule can be about a request
+// that wire would send. known carries whether the dialect parsed at all.
 func (c *Config) dialectApplies(known bool) bool {
-	return known && c.Provider.Type != ProviderTypeAnthropic
+	return known && c.Provider.Type != ProviderTypeAnthropic && c.Provider.Type != ProviderTypeGemini
 }
 
 // validateSampling checks temperature/top_p against the range the target

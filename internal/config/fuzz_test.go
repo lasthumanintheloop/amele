@@ -22,6 +22,10 @@ func FuzzLoad(f *testing.F) {
 	// floats and a free-form map whose values reach json.Marshal during
 	// validation - four parser shapes the other seeds do not exercise.
 	f.Add([]byte("model: m\nprovider:\n  base_url: 'https://x'\n  dialect: openrouter\n  max_output_tokens: 65536\n  reasoning: {effort: high, budget_tokens: 8192}\n  temperature: 0.2\n  top_p: 0.9\n  params: {verbosity: low, provider: {require_parameters: true}}\n"))
+	// The gemini wire: a third provider.type whose validation takes different
+	// branches (no base_url requirement, no dialect, its own owned-params set),
+	// so mutating from here reaches code the other seeds never enter.
+	f.Add([]byte("model: m\nprovider:\n  type: gemini\n  api_key: '${K}'\n  reasoning: {budget_tokens: 8192}\n  params: {labels: {team: ops}}\n"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dir := t.TempDir()
