@@ -2008,6 +2008,34 @@ func TestValidateDialectViolationSuppressesDialectRules(t *testing.T) {
 	}
 }
 
+// TestValidateBudgetCapReportedOnUnknownDialect: the budget-fits-cap rule is
+// dialect-INDEPENDENT - it is a relation between two anthropic-wire fields, and
+// `type: anthropic` ignores the dialect entirely - so an unparseable dialect
+// must not hide it. It used to sit below the dialect early return, which cost
+// the operator a second validate round for a violation that was answerable in
+// the first: the Messages API would have 400'd on it either way.
+func TestValidateBudgetCapReportedOnUnknownDialect(t *testing.T) {
+	cfg := tuningBase(t.TempDir())
+	cfg.Provider.Type = ProviderTypeAnthropic
+	cfg.Provider.BaseURL = ""
+	// A leftover dialect that does not parse, alongside a budget with no cap to
+	// fit into: two independent mistakes, one pass.
+	cfg.Provider.Dialect = "kimi-k3"
+	cfg.Provider.Reasoning = &ReasoningConfig{BudgetTokens: llm.DefaultAnthropicMaxOutput}
+
+	joined := strings.Join(cfg.Violations(), "\n")
+	if !strings.Contains(joined, "provider.dialect") {
+		t.Errorf("violations do not report the dialect:\n%s", joined)
+	}
+	if !strings.Contains(joined, "reasoning.budget_tokens must be below provider.max_output_tokens") {
+		t.Errorf("the dialect-independent budget/cap rule was hidden by the dialect:\n%s", joined)
+	}
+	// The dialect-DEPENDENT rules stay suppressed, unchanged.
+	if strings.Contains(joined, "budget_tokens is only mapped") {
+		t.Errorf("a dialect-dependent rule fired on an unparseable dialect:\n%s", joined)
+	}
+}
+
 // TestToolsParallelDefault: an omitted tools.parallel must mean "on". The
 // default is the whole point of the field - configs written before v0.2 get
 // concurrent tool calls without being edited, and only an explicit `false`

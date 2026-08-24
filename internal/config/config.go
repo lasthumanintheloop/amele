@@ -1101,6 +1101,12 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 	if r.BudgetTokens < 0 {
 		add("provider.reasoning.budget_tokens must not be negative")
 	}
+	// Checked BEFORE the dialect early return: it is a relation between two
+	// anthropic-wire fields, and that wire does not consult the dialect at all,
+	// so an unparseable dialect cannot make it unanswerable. Leaving it below
+	// the return cost the operator a second validate round for a violation the
+	// first pass already knew - against validate's one-pass contract.
+	c.validateThinkingBudgetFitsCap(add, r)
 	if !known {
 		return
 	}
@@ -1117,7 +1123,6 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 	if c.dialectApplies(known) && dialect == llm.DialectKimi && r.Effort == "none" {
 		add("provider.reasoning.effort %q: kimi models cannot disable thinking", r.Effort)
 	}
-	c.validateThinkingBudgetFitsCap(add, r)
 }
 
 // validateThinkingBudgetFitsCap checks the one relation BETWEEN two tuning
