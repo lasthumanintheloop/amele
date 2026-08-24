@@ -299,6 +299,16 @@ func TestBackoffDelay(t *testing.T) {
 		{"retry-after stretches", 200 * time.Millisecond, 2, 7 * time.Second, 7 * time.Second},
 		{"retry-after never shrinks", 10 * time.Second, 2, time.Second, 10 * time.Second},
 		{"retry-after capped", 0, 2, time.Hour, maxRetryAfter},
+		// The ladder is capped by the same ceiling as a Retry-After wish. Both
+		// arrive at the caller as one wait, and a wait long enough to look like
+		// a hung run is no better for having been computed here: the accepted
+		// range tops out at 60s x 2^8 = 4h16m on the last rung of a
+		// max_attempts: 10 config.
+		{"ladder capped at the ceiling", 40 * time.Second, 3, 0, maxRetryAfter},
+		{"ladder cap holds on the last rung", 60 * time.Second, 10, 0, maxRetryAfter},
+		// Capping the ladder must not shrink a Retry-After that is itself
+		// within the ceiling: the stretch rule is unchanged.
+		{"retry-after still stretches a capped ladder", time.Minute, 2, maxRetryAfter, maxRetryAfter},
 		// Unreachable through the loops (they only call this from attempt 2)
 		// but pinned: a negative shift count would be a runtime panic.
 		{"attempt below the ladder", 200 * time.Millisecond, 1, 0, 200 * time.Millisecond},
@@ -369,6 +379,31 @@ func TestChatBackoffDefaultsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []time.Duration{time.Second, 2 * time.Second}
+	if !slices.Equal(delays, want) {
+		t.Errorf("delays: got %v want %v", delays, want)
+	}
+}
+
+// TestChatBackoffLadderStopsAtTheCeiling: the SEQUENCE a real retry loop asks
+// for flattens at maxRetryAfter instead of doubling past it. With the largest
+// initial_backoff the config accepts (60s), the second wait would otherwise be
+// 120s, and a max_attempts: 10 config would spend hours asleep - the failure
+// mode the Retry-After cap was added to prevent, reached through the config
+// instead of through a header.
+func TestChatBackoffLadderStopsAtTheCeiling(t *testing.T) {
+	srv := retryTwiceServer(t)
+
+	var delays []time.Duration
+	client := &OpenAIClient{
+		BaseURL:        srv.URL + "/v1",
+		InitialBackoff: 40 * time.Second,
+		Sleep:          recordDelays(&delays),
+	}
+	if _, err := client.Chat(context.Background(), Request{Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	// 40s, then 80s clamped to the 60s ceiling.
+	want := []time.Duration{40 * time.Second, maxRetryAfter}
 	if !slices.Equal(delays, want) {
 		t.Errorf("delays: got %v want %v", delays, want)
 	}

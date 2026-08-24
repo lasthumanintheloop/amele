@@ -194,10 +194,10 @@ type RetryConfig struct {
 	// default (3).
 	MaxAttempts int `yaml:"max_attempts"`
 	// InitialBackoff is the wait before the second attempt; each further
-	// attempt doubles it. Zero means the client default (1s). A provider's
-	// Retry-After header still stretches an individual wait (capped at 60s):
-	// retrying earlier than the rate limiter allows only burns the attempt
-	// budget.
+	// attempt doubles it, up to a 60s ceiling per wait. A provider's
+	// Retry-After header still stretches an individual wait (under the same
+	// ceiling): retrying earlier than the rate limiter allows only burns the
+	// attempt budget. Zero means the client default (1s).
 	InitialBackoff Duration `yaml:"initial_backoff"`
 }
 

@@ -47,16 +47,18 @@ const defaultRequestTimeout = 120 * time.Second
 // does not set provider.retry.initial_backoff.
 const defaultInitialBackoff = time.Second
 
-// maxRetryAfter caps how long a provider's Retry-After header can stretch one
-// backoff wait. Without a cap a misbehaving proxy could stall the run until
-// the run timeout fires - which would then misattribute the provider problem
-// to the user's budget (exit 3).
+// maxRetryAfter caps a single backoff wait, from whichever source. Without a
+// cap a misbehaving proxy's Retry-After header - or, equally, a doubled
+// initial_backoff late in a long ladder - could stall the run until the run
+// timeout fires, which would then misattribute the provider problem to the
+// user's budget (exit 3). The name predates the second source; the value has
+// always been "the longest one wait may be".
 const maxRetryAfter = 60 * time.Second
 
 // backoffDelay returns how long to wait before attempt (>= 2): an exponential
 // ladder rooted at initial (0 means defaultInitialBackoff), stretched - never
-// shrunk - to the provider's Retry-After wish when one was sent, and that
-// stretch capped at maxRetryAfter.
+// shrunk - to the provider's Retry-After wish when one was sent. No single wait
+// exceeds maxRetryAfter, whether it came from the ladder or from the header.
 //
 // Shared by both clients on purpose: a retry rhythm that differed between the
 // OpenAI-compatible and the native Anthropic wire would be a trap for a config
@@ -70,7 +72,13 @@ func backoffDelay(initial time.Duration, attempt int, retryAfter time.Duration) 
 	// runtime panic in Go, and library code must not panic
 	// (docs/engineering.md §5.3).
 	shift := max(attempt-2, 0)
-	delay := initial << shift
+	// CONTRACT: the ladder is capped by the same ceiling as a Retry-After wish.
+	// A wait is a wait: whether the number came from a provider header or from
+	// doubling initial_backoff, one that runs into the tens of minutes reads as
+	// a hung run, and the config's accepted maximum (60s) reaches 4h16m by the
+	// last rung of a max_attempts: 10 policy. Capping here bounds the whole
+	// ladder's worst case to (attempts-1) x 60s.
+	delay := min(initial<<shift, maxRetryAfter)
 	if retryAfter > delay {
 		delay = min(retryAfter, maxRetryAfter)
 	}
