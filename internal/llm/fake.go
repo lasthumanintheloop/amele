@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 )
@@ -16,7 +17,9 @@ type Fake struct {
 	// Errs, when non-nil at the call index, is returned instead of the
 	// response, letting tests script transient failures.
 	Errs []error
-	// Requests records everything Chat received, for assertions.
+	// Requests records every Request Chat received, whole and unaltered -
+	// including the sampling, reasoning and Extra knobs - so tests can assert
+	// what the loop and the cmd wiring actually asked the provider for.
 	Requests []Request
 
 	calls int
@@ -63,4 +66,15 @@ func ToolCallResponse(id, name, args string, usage Usage) Response {
 		Usage:        usage,
 		FinishReason: "tool_calls",
 	}
+}
+
+// WithReasoning returns a copy of the response whose assistant message
+// carries the given opaque reasoning payload. It composes with the
+// constructors above (a reasoning model answers with text or tool calls, and
+// either way the carrier rides along) so tests scripting a reasoning provider
+// need no third constructor. The bytes are stored as given; the fake never
+// re-encodes them, which is what makes byte-identity assertions meaningful.
+func (r Response) WithReasoning(reasoning json.RawMessage) Response {
+	r.Message.Reasoning = reasoning
+	return r
 }

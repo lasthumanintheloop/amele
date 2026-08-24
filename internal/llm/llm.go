@@ -44,6 +44,17 @@ type Message struct {
 	ToolCalls []ToolCall
 	// ToolCallID links a RoleTool message to the assistant call it answers.
 	ToolCallID string
+	// Reasoning is the provider's reasoning payload for this assistant
+	// message, opaque to the loop. Clients fill it from their wire format (a
+	// reasoning_content string, thinking blocks, a reasoning_details array)
+	// and re-serialize it on the way back. Nil means "this message carries no
+	// reasoning" - never an empty JSON document.
+	//
+	// CONTRACT: the loop and session layers never parse or modify it;
+	// providers that sign their reasoning (Anthropic) or hash-check it
+	// (DeepSeek) reject altered payloads, so the bytes that came off the wire
+	// are the bytes that go back.
+	Reasoning json.RawMessage
 }
 
 // ToolDef describes a tool offered to the model. Parameters is a JSON Schema
@@ -71,7 +82,30 @@ type ResponseFormat struct {
 	Schema json.RawMessage
 }
 
-// Request is one chat completion call.
+// ReasoningSpec is the provider-neutral reasoning knob: what the config asked
+// for, before any dialect decides which wire field carries it. Each client
+// maps it (effort to reasoning_effort / output_config, BudgetTokens to a
+// budget-based thinking block) and reports the mapping in explain; nothing
+// here is sent verbatim.
+//
+// The zero value means "no reasoning knob"; a Request carries *ReasoningSpec
+// so that "unset" and "explicitly none" stay distinguishable - effort "none"
+// is a real instruction to turn thinking off, not the absence of one.
+type ReasoningSpec struct {
+	// Effort is the normalized depth: none, low, medium, high, xhigh or max.
+	// Dialects that lack a level round it and say so in explain; validation
+	// of the value itself happens in config, not here.
+	Effort string
+	// BudgetTokens is an optional thinking-token budget for the targets that
+	// take one (Anthropic legacy thinking, OpenRouter max_tokens reasoning).
+	// Zero means "no budget given".
+	BudgetTokens int
+}
+
+// Request is one chat completion call. The sampling, reasoning and cap fields
+// are provider-neutral: a nil pointer or zero value means "send no such
+// field", so a config that stays silent leaves the provider's own default
+// untouched.
 type Request struct {
 	Model    string
 	Messages []Message
@@ -79,6 +113,26 @@ type Request struct {
 	// ResponseFormat, when non-nil, asks the provider to constrain the reply
 	// to the given JSON Schema. nil means plain text.
 	ResponseFormat *ResponseFormat
+	// MaxOutputTokens caps the tokens the provider may generate for this
+	// call. Zero means "send no cap". The dialect picks the wire field name
+	// (max_tokens vs max_completion_tokens).
+	MaxOutputTokens int
+	// Reasoning, when non-nil, asks for a reasoning depth. nil sends no
+	// reasoning knob at all.
+	Reasoning *ReasoningSpec
+	// Temperature and TopP are the sampling knobs, pointers so that an
+	// explicit 0 is distinguishable from "unset". Providers that reject them
+	// (fixed-sampling models) are handled by the clients, not here.
+	Temperature *float64
+	TopP        *float64
+	// Extra is the raw escape hatch (provider.params): keys merged verbatim
+	// into the request body root, pre-serialized by the cmd wiring so this
+	// package never re-encodes user YAML.
+	//
+	// CONTRACT: collisions with amele-owned wire fields are rejected at
+	// validate time (exit 2), so a client may merge these keys without
+	// re-checking that they cannot overwrite model, messages or tools.
+	Extra map[string]json.RawMessage
 }
 
 // Usage is the token accounting reported by the provider for one call.
