@@ -249,6 +249,12 @@ and concurrency buys latency, never a different transcript.
 Per-tool timeouts are unchanged: each subprocess, shell command and MCP call
 keeps its own clock, and `limits.timeout` still bounds the whole run.
 
+**At most 8 calls run at once.** Providers ask for a handful of tools per turn,
+so this ceiling is invisible in practice - but the length of that list is
+model output, and a broken or hostile response could otherwise start a thousand
+subprocesses at once. A wider turn runs in waves instead: every call still
+runs, and the recorded order is still the model's call order.
+
 **What to check before leaving it on.** amele's own tools are independent by
 construction (a separate process or request per call), but *your* tools might
 not be: two subprocess tools appending to the same file, a script with a lock

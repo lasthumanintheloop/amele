@@ -305,6 +305,85 @@ func TestParallelEightCallsRace(t *testing.T) {
 	}
 }
 
+// TestParallelBoundsInFlightCalls is the SECURITY regression for the review
+// finding: the model decides how many tool calls one turn carries, and a
+// hostile or broken response can carry thousands of them under the body cap.
+// One goroutine (and one subprocess) per call turned that number straight into
+// a resource spike, so the dispatcher must run them in bounded waves.
+//
+// The barrier makes both halves of the contract observable at once: the first
+// maxParallelToolCalls calls have to be in flight together (a bound that
+// serialized the turn would hang on it), and the meter must never see more
+// than that many, however wide the turn is.
+func TestParallelBoundsInFlightCalls(t *testing.T) {
+	// Wide enough that an unbounded dispatcher's peak is unmistakable, small
+	// enough to stay a fast unit test.
+	const n = 4 * maxParallelToolCalls
+
+	var (
+		mu       sync.Mutex
+		arrived  int
+		waveFull = make(chan struct{})
+	)
+	meter := &concurrencyMeter{}
+	toolset := make([]tools.Tool, 0, n)
+	calls := make([]llm.ToolCall, 0, n)
+	wantHistory := make([]string, 0, n)
+	wantIDs := make([]string, 0, n)
+	for i := range n {
+		name := fmt.Sprintf("tool_%02d", i)
+		id := fmt.Sprintf("c%02d", i)
+		calls = append(calls, call(id, name))
+		wantHistory = append(wantHistory, id+"="+name+"-result")
+		wantIDs = append(wantIDs, id)
+		toolset = append(toolset, scriptedTool{name: name, run: func(context.Context, string) (string, error) {
+			meter.enter()
+			defer meter.leave()
+			mu.Lock()
+			arrived++
+			if arrived == maxParallelToolCalls {
+				close(waveFull)
+			}
+			mu.Unlock()
+			// Only the first wave really waits; once the barrier is open the
+			// later waves sail through it, so the test does not depend on how
+			// the bound schedules the remaining calls.
+			waitFor(t, waveFull, fmt.Sprintf("%d calls to be in flight at once", maxParallelToolCalls))
+			// Held open after the barrier so an UNBOUNDED dispatcher would
+			// pile every call into the meter at once instead of draining the
+			// wave fast enough to hide the spike.
+			time.Sleep(20 * time.Millisecond)
+			return name + "-result", nil
+		}})
+	}
+
+	fake := &llm.Fake{Responses: []llm.Response{
+		toolCallsResponse(calls...),
+		llm.TextResponse("done", usage(1, 1)),
+	}}
+	l := parallelLoop(t, fake, toolset...)
+
+	events, res, err := runWithEvents(t, context.Background(), l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if peak := meter.Peak(); peak != maxParallelToolCalls {
+		t.Errorf("peak concurrency: got %d want %d (the dispatcher must run %d calls in bounded waves)",
+			peak, maxParallelToolCalls, n)
+	}
+	// The bound is a spike limiter, not a call limiter: every call the model
+	// asked for still runs, and still answers in call order.
+	if res.ToolCalls != n {
+		t.Errorf("tool calls: got %d want %d", res.ToolCalls, n)
+	}
+	if got := toolMessages(fake.Requests[1]); !equalStrings(got, wantHistory) {
+		t.Errorf("history order: got %v want %v", got, wantHistory)
+	}
+	if got := eventIDs(events, "tool_result"); !equalStrings(got, wantIDs) {
+		t.Errorf("tool_result order: got %v want %v", got, wantIDs)
+	}
+}
+
 // TestParallelDisabledRunsSequentially: with ParallelTools off, two calls in
 // one turn must never be in flight together - the opt-out has to be real, not
 // advisory.

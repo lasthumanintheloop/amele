@@ -608,14 +608,30 @@ func (l *Loop) autoApproved(call llm.ToolCall) bool {
 	return l.AutoApprove(call)
 }
 
+// maxParallelToolCalls bounds how many of one turn's tool calls may be running
+// at the same time.
+//
+// SECURITY: the length of the tool-call list is model output, and model output
+// is untrusted input. A well-behaved provider keeps it to single digits, but
+// nothing on the wire enforces that: a hostile or broken response can carry
+// thousands of calls within the response body cap, and one goroutine (plus one
+// subprocess, its pipes and its file descriptors) per call turned that number
+// straight into a PID/memory/fd spike. This bound is the spike limiter only -
+// the budgets (max_turns, max_tokens, timeout) remain the limiters on total
+// VOLUME, and every call the model asked for still runs.
+//
+// Eight is chosen to sit above what real providers emit, so the common turn
+// never queues and stays byte-identical to the unbounded dispatcher.
+const maxParallelToolCalls = 8
+
 // dispatchParallel runs the calls of one turn concurrently and publishes their
 // results in the model's original call order.
 //
-// CONTRACT: one goroutine per call, with no worker pool. Providers cap the
-// tool calls in a single assistant turn at single digits (OpenAI, Anthropic
-// and the gateways all do), so the fan-out is bounded by the wire format, and
-// a pool would add a queue - plus a scheduling order - to a list that is
-// already short.
+// CONTRACT: the concurrency bound is invisible in the output. Calls are
+// announced, approved and published in the model's call order regardless of
+// which wave they ran in, and results are slotted by index, so a turn wider
+// than maxParallelToolCalls produces exactly the events an unbounded
+// dispatcher would - only spread over more waves.
 func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolCall) ([]string, error) {
 	// Announced up front, in call order: the tool_call events say what the
 	// MODEL asked for, and that fact is known before any tool runs.
@@ -644,14 +660,23 @@ func (l *Loop) dispatchParallel(ctx context.Context, turn int, calls []llm.ToolC
 	// the Wait below before this function returns - including when ctx is
 	// already done, because the tools honor ctx themselves and returning early
 	// would leave them writing into a turn nobody is reading.
+	//
+	// SECURITY: the slot is taken BEFORE the goroutine is started, not inside
+	// it, so a turn carrying thousands of calls costs thousands of iterations
+	// rather than thousands of live goroutines (see maxParallelToolCalls). The
+	// channel cannot deadlock: every started goroutine releases its slot on
+	// every exit path, and nothing a tool does can block that release.
 	var wg sync.WaitGroup
+	slots := make(chan struct{}, maxParallelToolCalls)
 	for i, call := range calls {
 		if refused[i] {
 			continue // the policy already answered for this call
 		}
+		slots <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-slots }()
 			results[i] = l.runCall(ctx, turn, call)
 		}()
 	}
