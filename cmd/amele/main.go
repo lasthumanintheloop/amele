@@ -2565,9 +2565,13 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 // config carries.
 //
 // ResponseFormat is deliberately NOT decided here: buildAgent sets it on the
-// loop for every provider, and the Anthropic client ignores it by its own
-// documented contract. Special-casing it per provider in cmd would duplicate
-// a capability decision the clients already own.
+// loop for every provider, and each client maps it to its own wire spelling -
+// response_format:json_schema on the OpenAI-compatible path,
+// output_config.format on the Anthropic one, both GA. A client whose endpoint
+// rejects that field repeats the call once without it and reports the
+// degradation through Response.SchemaEnforcementDropped, which run surfaces as
+// a warning. Special-casing it per provider in cmd would duplicate a
+// capability decision the clients already own.
 func buildProvider(cfg *config.Config) llm.Provider {
 	if cfg.Provider.Type == config.ProviderTypeAnthropic {
 		return &llm.AnthropicClient{
