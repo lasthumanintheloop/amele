@@ -74,17 +74,17 @@ Within a frozen version, changes must be additive and backwards-compatible:
   absent) - jsonl-events.md v1.3. Additive: the wire `v` stays `1`, nothing was
   removed, renamed or re-typed, and no credential is written. Migration: none
   required; absent `auth` means "no mechanism amele manages", never "unknown".
-- **2026-08-24 - JSONL v1.4, reasoning observability.** `llm_response` gains
-  the optional `reasoning_bytes` field: the SIZE of the provider's reasoning
-  payload for that turn, never its content - jsonl-events.md v1.4. Additive:
-  the wire `v` stays `1`, nothing was removed, renamed or re-typed. Migration:
-  none required; absent `reasoning_bytes` means the turn carried no reasoning.
 - **2026-08-19 - `amele mcp login|status|logout`.** A new command for the
   OAuth credentials of MCP servers, plus an `auth:` row per OAuth server in
   the `amele explain` report - cli.md. Additive: no existing command, flag or
   report line changed. The `status` table's layout is explicitly
   informational and NOT frozen; the streams and exit codes are.
 
+- **2026-08-24 - JSONL v1.4, reasoning observability.** `llm_response` gains
+  the optional `reasoning_bytes` field: the SIZE of the provider's reasoning
+  payload for that turn, never its content - jsonl-events.md v1.4. Additive:
+  the wire `v` stays `1`, nothing was removed, renamed or re-typed. Migration:
+  none required; absent `reasoning_bytes` means the turn carried no reasoning.
 - **2026-08-24 - config schema: the provider tuning surface.** `provider` gains
   five optional keys - `dialect` (enum: openai, deepseek, glm, kimi, groq,
   openrouter; omitted means openai), `reasoning` (`effort` enum + optional

@@ -288,13 +288,15 @@ Direction, not dates. Details and discussion live in
 [issues](https://github.com/lasthumanintheloop/amele/issues) and
 [milestones](https://github.com/lasthumanintheloop/amele/milestones).
 
-- **v0.2 - connected and fast.** MCP client - **done**: stdio and Streamable
+- **v0.2 - connected and fast** - **done**: MCP client (stdio and Streamable
   HTTP with static header auth, plus OAuth 2.1 with `amele mcp
-  login|status|logout` ([docs/mcp.md](docs/mcp.md)).
-  Then: parallel tool calls within a turn; sampling parameters (`temperature`, `top_p`) and a
-  provider-normalized `reasoning` setting (effort / thinking budget) that
-  survives tool loops across OpenAI, Anthropic, DeepSeek and OpenRouter;
-  configurable retry policy.
+  login|status|logout` - [docs/mcp.md](docs/mcp.md)); parallel tool calls
+  within a turn, on by default and with the recorded order unchanged
+  ([docs/features.md](docs/features.md#parallel-tool-calls-toolsparallel));
+  sampling parameters (`temperature`, `top_p`) and a provider-normalized
+  `reasoning` setting (effort / thinking budget) that survives tool loops
+  across OpenAI, Anthropic, DeepSeek, GLM, Kimi, Groq and OpenRouter
+  ([docs/providers.md](docs/providers.md)); configurable retry policy.
 - **v0.3 - cheap and durable.** Prompt caching (Anthropic `cache_control`,
   cache-hit reporting for every dialect); provider fallback; guards against
   oversized tool results; `--resume` for interrupted runs.

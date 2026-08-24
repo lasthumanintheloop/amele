@@ -62,7 +62,7 @@
           "minimum": 0,
           "maximum": 2,
           "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
-          "description": "Sampling temperature. Omitted means the provider decides; 0 is a value, not \"unset\". The target can narrow the range - type \"anthropic\" and dialect \"glm\" both accept only 0..1, and dialect \"kimi\" rejects temperature and top_p outright because its K-series models fix them - all enforced at load time. May also be a whole-value ${VAR} environment reference resolved at load time."
+          "description": "Sampling temperature. Omitted means the provider decides; 0 is a value, not \"unset\". The target can narrow the range - type \"anthropic\" and dialect \"glm\" both accept only 0..1, and dialect \"kimi\" (openai wire only) rejects temperature and top_p outright because its K-series models fix them - all enforced at load time. May also be a whole-value ${VAR} environment reference resolved at load time."
         },
         "top_p": {
           "type": ["number", "string"],

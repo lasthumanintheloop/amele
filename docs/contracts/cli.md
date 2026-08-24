@@ -100,12 +100,14 @@ on `run`, `chat`, `validate` and `explain`.
   `provider.temperature` and `provider.top_p` joined the allowlist. Additive:
   no existing key changed, and the refusal message for every other key
   (`provider.api_key` included) is unchanged apart from the longer list it
-  prints. `provider.dialect`, `provider.reasoning.budget_tokens` and
-  `provider.params` are deliberately absent: the dialect changes how every
-  request is SHAPED rather than what it spends, `budget_tokens` is legal on
-  only two of the targets (so a cron line carrying it would be a config error
-  more often than not), and `params` is a free-form mapping with no
-  `key=value` spelling.
+  prints. `provider.dialect`, `provider.reasoning.budget_tokens`,
+  `provider.retry.*` and `provider.params` are deliberately absent: the dialect
+  changes how every request is SHAPED rather than what it spends,
+  `budget_tokens` is legal on only two of the targets (so a cron line carrying
+  it would be a config error more often than not), the retry policy decides how
+  long a failing call keeps trying - a rhythm the audited file owns, next to
+  the `limits.timeout` that bounds it - and `params` is a free-form mapping with
+  no `key=value` spelling.
 - **Migration (2026-08-12): the allowlist shrank.** `lock` was settable when
   overrides shipped and no longer is: `--set lock=true|false` is now exit 2
   like any other non-settable key. It was the one entry that could *weaken* a

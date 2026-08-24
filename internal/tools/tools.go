@@ -24,12 +24,28 @@ import (
 )
 
 // Tool is one callable capability offered to the model.
+//
+// CONTRACT: Invoke may be called CONCURRENTLY for distinct calls of the same
+// turn (internal/loop runs a turn's tool calls in parallel unless the config or
+// an `ask` policy puts the turn back on the sequential path -
+// docs/features.md#parallel-tool-calls-toolsparallel). An implementation must
+// therefore keep no per-call state on its receiver: the builtins hold only
+// their configuration, which is written once at startup and read-only
+// afterwards, and every call's mutable state lives on the stack or in a child
+// process. Concurrency BETWEEN tools is not amele's to promise - two subprocess
+// tools appending to one file race no matter who calls them - which is what
+// tools.parallel: false exists for.
 type Tool interface {
-	// Def returns the definition advertised to the provider.
+	// Def returns the definition advertised to the provider. Safe to call from
+	// any goroutine; the definition is fixed once the tool is constructed.
 	Def() llm.ToolDef
 	// Invoke executes the tool. The returned string is shown to the model
 	// verbatim. An error return means the harness itself failed (not the
 	// tool's task); the loop converts it to an error result for the model.
+	//
+	// Safe for concurrent use by multiple goroutines (see the type comment).
+	// ctx carries the call's deadline and the run's cancellation; an
+	// implementation must honor it rather than outlive the turn.
 	Invoke(ctx context.Context, rawArgs string) (string, error)
 }
 
@@ -131,6 +147,14 @@ func (o Outcome) String() string {
 // Registry holds the enabled tools for one run, preserving registration
 // order (definition order is part of the harness token budget and must be
 // stable for deterministic replay).
+//
+// CONTRACT: a Registry is FROZEN AFTER STARTUP. Register is called while the
+// run is being assembled, on one goroutine; from then on the registry is
+// read-only and Get/Defs/Names are safe to call concurrently - which they must
+// be, because the loop's parallel tool workers look their tool up through it.
+// Registering into a running registry would be a data race against those
+// readers (the map has no lock, deliberately: a mutex on the hot read path
+// would buy nothing for a structure nothing mutates).
 type Registry struct {
 	byName map[string]Tool
 	order  []string

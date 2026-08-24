@@ -1,4 +1,4 @@
-# Structured output, permissions, shell and chat
+# Structured output, permissions, shell, chat and parallel tool calls
 
 Beyond the core `run` + `validate`, five features round out the agent: structured
 output, permission profiles, a builtin `shell` tool, an interactive `chat`
@@ -232,8 +232,9 @@ tools:
 session log, the message history sent back to the model and the `-v` progress
 lines all appear in the order the *model asked for the calls*
 ([JSONL contract](contracts/jsonl-events.md#ordering-guarantees)). Two runs of
-the same recorded conversation therefore produce the same file - concurrency
-buys latency, never a different transcript.
+the same recorded conversation therefore produce their events in the same
+ORDER - the timestamps still differ, so the files are not byte-identical -
+and concurrency buys latency, never a different transcript.
 
 **When amele falls back to one at a time**, automatically:
 
