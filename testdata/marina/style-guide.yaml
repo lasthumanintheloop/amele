@@ -1,0 +1,100 @@
+# Marina's acceptance fixture: a style-guide checker that must think, use a
+# tool, and still answer in schema.
+#
+# It is the end-to-end case for the provider dialect layer, because it needs
+# every part of it at once:
+#
+#   - a tool loop, so a dialect that returns reasoning must echo it back
+#     (DeepSeek answers a missing echo with a 400);
+#   - reasoning.effort, so the neutral knob has to reach the right wire field;
+#   - max_output_tokens, because reasoning tokens are billed against the same
+#     ceiling as the answer - the original bug this fixture is named after was
+#     a run truncated mid-JSON on a model whose thinking ate the cap;
+#   - output.schema, so the run either prints valid JSON or fails with exit 6.
+#
+# The provider is parametrized so ONE file can be pointed at every dialect
+# (docs/providers.md). A hand run:
+#
+#   MARINA_DIALECT=groq \
+#   MARINA_BASE_URL=https://api.groq.com/openai/v1 \
+#   MARINA_MODEL=openai/gpt-oss-20b \
+#   MARINA_API_KEY=$GROQ_API_KEY \
+#   amele run testdata/marina/style-guide.yaml "check violating.md"
+#
+# `amele explain testdata/marina/style-guide.yaml` reports which variables are
+# missing and what the tuning knobs become on the wire, without spending a
+# token. The automated version of this file is
+# cmd/amele/marina_integration_test.go.
+#
+# One editor caveat: `dialect: ${MARINA_DIALECT}` is legal at run time -
+# interpolation happens before validation, and `amele validate` accepts it with
+# the variables set - but the published JSON Schema cannot express a ${VAR}
+# inside an enum, so an editor bound to config.schema.json flags that one line.
+
+model: ${MARINA_MODEL}
+provider:
+  base_url: ${MARINA_BASE_URL}
+  api_key: ${MARINA_API_KEY}
+  dialect: ${MARINA_DIALECT}    # openai | deepseek | glm | kimi | groq | openrouter
+  # Room for the thinking AND the answer: on every provider that reports
+  # reasoning, the reasoning is charged against this ceiling.
+  max_output_tokens: 8192
+  reasoning:
+    effort: low                 # enough to reason about the rules, cheap to run
+
+system_prompt: |
+  You are a style-guide checker. The style guide has exactly three rules:
+
+    no-exclamation          A sentence may not end with an exclamation mark.
+    no-first-person         The words "I", "we", "us" and "our" may not appear.
+    no-marketing-superlative The words "world-class", "revolutionary",
+                            "best-in-class" and "game-changing" may not appear.
+
+  Read the document named in the task with fs_read. Judge it against those
+  three rules and nothing else: a sentence you merely dislike is not a
+  violation. For every violation, quote the offending text from the document
+  verbatim and say in one sentence which rule it breaks and why.
+
+  The verdict is "fail" if there is at least one violation, "pass" otherwise.
+
+prompt: |
+  {{args}}
+  {{input}}
+
+workspace: ./inbox              # the documents to check; nothing else is reachable
+tools:
+  fs: true
+permissions:
+  default: allow
+  tools:
+    fs_write: deny              # a checker reports, it does not edit
+
+output:
+  schema:
+    type: object
+    additionalProperties: false
+    required: [verdict, violations]
+    properties:
+      verdict:
+        type: string
+        enum: [pass, fail]
+      violations:
+        type: array
+        items:
+          type: object
+          additionalProperties: false
+          required: [rule, quote, reason]
+          properties:
+            rule:
+              type: string
+              enum: [no-exclamation, no-first-person, no-marketing-superlative]
+            quote:
+              type: string      # the offending text, verbatim from the document
+            reason:
+              type: string      # why that quote breaks that rule
+
+limits:
+  max_turns: 8
+  max_tokens: 60000
+  timeout: 3m
+session_dir: sessions

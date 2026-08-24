@@ -2,5 +2,6 @@
 /dist/
 /coverage.out
 /sessions/
+/testdata/marina/sessions/
 .context/
 .gstack/
