@@ -49,6 +49,15 @@ type Event struct {
 	InputTokens  int      `json:"input_tokens,omitempty"`
 	OutputTokens int      `json:"output_tokens,omitempty"`
 	FinishReason string   `json:"finish_reason,omitempty"`
+	// ReasoningBytes is the size of the provider's reasoning payload for this
+	// turn (v1.4, additive; absent means none).
+	//
+	// SECURITY: the size, never the content. Reasoning is the model's
+	// unfiltered scratchpad - it can restate a credential in words the value
+	// redactor never sees - and replay does not need it (the fake provider
+	// scripts responses). What an operator asking "why did this turn cost
+	// that much?" needs is exactly this number.
+	ReasoningBytes int `json:"reasoning_bytes,omitempty"`
 
 	// tool_call / tool_result. CallID links both back to the requesting
 	// llm_response entry in ToolCallIDs.
@@ -322,14 +331,18 @@ func (w *Writer) RunStart(model, task string) {
 }
 
 // LLMResponse records one provider round-trip: the assistant's text (clipped
-// and redacted), the IDs of any tool calls it requested, and the token
-// accounting.
-func (w *Writer) LLMResponse(turn int, content string, toolCallIDs []string, inputTokens, outputTokens int, finishReason string) {
+// and redacted), the IDs of any tool calls it requested, the token accounting,
+// and the SIZE of the turn's reasoning payload.
+//
+// reasoningBytes is a length, not a payload: the caller passes
+// len(message.Reasoning) and the reasoning itself is never written (see
+// Event.ReasoningBytes). Zero means the turn carried none.
+func (w *Writer) LLMResponse(turn int, content string, toolCallIDs []string, inputTokens, outputTokens int, finishReason string, reasoningBytes int) {
 	w.emit(Event{
 		Type: "llm_response", Turn: turn,
 		Content: w.clip(content), ToolCallIDs: toolCallIDs,
 		InputTokens: inputTokens, OutputTokens: outputTokens,
-		FinishReason: finishReason,
+		FinishReason: finishReason, ReasoningBytes: reasoningBytes,
 	})
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -684,6 +685,37 @@ func TestTuningZeroValueSendsNothing(t *testing.T) {
 	req := fake.Requests[0]
 	if req.MaxOutputTokens != 0 || req.Reasoning != nil || req.Temperature != nil || req.TopP != nil || req.Extra != nil {
 		t.Errorf("untuned request carries knobs: %+v", req)
+	}
+}
+
+// TestReasoningBytesReachTheSessionLog: a turn whose provider returned a
+// reasoning payload logs its SIZE (JSONL v1.4) and never its content. The size
+// is what answers "why did this turn cost that much?"; the content is the
+// model's unfiltered scratchpad and stays out of the audit trail.
+func TestReasoningBytesReachTheSessionLog(t *testing.T) {
+	reasoning := `{"type":"thinking","thinking":"the log will say"}`
+	fake := &llm.Fake{Responses: []llm.Response{
+		llm.TextResponse("answer", usage(1, 1)).WithReasoning(json.RawMessage(reasoning)),
+	}}
+	w, err := session.New(t.TempDir(), session.Options{Clock: fixedSessionClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := newLoop(t, fake, Limits{})
+	l.Session = w
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := fmt.Sprintf(`"reasoning_bytes":%d`, len(reasoning)); !strings.Contains(string(data), want) {
+		t.Errorf("session log is missing %s:\n%s", want, data)
+	}
+	if strings.Contains(string(data), "the log will say") {
+		t.Errorf("reasoning CONTENT reached the session log:\n%s", data)
 	}
 }
 

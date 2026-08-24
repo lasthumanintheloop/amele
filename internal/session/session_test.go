@@ -3,6 +3,7 @@ package session
 import (
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,11 +34,13 @@ func TestWriterGolden(t *testing.T) {
 	}
 
 	w.RunStart("test-model", "scan the logs")
-	w.LLMResponse(1, "let me read the log", []string{"call_1"}, 100, 20, "tool_calls")
+	// A turn that carried reasoning reports its SIZE only - the log never
+	// carries the thinking itself.
+	w.LLMResponse(1, "let me read the log", []string{"call_1"}, 100, 20, "tool_calls", len(`"the log is where the errors are"`))
 	w.ToolCall("call_1", "fs_read", `{"path":"app.log"}`)
 	// The secret arrives via tool output and must be redacted by value.
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "fs_read", Result: "line with sk-supersecret token", Outcome: OutcomeOK})
-	w.LLMResponse(2, "all clear", nil, 150, 30, "stop")
+	w.LLMResponse(2, "all clear", nil, 150, 30, "stop", 0)
 	w.RunEnd("success", 0, 2, 1, 300, 1500*time.Millisecond)
 
 	got, err := os.ReadFile(w.Path())
@@ -108,6 +111,43 @@ func TestWriterAppendsUnconditionally(t *testing.T) {
 	}
 }
 
+// TestLLMResponseReasoningBytes pins the v1.4 field: an assistant turn that
+// carried a reasoning payload reports its SIZE, and a turn without one omits
+// the field entirely (omitempty, so pre-1.4 consumers see the log they knew).
+//
+// SECURITY: the reasoning CONTENT is deliberately absent from the log. It is
+// the model's unfiltered scratchpad - it can restate a secret the redactor
+// never saw as a value - and replay does not need it. The size is what an
+// operator asking "why did this turn cost that much?" actually needs.
+func TestLLMResponseReasoningBytes(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reasoning := `{"type":"thinking","thinking":"the answer is 4"}`
+	w.LLMResponse(1, "thinking hard", nil, 10, 5, "stop", len(reasoning))
+	w.LLMResponse(2, "no reasoning here", nil, 10, 5, "stop", 0)
+
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 events, got:\n%s", data)
+	}
+	if want := fmt.Sprintf(`"reasoning_bytes":%d`, len(reasoning)); !strings.Contains(lines[0], want) {
+		t.Errorf("first event does not carry %s:\n%s", want, lines[0])
+	}
+	if strings.Contains(lines[1], "reasoning_bytes") {
+		t.Errorf("a turn with no reasoning must omit the field:\n%s", lines[1])
+	}
+	if strings.Contains(string(data), "the answer is 4") {
+		t.Errorf("reasoning CONTENT leaked into the log:\n%s", data)
+	}
+}
+
 func TestRedaction(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(dir, Options{Clock: fixedClock(), Secrets: []string{"sk-verysecret", "tiny"}})
@@ -117,7 +157,7 @@ func TestRedaction(t *testing.T) {
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "t", Result: "key=sk-verysecret and tiny goes too", Outcome: OutcomeOK})
 	// The model may echo a secret in its answer text; that path must be
 	// redacted too now that content is logged.
-	w.LLMResponse(2, "the key is sk-verysecret", nil, 1, 1, "stop")
+	w.LLMResponse(2, "the key is sk-verysecret", nil, 1, 1, "stop", 0)
 	w.RunEnd("success", 0, 1, 1, 10, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
@@ -162,7 +202,7 @@ func TestReplaySource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.LLMResponse(1, "reading the log now", []string{"call_9"}, 10, 5, "tool_calls")
+	w.LLMResponse(1, "reading the log now", []string{"call_9"}, 10, 5, "tool_calls", 0)
 	w.ToolCall("call_9", "fs_read", `{"path":"x"}`)
 	w.ToolResult(ToolResult{CallID: "call_9", Tool: "fs_read", Result: "data", Outcome: OutcomeOK})
 	w.RunEnd("success", 0, 1, 1, 15, time.Second)
@@ -221,7 +261,7 @@ func TestClipRuneBoundary(t *testing.T) {
 func TestNilWriterIsSafe(t *testing.T) {
 	var w *Writer
 	w.RunStart("m", "t")
-	w.LLMResponse(1, "c", []string{"id"}, 1, 1, "stop")
+	w.LLMResponse(1, "c", []string{"id"}, 1, 1, "stop", 0)
 	w.ToolCall("id", "t", "{}")
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: "r", Outcome: OutcomeOK})
 	w.MCPConnect(MCPConnect{Server: "s", Transport: "stdio", OK: true})
@@ -418,7 +458,7 @@ func TestOutcomeFieldsAreToolResultOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.RunStart("m", "task")
-	w.LLMResponse(1, "text", []string{"c1"}, 1, 1, "tool_calls")
+	w.LLMResponse(1, "text", []string{"c1"}, 1, 1, "tool_calls", 0)
 	w.ToolCall("c1", "shell", "{}")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: "out", Outcome: OutcomeOK})
 	w.RunEnd("success", 0, 1, 1, 2, time.Second)

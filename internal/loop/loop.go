@@ -328,8 +328,11 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 		}
 		// The logged number is offset by TurnBase so a multi-call session
 		// (chat) keeps counting up; the loop's own budget still uses `turn`.
+		// The reasoning payload is logged as a SIZE only (JSONL v1.4): the loop
+		// never parses it, and its content is the one field of a turn that must
+		// not reach the log (session.Event.ReasoningBytes).
 		l.Session.LLMResponse(l.TurnBase+turn, resp.Message.Content, toolCallIDs(resp.Message.ToolCalls),
-			resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.FinishReason)
+			resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.FinishReason, len(resp.Message.Reasoning))
 
 		if err := l.checkTokenBudget(res, resp); err != nil {
 			return finish(err)

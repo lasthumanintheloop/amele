@@ -1,8 +1,9 @@
 # JSONL event schema
 
-**v1.3 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
-`result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2) and
-`mcp_connect.auth` (v1.3) added additively (every v1 field unchanged, and the
+**v1.4 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+`result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
+`mcp_connect.auth` (v1.3) and `llm_response.reasoning_bytes` (v1.4) added
+additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
 and (future) replay input are deliberately the same format. Source of truth:
@@ -29,7 +30,7 @@ Every line is one JSON object with three always-present fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `v` | int | Wire schema version. Always `1` for this document - the `v1.3` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
+| `v` | int | Wire schema version. Always `1` for this document - the `v1.4` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
 | `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
@@ -56,6 +57,7 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `input_tokens` | int | Provider-reported input tokens for **this** round-trip (not cumulative). |
 | `output_tokens` | int | Provider-reported output tokens for this round-trip. |
 | `finish_reason` | string | The provider's finish reason verbatim (`stop`, `length`, `tool_calls`, `content_filter`, `error`, ...); may be absent when the provider omits it. |
+| `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is never logged**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn. Since v1.4. |
 
 ### `tool_call` - the model requested a tool
 
@@ -304,3 +306,19 @@ worth recording afterwards is which mechanism authenticated the connect.
   treat an unknown value as "some other mechanism", never as a parse failure;
 - a token value is not in the log and never will be: a reader that needs the
   expiry or the issuer reads `amele mcp status`, not the session file.
+
+### v1.4 (amele v0.2.0) - reasoning observability (additive, `v` stays `1`)
+
+Added one optional field to `llm_response`: `reasoning_bytes`. Nothing was
+removed, renamed or re-typed, no other event type changed a byte, and no new
+event type appeared.
+
+**Migration:** none required. Concretely:
+
+- absent `reasoning_bytes` means the turn carried no reasoning payload - or
+  the log predates v1.4. It never means "unknown";
+- it is a SIZE and stays one. The reasoning content is deliberately not in the
+  log and never will be (see the field's note above), so a consumer must not
+  expect the payload to appear beside it in a later revision;
+- the number is the size amele stored, before any clipping applies to other
+  fields - reasoning is not clipped because it is not written.
