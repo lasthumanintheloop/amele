@@ -1,0 +1,1 @@
+{"model":"gpt-5.6-sol","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"max_completion_tokens":4096,"reasoning_effort":"none"}

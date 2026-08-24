@@ -1,0 +1,1 @@
+{"model":"openai/gpt-5.6-sol","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"max_tokens":16384,"reasoning":{"effort":"high"}}

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +56,11 @@ type OpenAIClient struct {
 	// BaseURL is the API root without a trailing slash,
 	// e.g. "https://api.openai.com/v1".
 	BaseURL string
+	// Dialect selects the variation of the OpenAI-compatible wire format this
+	// endpoint speaks: which field carries the output cap, how the reasoning
+	// knob is spelled. The zero value behaves exactly like DialectOpenAI, so a
+	// client constructed before dialects existed keeps its behavior.
+	Dialect Dialect
 	// APIKey is sent as a Bearer token when non-empty.
 	APIKey string
 	// HTTPClient is injectable for tests; nil means a client bounded by
@@ -74,6 +81,10 @@ type OpenAIClient struct {
 
 // Wire types for the OpenAI-compatible JSON body. Kept unexported: the rest
 // of the codebase only sees the neutral types in llm.go.
+// Every field amele owns is a struct member (not a map entry) so the encoded
+// key order is fixed by the declaration order: the wire goldens are then
+// byte-stable, and a reviewer reads a diff of the request instead of a diff of
+// Go map iteration.
 type oaRequest struct {
 	Model    string      `json:"model"`
 	Messages []oaMessage `json:"messages"`
@@ -81,6 +92,17 @@ type oaRequest struct {
 	// ResponseFormat is a pointer so the key vanishes entirely for plain-text
 	// runs: strict gateways reject unknown/null keys they do not implement.
 	ResponseFormat *oaResponseFormat `json:"response_format,omitempty"`
+	// MaxTokens and MaxCompletionTokens are the two spellings of the output
+	// cap. Exactly one is ever set - capField picks it from the dialect - and
+	// both are omitempty so a request that asked for no cap sends neither and
+	// inherits the provider's own default.
+	MaxTokens           int `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int `json:"max_completion_tokens,omitempty"`
+	// Temperature and TopP are pointers because 0 is a meaningful sampling
+	// value: omitempty on a float64 would silently drop `temperature: 0`, the
+	// exact setting a deterministic run asks for.
+	Temperature *float64 `json:"temperature,omitempty"`
+	TopP        *float64 `json:"top_p,omitempty"`
 }
 
 // oaResponseFormat is the OpenAI json_schema response format. Only the
@@ -184,8 +206,8 @@ func (e *statusError) rejectsResponseFormat() bool {
 // transparently repeats the call once without the field; see the fallback
 // comment below.
 func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error) {
-	wire := c.toWire(req)
-	body, err := json.Marshal(wire)
+	wire, fields := c.toWire(req)
+	body, err := encodeBody(wire, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encoding request: %v", ErrProvider, err)
 	}
@@ -200,7 +222,7 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	var fallbackBody []byte
 	if wire.ResponseFormat != nil {
 		wire.ResponseFormat = nil
-		fallbackBody, err = json.Marshal(wire)
+		fallbackBody, err = encodeBody(wire, fields)
 		if err != nil {
 			return nil, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
 		}
@@ -362,8 +384,16 @@ func parseRetryAfter(header string) time.Duration {
 	return time.Duration(secs) * time.Second
 }
 
-// toWire converts the neutral request into the OpenAI JSON shape.
-func (c *OpenAIClient) toWire(req Request) oaRequest {
+// toWire converts the neutral request into the OpenAI JSON shape for this
+// client's dialect. It returns the struct-encoded part of the body and the
+// body-root fragments that are merged after marshalling: the dialect's
+// reasoning fields (whose KEY depends on the dialect, which a Go struct cannot
+// express) and the caller's raw provider.params.
+//
+// CONTRACT: params keys cannot collide with the fields amele owns - config
+// validation rejects that at exit 2 - so merging them needs no further
+// defense here.
+func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessage) {
 	out := oaRequest{Model: req.Model}
 	for _, m := range req.Messages {
 		wm := oaMessage{Role: m.Role, Content: m.Content, ToolCallID: m.ToolCallID}
@@ -389,7 +419,83 @@ func (c *OpenAIClient) toWire(req Request) oaRequest {
 			},
 		}
 	}
-	return out
+	if req.MaxOutputTokens > 0 {
+		if capField(c.Dialect) == "max_tokens" {
+			out.MaxTokens = req.MaxOutputTokens
+		} else {
+			out.MaxCompletionTokens = req.MaxOutputTokens
+		}
+	}
+	// Sampling is passed through on every dialect. The only target that
+	// forbids it (kimi's fixed K-series values) is stopped at validate, so a
+	// value that reaches here was asked for deliberately and is never dropped
+	// silently by amele.
+	out.Temperature = req.Temperature
+	out.TopP = req.TopP
+
+	// MapReasoning allocates a fresh map per call, so extending it with the
+	// raw params below cannot leak into another request.
+	var fields map[string]json.RawMessage
+	if req.Reasoning != nil {
+		fields = MapReasoning(c.Dialect, *req.Reasoning).Fields
+	}
+	for key, value := range req.Extra {
+		if fields == nil {
+			fields = make(map[string]json.RawMessage, len(req.Extra))
+		}
+		fields[key] = value
+	}
+	return out, fields
+}
+
+// encodeBody renders one request body: the struct-encoded fields first, in
+// declaration order, then the merged fragments.
+func encodeBody(wire oaRequest, fields map[string]json.RawMessage) ([]byte, error) {
+	body, err := json.Marshal(wire)
+	if err != nil {
+		return nil, fmt.Errorf("encoding request: %w", err)
+	}
+	return mergeBodyFields(body, fields)
+}
+
+// mergeBodyFields appends pre-serialized fragments to the root of an already
+// encoded JSON object.
+//
+// Hand-editing JSON is normally a smell; it is the right tool here because the
+// KEY of a dialect's reasoning field and of every provider.params entry is
+// data, not a Go type, and re-encoding the whole body through a map would give
+// up the stable key order the goldens (and reviewable request diffs) depend
+// on. The keys are merged in sorted order for that same reason - Go map
+// iteration is randomized - and every value is passed through json.Compact, so
+// an unparseable fragment fails the request here instead of reaching the
+// provider as a malformed body it answers with an opaque 400.
+func mergeBodyFields(body []byte, fields map[string]json.RawMessage) ([]byte, error) {
+	if len(fields) == 0 {
+		return body, nil
+	}
+	if len(body) < 2 || body[0] != '{' || body[len(body)-1] != '}' {
+		return nil, fmt.Errorf("merging request fields: body is not a JSON object")
+	}
+	out := make([]byte, 0, len(body)+64)
+	out = append(out, body[:len(body)-1]...)
+	for _, key := range slices.Sorted(maps.Keys(fields)) {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, fields[key]); err != nil {
+			return nil, fmt.Errorf("merging request field %q: %w", key, err)
+		}
+		// An object that is still empty ends with '{' and takes no separator.
+		if out[len(out)-1] != '{' {
+			out = append(out, ',')
+		}
+		encodedKey, err := json.Marshal(key)
+		if err != nil {
+			return nil, fmt.Errorf("merging request field %q: %w", key, err)
+		}
+		out = append(out, encodedKey...)
+		out = append(out, ':')
+		out = append(out, compact.Bytes()...)
+	}
+	return append(out, '}'), nil
 }
 
 func (c *OpenAIClient) httpClient() *http.Client {

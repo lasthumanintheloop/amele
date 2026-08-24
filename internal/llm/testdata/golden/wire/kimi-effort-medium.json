@@ -1,0 +1,1 @@
+{"model":"kimi-k3","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"max_completion_tokens":131072,"reasoning_effort":"high"}

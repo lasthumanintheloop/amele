@@ -1,0 +1,1 @@
+{"model":"anthropic/claude-opus-5","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"reasoning":{"max_tokens":8192}}

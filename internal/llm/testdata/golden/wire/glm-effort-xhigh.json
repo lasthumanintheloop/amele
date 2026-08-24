@@ -1,0 +1,1 @@
+{"model":"glm-5.3","messages":[{"role":"system","content":"you are a log sentry"},{"role":"user","content":"scan today's log"}],"max_tokens":131072,"temperature":0.6,"reasoning_effort":"max","thinking":{"type":"enabled"}}
