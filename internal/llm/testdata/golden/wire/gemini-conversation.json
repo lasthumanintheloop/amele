@@ -1,0 +1,1 @@
+{"contents":[{"role":"user","parts":[{"text":"scan today's log"}]},{"role":"model","parts":[{"text":"nothing unusual"}]},{"role":"user","parts":[{"text":"and yesterday's?"}]}],"systemInstruction":{"parts":[{"text":"you are a log sentry"},{"text":"answer in English"}]}}
