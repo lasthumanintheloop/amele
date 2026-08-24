@@ -1,0 +1,422 @@
+# Providers: one config, many endpoints
+
+amele speaks two wire formats: OpenAI-compatible `chat/completions` (the
+default) and the native Anthropic Messages API (`provider.type: anthropic`).
+The first one is nominally a single protocol and is in practice a family of
+them - the providers speaking it disagree about which field carries the output
+cap, how the reasoning knob is spelled, and whether the model's own reasoning
+has to be handed back to it inside a tool loop. `provider.dialect` names which
+variation your endpoint speaks, and one config can then say what it *wants*
+once and be run against any of them.
+
+The promise is not "every feature works everywhere". It is:
+
+> Nothing amele sends is silently dropped, and nothing a provider requires -
+> reasoning echo-back above all - is silently violated. Every mapping and
+> every degradation is visible in `amele explain` and in the session log.
+
+**How to read this page.** Every behavior described here is either pinned by a
+test in this repository or verified against the provider's official
+documentation on 2026-08-24. Where neither is true - a provider documents
+nothing, or documents two contradictory things - the claim is marked
+**unverified** and says what amele does about it. Model ids and base URLs are
+the parts that rot fastest; copy them from your provider's own docs if they
+have moved.
+
+## The tuning surface
+
+```yaml
+provider:
+  type: openai                # openai (default) | anthropic - the WIRE
+  dialect: deepseek           # openai (default) | deepseek | glm | kimi
+                              #                  | groq | openrouter
+  base_url: https://api.deepseek.com
+  api_key: ${DEEPSEEK_API_KEY}
+  max_output_tokens: 8192     # the per-request output ceiling
+  reasoning:
+    effort: high              # none | low | medium | high | xhigh | max
+    budget_tokens: 8192       # a token count instead of a level
+  temperature: 0.2
+  top_p: 0.9
+  params:                     # escape hatch: merged verbatim into the body
+    provider: {require_parameters: true}   # e.g. an OpenRouter routing rule
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `type` | `openai` | The wire format. `anthropic` selects the native Messages API, where `dialect` is not consulted at all. |
+| `dialect` | `openai` | Which variation of the OpenAI-compatible format this endpoint speaks. **Explicit, never sniffed** from `base_url`: a silently chosen dialect would reshape every request in a way the YAML file does not show. `explain` prints a hint when the host is one it recognizes. |
+| `max_output_tokens` | none (openai wire) / `8192` (anthropic wire) | The per-request output ceiling. The dialect picks the field name (`max_completion_tokens` or `max_tokens`); the Messages API requires the field, so that wire always sends one. **Reasoning tokens are billed against this ceiling** on every provider that reports them. |
+| `reasoning.effort` | none | The reasoning depth, in a vocabulary that is the UNION of what the providers accept - no single provider takes all six values. A dialect with a smaller vocabulary rounds **up** to the nearest level it has and says so in `explain`: the config asked for at least this much thinking, and quietly buying less is the failure mode you cannot see in the output. |
+| `reasoning.budget_tokens` | none | A token budget instead of a level. Only the anthropic wire and the `openrouter` dialect can carry one; anywhere else it is a config error (exit 2) rather than a silently dropped field. |
+| `temperature` | none | `[0, 2]`, narrowed to `[0, 1]` on the anthropic wire and on the `glm` dialect. Unset means the provider decides - which is not the same as `0`. |
+| `top_p` | none | `(0, 1]`. `0` is rejected rather than clamped: an empty nucleus is a 400, not greedy decoding. |
+| `params` | none | Arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for. Keys amele writes itself (`model`, `messages`, `tools`, `response_format`, `max_tokens`, `max_completion_tokens`, `reasoning`, `reasoning_effort`, `thinking`, `temperature`, `top_p`, `stream`, `output_config`, `system`) are a config error, so `params` can extend a request but never rewrite one. |
+
+`provider.max_output_tokens`, `provider.reasoning.effort`,
+`provider.temperature` and `provider.top_p` are in the `--set` override
+allowlist, so one config can be swept over several settings from a shell loop.
+`provider.dialect`, `provider.reasoning.budget_tokens` and `provider.params`
+are deliberately not ([cli.md](contracts/cli.md#set)).
+
+## The dialect table
+
+What each dialect makes of the same config, on the OpenAI-compatible wire:
+
+| dialect | `reasoning.effort` becomes | output cap field | reasoning returned / echoed back | sampling | `output.schema` | unknown request fields |
+| --- | --- | --- | --- | --- | --- | --- |
+| `openai` | `reasoning_effort` (verbatim) | `max_completion_tokens` | nothing returned on this API | passed through | native `response_format: json_schema` | rejected (400) |
+| `deepseek` | `thinking: {"type":"enabled"}` + `reasoning_effort` (medium->high, xhigh->max); `none` -> `thinking: {"type":"disabled"}` | `max_tokens` | `reasoning_content`, echoed back on **every** later request | passed through (ignored while thinking) | fallback: validate + retry | ignored (undocumented, observed) |
+| `glm` | same as `deepseek` | `max_tokens` | `reasoning_content`, echoed back | passed through, `temperature` capped at 1 | fallback: validate + retry | not documented; assume rejected (400) |
+| `kimi` | `reasoning_effort` (medium->high, xhigh->max), no thinking object | `max_completion_tokens` | `reasoning_content`, echoed back | **config error**: the K-series fixes `temperature`/`top_p` | attempted, then fallback | not documented; assume rejected (400) |
+| `groq` | `reasoning_effort` (verbatim) | `max_completion_tokens` | captured if present, echoed back | passed through | native `json_schema`, with fallback | not documented; assume rejected (400) |
+| `openrouter` | `reasoning: {"effort": ...}` (verbatim; `budget_tokens` -> `reasoning: {"max_tokens": N}`) | `max_tokens` | `reasoning_details` array, echoed back verbatim and in order | passed through (the gateway drops what the model cannot take) | native `json_schema` - but see [OpenRouter](#openrouter) | passed through to the upstream provider |
+
+Three rules are worth stating outside the table.
+
+**Behavior keys on the dialect, never on the model name.** Model ids churn
+within months - `deepseek-chat` and `deepseek-reasoner` were retired in July
+2026, `kimi-k2-thinking` in May 2026 - so a model-behavior table in amele would
+be wrong before your next upgrade. Model-level quirks are recognized from the
+provider's own error text instead and answered with advice (see [When a
+provider says no](#when-a-provider-says-no)).
+
+**The reasoning carrier is unconditional.** DeepSeek thinks by default; Kimi's
+K-series and GLM-5.3 cannot be switched off at all. So capturing the reasoning
+payload and echoing it back is dialect behavior that runs even when your config
+never mentions reasoning. `provider.reasoning` is opt-in; the carrier is not.
+
+**The payload is opaque.** amele stores what the wire returned as raw bytes and
+writes those same bytes back in the dialect's own shape - never parsed, never
+reordered, never truncated. It has to be byte-exact: Anthropic signs its
+thinking blocks, and OpenRouter requires the block sequence to match "the
+outputs generated by the model during the original request".
+
+## The Anthropic wire
+
+`provider.type: anthropic` selects the native Messages API. The dialect is not
+consulted there (a leftover `dialect:` is reported as ignored, not as an
+error), and the reasoning knob takes a different shape:
+
+| config | request |
+| --- | --- |
+| `reasoning.effort: high` | `thinking: {"type":"adaptive"}` + `output_config: {"effort":"high"}` - the current models' shape |
+| `reasoning.effort: none` | `thinking: {"type":"disabled"}` |
+| `reasoning.budget_tokens: 8192` | `thinking: {"type":"enabled","budget_tokens":8192}` - the legacy shape, Haiku 4.5 and older. A budget **wins** over an effort: the two target different model generations and cannot be combined. |
+
+- The effort vocabulary needs no rounding: Anthropic's own levels are
+  low/medium/high/xhigh/max, which is the neutral union minus `none`.
+- `max_output_tokens` is required on every request; without one amele sends
+  **8192**. On this wire a `budget_tokens` is drawn from the same ceiling, so a
+  budget at or above `max_output_tokens` leaves nothing for the answer and is a
+  config error (exit 2) rather than a 400 on your first unattended run.
+- `output.schema` is enforced natively (`output_config.format`), with the
+  validate+retry layer still behind it.
+- `temperature` above 1 is a config error; current models reject any
+  non-default sampling value outright, which amele can only recognize at run
+  time (see below).
+- The two thinking shapes are **not** interchangeable: `adaptive` is a 400 on
+  Claude 4.5 and older, and the legacy `enabled` shape is a 400 on 4.7+. amele
+  sends what your config asked for and lets the provider's own error name the
+  mismatch - it does not guess a model generation.
+
+DeepSeek, GLM and Kimi all publish Anthropic-compatible endpoints
+(`api.deepseek.com/anthropic`, `api.z.ai/api/anthropic`,
+`api.moonshot.ai/anthropic`). They work through this same client via
+`base_url`, with the provider's own deviations - DeepSeek ignores
+`budget_tokens` there, for instance. Those are documentation facts, not amele
+behavior: nothing in the code special-cases them.
+
+## Quickstarts
+
+Copy one, set the key in your environment, run `amele explain` before you spend
+a token.
+
+The `base_url` and model values below are what each provider publishes today
+and are **not pinned by any test here** - they are the fastest-rotting part of
+this page. Note that the OpenAI-compatible endpoint sits at a different path
+per provider (`/openai/v1` at Groq, `/api/paas/v4` at Z.ai, the bare root at
+DeepSeek); take the exact one from your provider's own documentation.
+
+**OpenAI**
+
+```yaml
+model: gpt-5.5
+provider:
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  max_output_tokens: 32768        # reserve room: reasoning is billed here too
+  reasoning: {effort: medium}
+```
+
+**Anthropic**
+
+```yaml
+model: claude-haiku-4-5
+provider:
+  type: anthropic                 # native Messages API; no /v1 in base_url
+  api_key: ${ANTHROPIC_API_KEY}
+  max_output_tokens: 16384
+  reasoning: {budget_tokens: 4096}   # Haiku 4.5 and older; newer: effort
+```
+
+**DeepSeek (native)**
+
+```yaml
+model: deepseek-v4-flash
+provider:
+  dialect: deepseek
+  base_url: https://api.deepseek.com
+  api_key: ${DEEPSEEK_API_KEY}
+  max_output_tokens: 8192
+  reasoning: {effort: low}
+```
+
+DeepSeek thinks by default, so a config with no `reasoning` block still gets
+reasoning back - and still has to echo it. Set `effort: none` to turn thinking
+off. `output.schema` runs on the fallback path here (no `json_schema` support).
+
+**GLM (Z.ai)**
+
+```yaml
+model: glm-5.3
+provider:
+  dialect: glm
+  base_url: https://api.z.ai/api/paas/v4
+  api_key: ${ZAI_API_KEY}
+  max_output_tokens: 16384
+  reasoning: {effort: high}
+  temperature: 0.3                # GLM's range is 0..1, not 0..2
+```
+
+**Kimi (Moonshot)**
+
+```yaml
+model: kimi-k3
+provider:
+  dialect: kimi
+  base_url: https://api.moonshot.ai/v1
+  api_key: ${MOONSHOT_API_KEY}
+  max_output_tokens: 32768        # Kimi advises >= 16000 when tools are in play
+  reasoning: {effort: high}
+```
+
+`temperature` and `top_p` are a **config error** on this dialect: the K-series
+pins them and answers any other value with a 400, so amele refuses at validate
+instead of letting the run die at 03:00. `reasoning.effort: none` is refused
+for the same reason - these models cannot stop thinking.
+
+amele sends no `thinking` object on this dialect: K3 has no such parameter, and
+emitting one would be a guess at which model generation is behind the name.
+That leaves the older K2.x thinking controls (`thinking: {type, keep}`)
+unreachable from a config - `params` cannot supply them, because `thinking` is
+a field amele owns and a collision there is a config error. Those models run
+with their own defaults; `reasoning.effort` is the knob amele offers.
+
+**Groq**
+
+```yaml
+model: openai/gpt-oss-20b
+provider:
+  dialect: groq
+  base_url: https://api.groq.com/openai/v1
+  api_key: ${GROQ_API_KEY}
+  max_output_tokens: 8192
+  reasoning: {effort: low}
+```
+
+Groq takes `reasoning_effort` and amele passes the value through verbatim.
+**Which values a given Groq-hosted model accepts is model-dependent and not
+verified here** - the vocabulary differs per model family, and amele keeps no
+per-model table. If the model does not know your value, Groq's own 400 names
+it.
+
+**OpenRouter**
+
+```yaml
+model: anthropic/claude-sonnet-5
+provider:
+  dialect: openrouter
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+  max_output_tokens: 16384
+  reasoning: {effort: high}       # the gateway maps it per upstream provider
+  params:
+    provider: {require_parameters: true}
+```
+
+OpenRouter's `json_schema` support is a **soft preference**: it is silently
+ignored when the endpoint serving your request cannot honor it, and support
+varies per endpoint rather than per model. `require_parameters: true` turns
+that into routing - the gateway only picks providers that support every
+parameter you sent. Without it, a dropped `json_schema` is the one degradation
+amele cannot report: an ignored field produces no 400, so there is nothing to
+warn about, and the run's only enforcement is the local validate+retry layer.
+That still holds the exit-code contract - stdout is schema-valid JSON or the
+run is exit 6 - it just costs retries no one asked for.
+
+Because the reasoning payload carries upstream signatures, a session's
+reasoning cannot be replayed against a different model. That is a property of
+the gateway, not of amele - amele only sends back what it received, for the
+model that produced it.
+
+## Reasoning costs tokens twice
+
+Every provider that returns reasoning charges it against the **output** cap of
+the turn that produced it. Then, in a tool loop, that same reasoning is sent
+back with the next request - where it is billed as **input**, again, on every
+later turn of the run.
+
+That has three practical consequences.
+
+1. **Leave room in `max_output_tokens`.** A cap sized for the answer alone is
+   how a run ends with `finish_reason: length` in the middle of a JSON
+   document. OpenAI advises reserving 25k for reasoning; Kimi advises at least
+   16000 when tools are involved. A config that sends no cap at all inherits
+   the provider's default, which may be much smaller than you think.
+2. **Size `limits.max_tokens` for the echo.** The run budget counts input
+   tokens, and a long tool loop re-sends the accumulated reasoning every turn.
+   Crossing the budget is exit 3, not a warning.
+3. **Watch `reasoning_bytes`.** Every `llm_response` event in the
+   [session log](contracts/jsonl-events.md#llm_response---one-per-provider-round-trip)
+   carries the byte size of that turn's reasoning payload (never its content -
+   the model's scratchpad is not written to disk). It is what answers "why did
+   that turn cost so much?".
+
+If a run does not need the depth, `reasoning: {effort: low}` or `none` is the
+cheapest change available - and on the dialects that cannot turn thinking off,
+the answer is a smaller model rather than a knob.
+
+## Structured output
+
+[`output.schema`](features.md#structured-output-outputschema) works on every
+provider; what differs is who enforces it.
+
+- **Natively** on `openai`, `groq`, `openrouter` and the anthropic wire: the
+  schema travels in the request (`response_format: json_schema`, or
+  `output_config.format` on the Messages API).
+- **By fallback** on `deepseek` and `glm`, which have no `json_schema` on this
+  wire, and on `kimi`, whose support is ambiguous (below). When the endpoint
+  answers a schema-carrying request with a 400 naming the field, amele repeats
+  that one request without it - once, immediately, costing no retry budget - and
+  enforces the schema itself: the answer is validated locally and violations
+  are fed back to the model for up to `output.max_schema_retries` repair
+  rounds.
+
+The fallback is not silent. The run prints a warning on stderr - `provider did
+not enforce output.schema natively; the validate+retry layer was the only
+enforcement` - and the exit-code contract is unchanged either way:
+stdout is a schema-valid JSON document, or the run fails with exit 6.
+
+Kimi is the ambiguous case: its API reference lists `json_schema` while its
+guide documents `json_object`, and the interaction with thinking is
+undocumented (**unverified**). amele therefore attempts the native path and
+takes the fallback if the endpoint refuses - which is the right behavior
+whichever way that documentation settles.
+
+## When a provider says no
+
+Some failures are configuration mistakes wearing a 400. amele recognizes a
+small, fixed set of them and appends advice in the vocabulary of the YAML file
+you are holding. The detection is a string match on the provider's error text
+by necessity, and it changes **nothing** but the message - no retry, no
+downgrade, no rewritten request. A provider that rewords its error costs you a
+hint, never correctness.
+
+| The provider says | amele adds |
+| --- | --- |
+| `Function tools with reasoning_effort are not supported for ...` | set `provider.reasoning.effort: none` for this model on chat/completions, or use a different model |
+| `'max_tokens' is not supported ... use 'max_completion_tokens'` | this model requires `max_completion_tokens`; set `provider.dialect` to a dialect that maps it (`openai`/`groq`/`kimi`) |
+| `Unsupported value: 'temperature' does not support ...` | this model rejects non-default sampling; remove `provider.temperature`/`top_p` |
+| `temperature may only be set to 1 when thinking is enabled` (anthropic) | this model rejects non-default sampling; remove `provider.temperature`/`top_p` |
+
+### The gpt-5.6 chat/completions restriction
+
+On OpenAI's `chat/completions`, the gpt-5.6 family rejects a request that
+carries **function tools together with any `reasoning_effort` other than
+`none`**. The default effort is `medium`, so an agent with tools breaks out of
+the box on those models. gpt-5.5 is not affected. (The restriction is in no
+official document; it is confirmed by the API's own error text and by several
+independent bug trackers - the error string is the only detection contract
+there is.)
+
+Two workarounds, both one line:
+
+```yaml
+provider:
+  reasoning: {effort: none}   # tools, no reasoning
+```
+
+```yaml
+model: gpt-5.5                # reasoning, tools, older family
+```
+
+amele does **not** silently downgrade the effort for you. Choosing between "no
+thinking" and "another model" is a decision about the agent's quality, and an
+agent framework that made it behind your back would be lying about what it
+sent.
+
+## What amele does not do
+
+- **No dialect auto-detection.** `explain` prints
+  `hint: base_url looks like api.deepseek.com; consider dialect: deepseek` when
+  it recognizes a host (`api.deepseek.com`, `api.z.ai`, `open.bigmodel.cn`,
+  `api.moonshot.ai`, `api.moonshot.cn`, `api.groq.com`, `openrouter.ai`,
+  `api.openrouter.ai`) and your config picked something else. It is a hint. You
+  pick.
+- **No model-capability database.** Nothing in amele maps a model id to a
+  behavior, because such a table is wrong within a release cycle.
+- **No auto-downgrade.** amele never removes a parameter you set to make a
+  request succeed. The one place it drops a field - `response_format` (or
+  `output_config`) on an endpoint that refuses it - is announced as a warning
+  and the schema is enforced anyway.
+- **No OpenAI Responses API.** `chat/completions` is the only OpenAI transport,
+  and streaming is a later slice ([roadmap](../README.md#roadmap)).
+
+## Verify it before you trust it
+
+```console
+$ amele explain agent.yaml
+MODEL & PROVIDER
+  model:           "deepseek-v4-flash"
+  provider type:   "openai"
+  base_url:        "https://api.deepseek.com"
+  request_timeout: default (120s)
+  dialect:         "deepseek"
+  max_output_tokens: 8192
+  provider mapping (the wire fields this config will send):
+    max_output_tokens: 8192 -> max_tokens: 8192
+    reasoning.effort: low -> thinking: {"type":"enabled"}
+    reasoning.effort: low -> reasoning_effort: low
+```
+
+The mapping rows are produced by the same functions the clients call, so the
+report cannot promise a request amele will not send - including every rounding
+and every value that is **not** sent. `provider.params` keys are listed;
+their values never are, because a routing key can be a credential.
+
+The acceptance fixture for all of this is
+[testdata/marina/](../testdata/marina/): a style-guide checker that has to
+think, call a tool and still answer in schema. One parametrized config, run
+against every dialect you have a key for:
+
+```console
+$ MARINA_DIALECT=deepseek MARINA_BASE_URL=https://api.deepseek.com \
+  MARINA_MODEL=deepseek-v4-flash MARINA_API_KEY=$DEEPSEEK_API_KEY \
+  amele run testdata/marina/style-guide.yaml "check violating.md"
+```
+
+Its automated form is `cmd/amele/marina_integration_test.go`, behind the
+`integration` build tag: it asserts exit 0, one schema-valid JSON document on
+stdout, and no truncated turn in the session log.
+
+## See also
+
+- [features.md](features.md) - structured output, permissions, `chat`.
+- [contracts/cli.md](contracts/cli.md) - the `explain` report and the `--set`
+  allowlist.
+- [contracts/jsonl-events.md](contracts/jsonl-events.md) - `reasoning_bytes`.
+- [contracts/exit-codes.md](contracts/exit-codes.md) - exit 3 (budgets), 5
+  (provider errors), 6 (schema).
+- [mcp.md](mcp.md) - borrowing tools from MCP servers, which is where the tool
+  loops that make echo-back load-bearing usually come from.

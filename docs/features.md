@@ -63,6 +63,10 @@ How it is enforced:
 An `output.schema` that cannot compile is a config error: `amele validate`
 catches it, and `amele run` fails with exit 2 before spending a token.
 
+Which providers enforce a schema natively and which leave it to steps 2-4 is in
+[providers.md](providers.md#structured-output), together with a warning line on
+stderr whenever the native path was unavailable.
+
 **A schema constrains shape, not content.** stdout is printed raw: unlike the
 session log, it is **not** secret-redacted. If untrusted content can reach the
 model (scraped pages, log lines, issue bodies) and stdout feeds a cron mail or

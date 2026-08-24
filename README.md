@@ -185,6 +185,13 @@ provider:
   base_url: http://localhost:11434/v1   # Ollama; api_key not needed locally
 ```
 
+Any OpenAI-compatible endpoint works, and `provider.dialect` tells amele which
+variation of it you are talking to, so one config says what it wants -
+reasoning depth, sampling, output cap - and gets it mapped correctly on
+OpenAI, Anthropic, DeepSeek, GLM, Kimi, Groq or OpenRouter, with the reasoning
+a tool loop needs echoed back instead of dropped:
+[docs/providers.md](docs/providers.md).
+
 The same YAML also works interactively: `amele chat agent.yaml` is a REPL
 over the same prompt, tools and budgets - your own terminal agent from the
 same artifact you deploy.
