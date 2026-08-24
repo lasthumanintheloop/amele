@@ -2563,7 +2563,11 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	for _, typ := range []string{"", config.ProviderTypeOpenAI} {
 		cfg := &config.Config{Provider: pc}
 		cfg.Provider.Type = typ
-		client, ok := buildProvider(cfg).(*llm.OpenAIClient)
+		provider, err := buildProvider(cfg)
+		if err != nil {
+			t.Fatalf("type %q: buildProvider: %v", typ, err)
+		}
+		client, ok := provider.(*llm.OpenAIClient)
 		if !ok {
 			t.Fatalf("type %q: want *llm.OpenAIClient", typ)
 		}
@@ -2574,7 +2578,13 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 
 	cfg := &config.Config{Provider: pc}
 	cfg.Provider.Type = config.ProviderTypeAnthropic
-	client, ok := buildProvider(cfg).(*llm.AnthropicClient)
+	// A dialect is inert on this wire: it must not fail the construction.
+	cfg.Provider.Dialect = "deepseek"
+	provider, err := buildProvider(cfg)
+	if err != nil {
+		t.Fatalf("type anthropic: buildProvider: %v", err)
+	}
+	client, ok := provider.(*llm.AnthropicClient)
 	if !ok {
 		t.Fatal("type anthropic: want *llm.AnthropicClient")
 	}

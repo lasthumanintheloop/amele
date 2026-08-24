@@ -1,0 +1,49 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "openai"
+  base_url:        "https://api.groq.com/openai/v1"
+  request_timeout: default (120s)
+  dialect:         "deepseek"
+  hint: base_url looks like api.groq.com; consider dialect: groq
+  max_output_tokens: 4096
+  provider mapping (the wire fields this config will send):
+    max_output_tokens: 4096 -> max_tokens: 4096
+    reasoning.effort: medium -> thinking: {"type":"enabled"}
+    reasoning.effort: medium -> reasoning_effort: high (deepseek has no medium)
+    temperature: 0.2 -> temperature: 0.2
+    top_p: 0.9 -> top_p: 0.9
+    params keys (merged verbatim, values not shown): "provider", "verbosity"
+    unknown request fields: ignored
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): disabled
+  shell: disabled
+  subprocess tools: (none)
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  20
+  max_tokens: UNBOUNDED (no token budget)
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+
+WARNINGS
+  - limits.max_tokens is 0: no token budget bounds this run
+  - session_dir is not set: no session log (audit trail) will be written

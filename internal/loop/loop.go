@@ -8,6 +8,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -103,6 +104,32 @@ type Limits struct {
 // Clock supplies time for duration accounting; injected per docs/engineering.md §5.4.
 type Clock func() time.Time
 
+// Tuning carries the provider-neutral request knobs a config sets once and
+// every turn repeats: reasoning depth, sampling, the output cap and the raw
+// params escape hatch. The loop does not interpret any of them - it forwards
+// them verbatim on every round-trip and lets the client map them to its wire.
+//
+// CONTRACT: the knobs ride on EVERY request, not only the first. A tool turn
+// that dropped the reasoning knob would think shallower exactly where a task
+// needs it most, and a dropped cap would leave the rest of the run uncapped.
+//
+// The zero value asks for nothing, which is the pre-tuning behavior: every
+// field stays at the provider's own default.
+type Tuning struct {
+	// MaxOutputTokens caps the tokens the provider may generate per call.
+	// Zero sends no cap.
+	MaxOutputTokens int
+	// Reasoning is the neutral thinking knob; nil sends none.
+	Reasoning *llm.ReasoningSpec
+	// Temperature and TopP are the sampling knobs, pointers so an explicit 0
+	// stays distinguishable from "unset".
+	Temperature *float64
+	TopP        *float64
+	// Extra is provider.params, already serialized to JSON by the caller: the
+	// loop never re-encodes user YAML, and never inspects these keys.
+	Extra map[string]json.RawMessage
+}
+
 // Loop wires one run's collaborators together.
 type Loop struct {
 	Provider llm.Provider
@@ -167,6 +194,10 @@ type Loop struct {
 	// this field is only an optimization that makes the model right the first
 	// time more often.
 	ResponseFormat *llm.ResponseFormat
+
+	// Tuning holds the provider-neutral request knobs forwarded on every
+	// round-trip. The zero value sends nothing.
+	Tuning Tuning
 
 	// TurnBase is added to the turn number recorded in session events. It
 	// exists for callers that drive several RunMessages calls inside ONE
@@ -269,6 +300,13 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 			Messages:       messages,
 			Tools:          l.Registry.Defs(),
 			ResponseFormat: l.ResponseFormat,
+			// The tuning knobs are repeated on every turn by design - see
+			// Tuning's contract note.
+			MaxOutputTokens: l.Tuning.MaxOutputTokens,
+			Reasoning:       l.Tuning.Reasoning,
+			Temperature:     l.Tuning.Temperature,
+			TopP:            l.Tuning.TopP,
+			Extra:           l.Tuning.Extra,
 		})
 		if err != nil {
 			// A provider failure caused by our own context ending is not a

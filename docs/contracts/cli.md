@@ -363,6 +363,23 @@ up yet.
   toolset estimated above 4000 tokens earns a `WARNINGS` line suggesting
   `tools.include`. Servers are disconnected (and stdio child processes
   reaped) before the report is printed.
+- **Provider mapping rows** (additive, 2026-08-24): when the config sets any
+  provider tuning knob, the `MODEL & PROVIDER` block carries a
+  `provider mapping (the wire fields this config will send):` sub-block - the
+  resolved `dialect`, which field carries `max_output_tokens`
+  (`max_tokens` vs `max_completion_tokens`), what `provider.reasoning` becomes
+  on this dialect **including every rounding and every value that is not sent**
+  (e.g. `reasoning.effort: medium -> reasoning_effort: high (deepseek has no
+  medium)`), the sampling values, the `provider.params` **keys** and what this
+  endpoint does with an unrecognized field (`rejected (400)` / `ignored` /
+  `passed through`). The rows are produced by the same mapping functions the
+  clients call, so the report cannot promise a request amele will not send.
+  SECURITY: params **values are never printed** - a provider-specific routing
+  key can be a credential. When `base_url` names a host whose dialect the
+  config did not pick, a `hint: base_url looks like <host>; consider dialect:
+  <d>` row follows the dialect row: amele never auto-detects a dialect, it only
+  says what it noticed. A config that sets no tuning gets no such block, so
+  existing reports are unchanged.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
   ✗ MISSING), every executable the config needs on `PATH` (✓ found /

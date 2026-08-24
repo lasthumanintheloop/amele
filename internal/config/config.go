@@ -1016,6 +1016,33 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 	if c.dialectApplies(known) && dialect == llm.DialectKimi && r.Effort == "none" {
 		add("provider.reasoning.effort %q: kimi models cannot disable thinking", r.Effort)
 	}
+	c.validateThinkingBudgetFitsCap(add, r)
+}
+
+// validateThinkingBudgetFitsCap checks the one relation BETWEEN two tuning
+// fields: on the anthropic wire the thinking budget is drawn from max_tokens,
+// so a budget that meets or exceeds provider.max_output_tokens leaves no room
+// for the answer and the Messages API refuses the request.
+//
+// CONTRACT: this is a total rule of that wire, and both numbers are literals in
+// the same file - exactly the mistake validate exists to catch (exit 2) instead
+// of letting it surface as a provider error (exit 5) on the first unattended
+// run. It is scoped to the anthropic wire deliberately: the openrouter gateway,
+// the only other target that maps a budget, carves it out of max_tokens itself.
+func (c *Config) validateThinkingBudgetFitsCap(add func(format string, args ...any), r *ReasoningConfig) {
+	if c.Provider.Type != ProviderTypeAnthropic {
+		return
+	}
+	// Zero on either side means "unset": with no cap in the file there is no
+	// relation to check, and the model's own default ceiling is not a number
+	// this config knows.
+	if r.BudgetTokens <= 0 || c.Provider.MaxOutputTokens <= 0 {
+		return
+	}
+	if r.BudgetTokens >= c.Provider.MaxOutputTokens {
+		add("provider.reasoning.budget_tokens must be below provider.max_output_tokens (%d >= %d): on the anthropic wire the thinking budget is drawn from the same output ceiling, so nothing is left for the answer",
+			r.BudgetTokens, c.Provider.MaxOutputTokens)
+	}
 }
 
 // dialectApplies reports whether the dialect-DEPENDENT rules may speak. They

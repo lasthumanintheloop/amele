@@ -20,6 +20,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -2521,14 +2522,24 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		}
 	}
 
+	provider, err := buildProvider(cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	tuning, err := providerTuning(cfg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	agent := &loop.Loop{
-		Provider:     buildProvider(cfg),
+		Provider:     provider,
 		Registry:     registry,
 		Session:      sess,
 		Approve:      approve,
 		Limits:       loop.Limits{MaxTurns: cfg.Limits.MaxTurns, MaxTokens: cfg.Limits.MaxTokens},
 		Model:        cfg.Model,
 		SystemPrompt: cfg.SystemPrompt,
+		Tuning:       tuning,
 	}
 
 	if validator == nil {
@@ -2572,20 +2583,92 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 // degradation through Response.SchemaEnforcementDropped, which run surfaces as
 // a warning. Special-casing it per provider in cmd would duplicate a
 // capability decision the clients already own.
-func buildProvider(cfg *config.Config) llm.Provider {
+//
+// The dialect is parsed here rather than stored parsed on the config: config
+// validates the spelling and keeps the file's own string, so this is the one
+// place that turns it into the wire mapping. A parse failure is impossible for
+// a validated config, which is why it is WRAPPED and returned rather than
+// panicked on or ignored - falling back to the openai mapping would silently
+// reshape every request of the run.
+func buildProvider(cfg *config.Config) (llm.Provider, error) {
 	if cfg.Provider.Type == config.ProviderTypeAnthropic {
+		// The dialect names a variation of the OpenAI-compatible wire and is
+		// documented as ignored here (config.schema.json), so it is not parsed
+		// on this path: a leftover dialect must not fail a run that never
+		// speaks it.
 		return &llm.AnthropicClient{
 			BaseURL:         cfg.Provider.BaseURL,
 			APIKey:          cfg.Provider.APIKey,
 			RequestTimeout:  cfg.Provider.RequestTimeout.Std(),
 			MaxOutputTokens: cfg.Provider.MaxOutputTokens,
-		}
+		}, nil
+	}
+	dialect, err := llm.ParseDialect(cfg.Provider.Dialect)
+	if err != nil {
+		return nil, fmt.Errorf("provider.dialect: %w", err)
 	}
 	return &llm.OpenAIClient{
 		BaseURL:        cfg.Provider.BaseURL,
 		APIKey:         cfg.Provider.APIKey,
+		Dialect:        dialect,
 		RequestTimeout: cfg.Provider.RequestTimeout.Std(),
+	}, nil
+}
+
+// providerTuning translates the config's provider knobs into the neutral
+// request fields the loop forwards on every turn.
+//
+// CONTRACT: this is the ONE place where provider.params (arbitrary YAML)
+// becomes JSON. Validate already proved the map is serializable and collides
+// with no field amele owns, so a failure here is not reachable through a
+// validated config - it is wrapped rather than ignored because a silently
+// dropped params map would leave the run missing a knob the file asked for.
+func providerTuning(cfg *config.Config) (loop.Tuning, error) {
+	extra, err := paramsJSON(cfg.Provider.Params)
+	if err != nil {
+		return loop.Tuning{}, fmt.Errorf("provider.params: %w", err)
 	}
+	return loop.Tuning{
+		MaxOutputTokens: cfg.Provider.MaxOutputTokens,
+		Reasoning:       reasoningSpec(cfg.Provider.Reasoning),
+		Temperature:     cfg.Provider.Temperature,
+		TopP:            cfg.Provider.TopP,
+		Extra:           extra,
+	}, nil
+}
+
+// reasoningSpec converts the config's reasoning block into the neutral spec,
+// or nil when the config asks for no reasoning knob at all.
+//
+// An EMPTY block counts as no block. `--set provider.reasoning.effort=` on a
+// config whose YAML carried a reasoning block leaves exactly that shape behind
+// (internal/config.overrideReasoningEffort), and it means "back to the provider
+// default" - so it must produce no ReasoningSpec, not one the clients would
+// have to interpret as "unset" a second time.
+func reasoningSpec(r *config.ReasoningConfig) *llm.ReasoningSpec {
+	if r == nil || (r.Effort == "" && r.BudgetTokens == 0) {
+		return nil
+	}
+	return &llm.ReasoningSpec{Effort: r.Effort, BudgetTokens: r.BudgetTokens}
+}
+
+// paramsJSON pre-serializes provider.params so the llm package never re-encodes
+// user YAML: the clients merge these bytes into the request body root verbatim.
+// A nil or empty map yields nil - "there is nothing to merge" - rather than an
+// empty map the clients would have to special-case.
+func paramsJSON(params map[string]any) (map[string]json.RawMessage, error) {
+	if len(params) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]json.RawMessage, len(params))
+	for key, value := range params {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			return nil, fmt.Errorf("key %q: %w", key, err)
+		}
+		out[key] = encoded
+	}
+	return out, nil
 }
 
 // maxPromptArgs caps how much of a tool call's JSON arguments is shown in the

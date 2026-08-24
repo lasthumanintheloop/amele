@@ -1599,6 +1599,65 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) { c.Provider.Params = map[string]any{"x": math.NaN()} },
 			"provider.params",
 		},
+
+		// Rule 9: on the anthropic wire the thinking budget is drawn FROM the
+		// output cap, so a budget that meets or exceeds the cap leaves no room
+		// for an answer. The API answers it with a 400, which would arrive as
+		// an exit-5 provider error in the middle of a cron run; the numbers are
+		// both in the file, so the mistake is knowable at validate time.
+		{
+			"budget_tokens at the anthropic output cap",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.MaxOutputTokens = 8192
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"reasoning.budget_tokens must be below provider.max_output_tokens",
+		},
+		{
+			"budget_tokens above the anthropic output cap",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.MaxOutputTokens = 4096
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"reasoning.budget_tokens must be below provider.max_output_tokens",
+		},
+		{
+			"budget_tokens below the anthropic output cap",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.MaxOutputTokens = 16384
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
+		{
+			// No cap set means no relation to check: the model's own default
+			// ceiling is not a number this file knows.
+			"budget_tokens without an output cap",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
+		{
+			// The openrouter gateway carves the budget out of max_tokens
+			// itself, so the same pair is legal there; this rule is about the
+			// anthropic wire only.
+			"budget_tokens at the cap is not the openrouter rule",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.MaxOutputTokens = 8192
+				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
+			},
+			"",
+		},
 	}
 
 	for _, tt := range tests {

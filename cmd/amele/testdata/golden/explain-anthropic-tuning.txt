@@ -1,0 +1,47 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "anthropic"
+  base_url:        (default: api.anthropic.com)
+  request_timeout: default (120s)
+  dialect:         "kimi" (ignored: the anthropic wire has no dialects)
+  max_output_tokens: 16384
+  provider mapping (the wire fields this config will send):
+    max_output_tokens: 16384 -> max_tokens: 16384
+    reasoning.budget_tokens: 8192 -> thinking: {"type":"enabled","budget_tokens":8192}
+    reasoning.effort: max not sent: the anthropic wire takes a thinking budget or an effort, not both
+    temperature: 0.5 -> temperature: 0.5
+    params keys (merged verbatim, values not shown): "top_k"
+    unknown request fields: rejected (400)
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): disabled
+  shell: disabled
+  subprocess tools: (none)
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  20
+  max_tokens: UNBOUNDED (no token budget)
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+
+WARNINGS
+  - limits.max_tokens is 0: no token budget bounds this run
+  - session_dir is not set: no session log (audit trail) will be written

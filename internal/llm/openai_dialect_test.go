@@ -355,8 +355,8 @@ func TestCapFieldPerDialect(t *testing.T) {
 	}
 	for dialect, want := range tests {
 		t.Run(string(dialect), func(t *testing.T) {
-			if got := capField(dialect); got != want {
-				t.Errorf("capField(%q) = %q, want %q", dialect, got, want)
+			if got := CapField(dialect); got != want {
+				t.Errorf("CapField(%q) = %q, want %q", dialect, got, want)
 			}
 			client := &OpenAIClient{Dialect: dialect}
 			wire, _ := client.toWire(Request{Model: "m", Messages: baseMessages(), MaxOutputTokens: 4096})

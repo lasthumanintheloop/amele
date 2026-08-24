@@ -36,6 +36,7 @@ import (
 	"strings"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
@@ -812,10 +813,198 @@ func providerSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	// client falls back to the official endpoint.
 	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, "(default: api.anthropic.com)"))
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
+	dialectRow(b, cfg)
 	if cfg.Provider.MaxOutputTokens > 0 {
 		fmt.Fprintf(b, "  max_output_tokens: %d\n", cfg.Provider.MaxOutputTokens)
 	}
+	providerMapping(b, cfg)
 	b.WriteString("\n")
+}
+
+// anthropicWire reports whether this config talks to the Anthropic Messages
+// API. It is the first question every mapping row asks: on that wire the
+// dialect is not consulted at all, and the reasoning knob takes a different
+// shape entirely.
+func anthropicWire(cfg *config.Config) bool {
+	return cfg.Provider.Type == config.ProviderTypeAnthropic
+}
+
+// dialectRow reports the resolved dialect and, when base_url names a provider
+// whose dialect the config did not pick, the hint that says so.
+//
+// The row is printed only when it carries information: a config that names no
+// dialect and points nowhere recognizable keeps the report it had before
+// dialects existed.
+func dialectRow(b *strings.Builder, cfg *config.Config) {
+	if anthropicWire(cfg) {
+		// A dialect left behind while switching wires is inert, not wrong.
+		// Saying so beats both silence (the operator believes it applies) and
+		// a validation error (which would blame a provider this config is not
+		// talking to).
+		if cfg.Provider.Dialect != "" {
+			fmt.Fprintf(b, "  dialect:         %s (ignored: the anthropic wire has no dialects)\n",
+				field(cfg.Provider.Dialect, ""))
+		}
+		return
+	}
+	hint, hinted := baseURLDialectHint(cfg)
+	if cfg.Provider.Dialect == "" && !hinted {
+		return
+	}
+	fmt.Fprintf(b, "  dialect:         %s\n", field(cfg.Provider.Dialect, `"openai" (default)`))
+	if hinted {
+		fmt.Fprintf(b, "  %s\n", singleLine(hint))
+	}
+}
+
+// baseURLDialectHint returns the "your base_url looks like X" line, or "" when
+// there is nothing to hint at.
+//
+// CONTRACT: a hint, never a decision. amele does NOT auto-detect the dialect
+// from base_url (design doc §"No magic"): a silently chosen dialect would
+// reshape every request in a way the YAML file does not show. The report names
+// the host, and the operator picks.
+func baseURLDialectHint(cfg *config.Config) (string, bool) {
+	if anthropicWire(cfg) {
+		// The CN trio's anthropic-compatible endpoints are a documented setup
+		// (docs/providers.md); hinting at a dialect that wire ignores would
+		// send the operator to change a field that changes nothing.
+		return "", false
+	}
+	suggested, known := llm.DialectForBaseURL(cfg.Provider.BaseURL)
+	if !known || string(suggested) == cfg.Provider.Dialect {
+		return "", false
+	}
+	return fmt.Sprintf("hint: base_url looks like %s; consider dialect: %s",
+		llm.BaseURLHost(cfg.Provider.BaseURL), suggested), true
+}
+
+// providerMapping prints what the tuning knobs become on the wire: which field
+// carries the output cap, how the reasoning knob is spelled (and rounded), the
+// sampling values, and what the endpoint does with the raw params keys.
+//
+// It exists because every one of those answers depends on the dialect, and the
+// operator reading a YAML file cannot see any of them. The block is omitted
+// entirely when the config sets no tuning at all.
+func providerMapping(b *strings.Builder, cfg *config.Config) {
+	lines := providerMappingLines(cfg)
+	if len(lines) == 0 {
+		return
+	}
+	b.WriteString("  provider mapping (the wire fields this config will send):\n")
+	for _, line := range lines {
+		// SECURITY: every line embeds config text (an effort value, a params
+		// key) and explain reports on configs that FAILED validation, so a
+		// value carrying a newline must not be able to forge a row.
+		fmt.Fprintf(b, "    %s\n", singleLine(line))
+	}
+}
+
+// providerMappingLines builds the mapping rows in a fixed order: cap, then
+// reasoning, then sampling, then the raw params.
+//
+// CONTRACT: not one mapping decision is made here. The cap field comes from
+// llm.CapField, the reasoning lines from the same mapping functions the clients
+// call (llm.MapReasoning / llm.AnthropicReasoningNotes), and the unknown-field
+// policy from llm.UnknownFieldPolicy - so the report cannot promise a request
+// the clients will not send.
+func providerMappingLines(cfg *config.Config) []string {
+	var lines []string
+	dialect, known := resolvedDialect(cfg)
+	if !known {
+		// Every dialect-dependent row is unanswerable. Guessing the default
+		// would describe a request amele will never send - the run is refused
+		// at validate - so the report says what it cannot say instead.
+		lines = append(lines, "provider.dialect is not a known dialect: the wire mapping cannot be reported (see PROBLEMS)")
+	}
+
+	if capTokens := cfg.Provider.MaxOutputTokens; capTokens > 0 && known {
+		lines = append(lines, fmt.Sprintf("max_output_tokens: %d -> %s: %d", capTokens, capFieldFor(cfg, dialect), capTokens))
+	}
+	if known {
+		lines = append(lines, reasoningMappingLines(cfg, dialect)...)
+	}
+	// Sampling is dialect-independent: both wires spell it temperature/top_p
+	// and pass the value through, so these rows survive an unknown dialect.
+	if t := cfg.Provider.Temperature; t != nil {
+		lines = append(lines, fmt.Sprintf("temperature: %g -> temperature: %g", *t, *t))
+	}
+	if p := cfg.Provider.TopP; p != nil {
+		lines = append(lines, fmt.Sprintf("top_p: %g -> top_p: %g", *p, *p))
+	}
+	if len(cfg.Provider.Params) > 0 {
+		// SECURITY: KEYS only. A params value is arbitrary text from the YAML
+		// file and a provider-specific routing key can be a credential; the
+		// report is written for sharing, so nothing here may print a value.
+		lines = append(lines, "params keys (merged verbatim, values not shown): "+quotedKeys(cfg.Provider.Params))
+		if policy := unknownFieldPolicy(cfg, dialect, known); policy != "" {
+			// The params rows' caveat, printed with them: the same raw key is
+			// a hard 400 on one endpoint and a silent no-op on another.
+			lines = append(lines, "unknown request fields: "+policy)
+		}
+	}
+	return lines
+}
+
+// resolvedDialect parses the config's dialect, reporting whether it is usable.
+// On the anthropic wire the dialect is not consulted, so it always resolves
+// (to a value the callers ignore) rather than blocking that wire's rows on a
+// leftover value.
+func resolvedDialect(cfg *config.Config) (llm.Dialect, bool) {
+	if anthropicWire(cfg) {
+		return llm.DialectOpenAI, true
+	}
+	dialect, err := llm.ParseDialect(cfg.Provider.Dialect)
+	return dialect, err == nil
+}
+
+// capFieldFor names the request field that will carry max_output_tokens.
+func capFieldFor(cfg *config.Config, dialect llm.Dialect) string {
+	if anthropicWire(cfg) {
+		// The Messages API has exactly one spelling and requires it.
+		return "max_tokens"
+	}
+	return llm.CapField(dialect)
+}
+
+// reasoningMappingLines asks the client's own mapping function what this
+// config's reasoning knob becomes, and returns its notes verbatim.
+func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect) []string {
+	r := cfg.Provider.Reasoning
+	// An empty block is what `--set provider.reasoning.effort=` leaves behind
+	// and means "the provider default" - the same as no block at all, so the
+	// report must not claim a reasoning field is on the wire.
+	if r == nil || (r.Effort == "" && r.BudgetTokens == 0) {
+		return nil
+	}
+	spec := llm.ReasoningSpec{Effort: r.Effort, BudgetTokens: r.BudgetTokens}
+	if anthropicWire(cfg) {
+		return llm.AnthropicReasoningNotes(spec)
+	}
+	return llm.MapReasoning(dialect, spec).Notes
+}
+
+// unknownFieldPolicy answers what this target does with a request field it does
+// not recognize, or "" when the dialect did not parse and there is no answer.
+func unknownFieldPolicy(cfg *config.Config, dialect llm.Dialect, known bool) string {
+	if anthropicWire(cfg) {
+		return llm.AnthropicUnknownFieldPolicy()
+	}
+	if !known {
+		return ""
+	}
+	return llm.UnknownFieldPolicy(dialect)
+}
+
+// quotedKeys renders a params map's keys as a sorted, quoted list. Sorted so
+// the report is deterministic (Go map order would shuffle it between runs) and
+// quoted because a YAML key is arbitrary text.
+func quotedKeys(params map[string]any) string {
+	keys := slices.Sorted(maps.Keys(params))
+	for i, k := range keys {
+		keys[i] = field(k, `""`)
+	}
+	return strings.Join(keys, ", ")
 }
 
 // toolsSection reports every capability the model would hold: the fs builtins,

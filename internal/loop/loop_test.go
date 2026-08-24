@@ -629,6 +629,64 @@ func TestResponseFormatForwarded(t *testing.T) {
 	}
 }
 
+// TestTuningForwarded: the provider-neutral knobs the config sets once
+// (reasoning depth, sampling, output cap, raw params) ride on EVERY request of
+// the run, not just the first. A tool turn that dropped the reasoning knob
+// would think shallower exactly where the model needs it most, and a dropped
+// cap would leave the later turns of a run uncapped.
+func TestTuningForwarded(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{
+		llm.ToolCallResponse("c1", "echo_tool", `{"stdin": "ping"}`, usage(1, 1)),
+		llm.TextResponse("done", usage(1, 1)),
+	}}
+	temperature, topP := 0.2, 0.9
+	tuning := Tuning{
+		MaxOutputTokens: 65536,
+		Reasoning:       &llm.ReasoningSpec{Effort: "high"},
+		Temperature:     &temperature,
+		TopP:            &topP,
+		Extra:           map[string]json.RawMessage{"verbosity": json.RawMessage(`"low"`)},
+	}
+	l := newLoop(t, fake, Limits{})
+	l.Tuning = tuning
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.Requests) != 2 {
+		t.Fatalf("provider calls: %d want 2", len(fake.Requests))
+	}
+	for i, req := range fake.Requests {
+		if req.MaxOutputTokens != tuning.MaxOutputTokens {
+			t.Errorf("request %d: MaxOutputTokens = %d, want %d", i, req.MaxOutputTokens, tuning.MaxOutputTokens)
+		}
+		if req.Reasoning != tuning.Reasoning {
+			t.Errorf("request %d: Reasoning = %+v, want the configured spec", i, req.Reasoning)
+		}
+		if req.Temperature != tuning.Temperature || req.TopP != tuning.TopP {
+			t.Errorf("request %d: sampling = %v/%v, want the configured pointers", i, req.Temperature, req.TopP)
+		}
+		if !reflect.DeepEqual(req.Extra, tuning.Extra) {
+			t.Errorf("request %d: Extra = %v, want %v", i, req.Extra, tuning.Extra)
+		}
+	}
+}
+
+// TestTuningZeroValueSendsNothing: a loop with no Tuning asks for nothing -
+// the pre-tuning behavior, where every knob is the provider's own default.
+func TestTuningZeroValueSendsNothing(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+	l := newLoop(t, fake, Limits{})
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	req := fake.Requests[0]
+	if req.MaxOutputTokens != 0 || req.Reasoning != nil || req.Temperature != nil || req.TopP != nil || req.Extra != nil {
+		t.Errorf("untuned request carries knobs: %+v", req)
+	}
+}
+
 // TestFinalValidatorRetry: a rejected final answer is not the end of the run -
 // the rejected assistant message stays in history and the feedback comes back
 // as a user message, which is what lets the model repair its own output.

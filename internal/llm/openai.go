@@ -93,7 +93,7 @@ type oaRequest struct {
 	// runs: strict gateways reject unknown/null keys they do not implement.
 	ResponseFormat *oaResponseFormat `json:"response_format,omitempty"`
 	// MaxTokens and MaxCompletionTokens are the two spellings of the output
-	// cap. Exactly one is ever set - capField picks it from the dialect - and
+	// cap. Exactly one is ever set - CapField picks it from the dialect - and
 	// both are omitempty so a request that asked for no cap sends neither and
 	// inherits the provider's own default.
 	MaxTokens           int `json:"max_tokens,omitempty"`
@@ -516,7 +516,7 @@ func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessag
 		}
 	}
 	if req.MaxOutputTokens > 0 {
-		if capField(c.Dialect) == "max_tokens" {
+		if CapField(c.Dialect) == "max_tokens" {
 			out.MaxTokens = req.MaxOutputTokens
 		} else {
 			out.MaxCompletionTokens = req.MaxOutputTokens

@@ -99,7 +99,7 @@ const (
 	thinkingDisabledJSON = `{"type":"disabled"}`
 )
 
-// capField returns the request-body key that carries the output-token cap for
+// CapField returns the request-body key that carries the output-token cap for
 // this dialect. The zero-value Dialect answers like DialectOpenAI, so a client
 // that was never told a dialect keeps the pre-dialect behavior.
 //
@@ -107,7 +107,10 @@ const (
 // max_tokens with a 400, and the CN natives plus OpenRouter only know
 // max_tokens (research §matrix "Output cap field"). Sending the wrong name is
 // either a hard failure or - worse - a silently uncapped run.
-func capField(d Dialect) string {
+//
+// It is exported so `amele explain` names the field the request will actually
+// carry instead of maintaining a second copy of this table.
+func CapField(d Dialect) string {
 	switch d {
 	case DialectDeepSeek, DialectGLM, DialectOpenRouter:
 		return "max_tokens"
