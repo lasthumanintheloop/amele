@@ -232,6 +232,9 @@ func NewSecretSet(initial []string) *SecretSet {
 // corrupt every event), duplicates are harmless, and the set is re-sorted so
 // the longest-first guarantee holds for values added later too. Safe for
 // concurrent use; a nil receiver is a no-op.
+//
+// SECURITY: each value is registered in every spelling a sink can carry it in,
+// not only the literal one (see secretVariants).
 func (s *SecretSet) Add(values ...string) {
 	if s == nil {
 		return
@@ -239,13 +242,61 @@ func (s *SecretSet) Add(values ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, v := range values {
-		if v != "" {
-			s.secrets = append(s.secrets, v)
-		}
+		s.secrets = append(s.secrets, secretVariants(v)...)
 	}
 	// Stable so equal-length secrets keep a deterministic (registration)
 	// order - golden files must not depend on sort tie-breaking.
 	slices.SortStableFunc(s.secrets, func(a, b string) int { return len(b) - len(a) })
+}
+
+// secretVariants returns every spelling of one secret the sinks can carry: the
+// literal value, and the interior of its JSON string encoding when that differs.
+// An empty value yields nothing - replacing "" would corrupt every event.
+//
+// SECURITY: the JSON spellings are not cosmetic. Redaction is a literal
+// substring search, and a secret does not only travel as itself: a provider's
+// 400 body quotes the offending value back inside the server's own JSON, where
+// a quote or a backslash arrives escaped (`a"b` as `a\"b`). Registering only
+// the raw bytes let that copy through into the error message and from there
+// into the log. Params values interpolated from ${ENV} do reach request bodies,
+// so this is a live path, not a hypothetical one.
+//
+// Two JSON forms are registered because encoders disagree about HTML escaping:
+// Go's own rewrites <, > and & into their \u escapes while most other servers
+// emit them verbatim, and which encoder produced the body amele is redacting is
+// not something amele gets to choose. Forms that coincide are skipped, so a
+// secret made of ordinary token characters still registers exactly once.
+func secretVariants(v string) []string {
+	if v == "" {
+		return nil
+	}
+	variants := []string{v}
+	for _, escapeHTML := range []bool{false, true} {
+		if escaped := jsonStringInterior(v, escapeHTML); escaped != "" && !slices.Contains(variants, escaped) {
+			variants = append(variants, escaped)
+		}
+	}
+	return variants
+}
+
+// jsonStringInterior renders v as a JSON string and returns it without the
+// surrounding quotes - the shape a value has when a server has spliced it into
+// a JSON document. It returns "" if the encoding fails, which json cannot do
+// for a string (invalid UTF-8 is replaced, not rejected); the branch is a
+// defensive fallback rather than a reachable one.
+func jsonStringInterior(v string, escapeHTML bool) string {
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(escapeHTML)
+	if err := enc.Encode(v); err != nil {
+		return ""
+	}
+	// Encode appends a newline; the quotes are the encoder's, not the body's.
+	encoded := strings.TrimSuffix(buf.String(), "\n")
+	if len(encoded) < 2 {
+		return ""
+	}
+	return encoded[1 : len(encoded)-1]
 }
 
 // Redact replaces every registered secret in text with "[REDACTED]". Safe for

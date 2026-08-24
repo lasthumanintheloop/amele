@@ -670,6 +670,45 @@ func TestSecretSetEmptyValuesIgnored(t *testing.T) {
 	}
 }
 
+// TestSecretSetRedactsJSONEscapedForm is the SECURITY regression for the
+// review finding: a secret reaches the log through a PROVIDER's JSON error
+// body, where the server re-encoded it as a JSON string. A value carrying a
+// quote or a backslash then appears escaped (`a\"b`) and no longer equals the
+// bytes registered here, so a literal-only search walked straight past it.
+//
+// The secret below is a fabricated value that merely LOOKS awkward; it is not
+// a credential of any kind.
+func TestSecretSetRedactsJSONEscapedForm(t *testing.T) {
+	const fakeValue = `test"quote\secret`
+	// The spelling a JSON encoder produces for that value, computed rather
+	// than typed so the test cannot drift from what a server would emit.
+	encoded, err := json.Marshal(fakeValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	escaped := string(encoded[1 : len(encoded)-1])
+	if escaped == fakeValue {
+		t.Fatalf("test is vacuous: %q needs a character JSON escapes", fakeValue)
+	}
+
+	set := NewSecretSet([]string{fakeValue})
+	// A 400 body of the shape every OpenAI-compatible gateway echoes back:
+	// the offending value, quoted, inside the provider's own JSON.
+	snippet := `status 400: {"error":{"message":"Unrecognized value for 'x-api-key': ` + escaped + `","type":"invalid_request_error"}}`
+	got := set.Redact(snippet)
+	if strings.Contains(got, escaped) {
+		t.Errorf("JSON-escaped secret survived redaction: %q", got)
+	}
+	// The literal spelling must keep working: the same value still reaches
+	// plain-text sinks (tool output, argv echoes).
+	if plain := set.Redact("key=" + fakeValue + " end"); strings.Contains(plain, fakeValue) {
+		t.Errorf("literal secret survived redaction: %q", plain)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Errorf("redaction marker missing: %q", got)
+	}
+}
+
 // TestSecretSetConcurrent: the registry is shared by sinks running on
 // different goroutines (the MCP stderr relays) while a token refresh adds to
 // it, so Add and Redact must be safe together under -race.

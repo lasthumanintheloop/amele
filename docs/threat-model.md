@@ -233,7 +233,10 @@ server is acceptable - which is what granting them already means.
   redacted from JSONL events **by value** in task text, model content, tool
   arguments, and tool results (`internal/session/session.go`,
   `TestRedaction`). Redaction is unconditional; short secrets are still
-  secrets.
+  secrets. Each value is registered in its literal spelling **and** in its
+  JSON-string-escaped one (`secretVariants`): a provider's 400 body quotes the
+  offending value back inside the server's own JSON, where a quote or a
+  backslash arrives escaped and a literal-only search would walk past it.
 - `amele explain` output redacts too, but by a display rule of its own
   (`internal/explain`, `secretValues`): it withholds whatever feeds
   `provider.api_key` - always, whatever the variable is called - and every
