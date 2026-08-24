@@ -709,6 +709,116 @@ func TestSecretSetRedactsJSONEscapedForm(t *testing.T) {
 	}
 }
 
+// jsonInterior renders v as a JSON string and strips the encoder's quotes -
+// the spelling a value has once a server has spliced it into a JSON document.
+// Computed rather than typed so these tests cannot drift from what a real
+// encoder emits.
+func jsonInterior(t *testing.T, v string) string {
+	t.Helper()
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded[1 : len(encoded)-1])
+}
+
+// TestSecretSetRedactsDeepEscapedForms is the SECURITY regression for the
+// review finding that one level of JSON escaping is not enough.
+//
+// Two shapes were walking past a literal search. A gateway that wraps the
+// upstream response - already a JSON document - inside its OWN JSON error body
+// escapes the escapes, so `a"b` arrives as `a\\\"b`. And an encoder that
+// prefers unicode escapes spells the same quote `\u0022`, which shares no
+// bytes with either of the forms that were registered.
+//
+// The secrets below are fabricated values that merely LOOK awkward; none of
+// them is a credential of any kind.
+func TestSecretSetRedactsDeepEscapedForms(t *testing.T) {
+	const fakeValue = `test"quote\secret`
+	const plainValue = "sk-plain-token"
+	unicodeEscaped := strings.NewReplacer(`"`, `\u0022`, `\`, `\u005c`).Replace(fakeValue)
+
+	tests := []struct {
+		name    string
+		secrets []string
+		// spelling is the form of the secret the body carries; the body is
+		// built around it so every case redacts the same way.
+		spelling func(t *testing.T) string
+	}{
+		{
+			name:     "literal",
+			secrets:  []string{fakeValue},
+			spelling: func(*testing.T) string { return fakeValue },
+		},
+		{
+			name:     "one json level",
+			secrets:  []string{fakeValue},
+			spelling: func(t *testing.T) string { return jsonInterior(t, fakeValue) },
+		},
+		{
+			name:    "two json levels: a gateway wrapping the upstream body",
+			secrets: []string{fakeValue},
+			spelling: func(t *testing.T) string {
+				return jsonInterior(t, jsonInterior(t, fakeValue))
+			},
+		},
+		{
+			name:     "unicode escapes",
+			secrets:  []string{fakeValue},
+			spelling: func(*testing.T) string { return unicodeEscaped },
+		},
+		{
+			name:    "unicode escapes wrapped once more",
+			secrets: []string{fakeValue},
+			spelling: func(t *testing.T) string {
+				return jsonInterior(t, unicodeEscaped)
+			},
+		},
+		{
+			// The extra variants must not disturb longest-first ordering: a
+			// short secret registered alongside a longer one it prefixes still
+			// must not eat the prefix and leave the tail in the log.
+			name:     "overlapping secrets keep longest-first",
+			secrets:  []string{`test"`, fakeValue},
+			spelling: func(t *testing.T) string { return jsonInterior(t, fakeValue) },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spelling := tt.spelling(t)
+			set := NewSecretSet(tt.secrets)
+			body := `status 400: {"error":{"message":"bad key: ` + spelling + `"}}`
+			got := set.Redact(body)
+			if strings.Contains(got, "quote") || strings.Contains(got, "secret") {
+				t.Errorf("secret survived redaction: %q", got)
+			}
+			if !strings.Contains(got, "[REDACTED]") {
+				t.Errorf("redaction marker missing: %q", got)
+			}
+		})
+	}
+
+	// A secret made of ordinary token characters has exactly one spelling, so
+	// the deeper variants must add nothing and change nothing.
+	t.Run("plain secret unaffected", func(t *testing.T) {
+		if got, want := len(secretVariants(plainValue)), 1; got != want {
+			t.Errorf("variants of a plain secret: got %d want %d", got, want)
+		}
+		set := NewSecretSet([]string{plainValue})
+		if got, want := set.Redact("key="+plainValue+" end"), "key=[REDACTED] end"; got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	})
+
+	// SECURITY: "" must still register nothing - a variant of the empty string
+	// would replace every byte boundary in every event.
+	t.Run("empty secret registers nothing", func(t *testing.T) {
+		if got := secretVariants(""); len(got) != 0 {
+			t.Errorf("variants of an empty secret: got %v want none", got)
+		}
+	})
+}
+
 // TestSecretSetConcurrent: the registry is shared by sinks running on
 // different goroutines (the MCP stderr relays) while a token refresh adds to
 // it, so Add and Redact must be safe together under -race.

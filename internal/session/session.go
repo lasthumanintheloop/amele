@@ -250,7 +250,8 @@ func (s *SecretSet) Add(values ...string) {
 }
 
 // secretVariants returns every spelling of one secret the sinks can carry: the
-// literal value, and the interior of its JSON string encoding when that differs.
+// literal value, the interiors of its JSON string encodings, and the interiors
+// of THOSE (a value quoted into a document that is itself quoted into another).
 // An empty value yields nothing - replacing "" would corrupt every event.
 //
 // SECURITY: the JSON spellings are not cosmetic. Redaction is a literal
@@ -266,18 +267,87 @@ func (s *SecretSet) Add(values ...string) {
 // emit them verbatim, and which encoder produced the body amele is redacting is
 // not something amele gets to choose. Forms that coincide are skipped, so a
 // secret made of ordinary token characters still registers exactly once.
+//
+// SECURITY: two levels of encoding are registered, not one. A gateway that
+// wraps the upstream response - already a JSON document - inside its OWN JSON
+// error body escapes the escapes, so `a"b` reaches the log as `a\\\"b` and
+// shares no bytes with either one-level form. The \u spellings are registered
+// for the same reason: an encoder that prefers unicode escapes writes the same
+// quote as \u0022, which no other variant contains.
+//
+// This is best-effort defense in depth over the representations real gateways
+// emit, not a semantic JSON redactor: it enumerates spellings rather than
+// parsing the text it is about to redact, so an encoding nobody has been seen
+// to produce (three levels of wrapping, a value split across two fields) is out
+// of reach by construction. The enumeration is what makes it cheap and
+// order-independent enough to run on every event.
 func secretVariants(v string) []string {
 	if v == "" {
 		return nil
 	}
 	variants := []string{v}
-	for _, escapeHTML := range []bool{false, true} {
-		if escaped := jsonStringInterior(v, escapeHTML); escaped != "" && !slices.Contains(variants, escaped) {
-			variants = append(variants, escaped)
+	add := func(s string) {
+		if s != "" && !slices.Contains(variants, s) {
+			variants = append(variants, s)
+		}
+	}
+	// One level: the shape the value has spliced into a JSON document.
+	level1 := encodedSpellings(v)
+	for _, s := range level1 {
+		add(s)
+	}
+	// Two levels: that document quoted inside another one. Deeper nesting is
+	// deliberately not pursued - each level multiplies the variant count while
+	// the observed shapes stop at two.
+	for _, s := range level1 {
+		for _, ss := range encodedSpellings(s) {
+			add(ss)
 		}
 	}
 	return variants
 }
+
+// encodedSpellings returns the JSON-string-interior spellings of v that DIFFER
+// from v: the two escapeHTML modes Go's encoder offers, plus the \uXXXX form an
+// encoder that prefers unicode escapes emits. Spellings that coincide with v or
+// with each other are dropped, which is why a secret made of ordinary token
+// characters yields none at all and still registers exactly once.
+func encodedSpellings(v string) []string {
+	out := make([]string, 0, 3)
+	appendNew := func(s string) {
+		if s != "" && s != v && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
+	}
+	for _, escapeHTML := range []bool{false, true} {
+		appendNew(jsonStringInterior(v, escapeHTML))
+	}
+	appendNew(unicodeEscaper.Replace(v))
+	return out
+}
+
+// unicodeEscaper spells the characters a JSON encoder MAY escape as \uXXXX the
+// way an encoder that prefers that form writes them. Go's encoder uses the
+// short escapes for the quote and the backslash and the \u form for the HTML
+// trio; other encoders (PHP's json_encode without JSON_UNESCAPED_*, several
+// gateway front ends) use \u throughout, and that spelling shares no bytes with
+// the short one.
+//
+// Single-pass by construction: strings.Replacer never rescans what it wrote, so
+// the backslashes it introduces are not escaped again. Control characters are
+// left to the encoder-produced spellings above - a secret containing a newline
+// is not a shape any provider has been seen to emit.
+//
+// Package-level because it is a compiled table with no mutable state: a
+// Replacer is immutable once built and safe for concurrent use, so this is a
+// constant that the language cannot spell as one.
+var unicodeEscaper = strings.NewReplacer(
+	`"`, `\u0022`,
+	`\`, `\u005c`,
+	`<`, `\u003c`,
+	`>`, `\u003e`,
+	`&`, `\u0026`,
+)
 
 // jsonStringInterior renders v as a JSON string and returns it without the
 // surrounding quotes - the shape a value has when a server has spliced it into
