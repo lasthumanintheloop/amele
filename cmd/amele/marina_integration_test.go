@@ -105,7 +105,10 @@ func TestIntegrationMarina(t *testing.T) {
 			sessionDir := t.TempDir()
 			var stdout, stderr bytes.Buffer
 			code := run(context.Background(),
-				[]string{"run", "--set", "session_dir=" + sessionDir, cfgPath, "check violating.md"},
+				// CONTRACT: the config path is run's first argument; flags come
+				// after it (docs/contracts/cli.md) - the first live run of this
+				// test failed on the reversed order.
+				[]string{"run", cfgPath, "--set", "session_dir=" + sessionDir, "check violating.md"},
 				strings.NewReader(""), &stdout, &stderr, lookup)
 			if code != ExitOK {
 				t.Fatalf("exit %d\nstderr: %s", code, stderr.String())
