@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -83,5 +84,72 @@ func TestDialectConstantValues(t *testing.T) {
 		if string(d) != s {
 			t.Errorf("dialect constant = %q, want %q", string(d), s)
 		}
+	}
+}
+
+// TestOwnedWireFieldsCoverEveryMappedKey is the anti-drift check behind
+// OwnedWireFields: whatever key MapReasoning can emit for a dialect must be in
+// that dialect's owned set, or provider.params would be allowed to carry a key
+// the very next request overwrites. It walks the whole effort vocabulary plus a
+// budget, so a new mapping that invents a key fails here rather than in
+// production.
+func TestOwnedWireFieldsCoverEveryMappedKey(t *testing.T) {
+	// The union config validation accepts (config.effortValues); duplicated
+	// here on purpose - llm must not import config, and a value that exists on
+	// only one side is exactly what this test should catch.
+	efforts := []string{"", "none", "low", "medium", "high", "xhigh", "max"}
+	for _, d := range dialects {
+		owned := OwnedWireFields(d)
+		for _, effort := range efforts {
+			for _, budget := range []int{0, 8192} {
+				mapped := MapReasoning(d, ReasoningSpec{Effort: effort, BudgetTokens: budget})
+				for key := range mapped.Fields {
+					if !slices.Contains(owned, key) {
+						t.Errorf("dialect %q maps effort %q/budget %d onto key %q, which OwnedWireFields does not claim: %v",
+							d, effort, budget, key, owned)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestOwnedWireFieldsAreDialectScoped pins the two answers the params escape
+// hatch depends on: the cap spelling follows CapField, and a dialect that emits
+// no thinking object does not claim the key (the kimi case that used to block
+// the K2.x controls).
+func TestOwnedWireFieldsAreDialectScoped(t *testing.T) {
+	tests := []struct {
+		dialect Dialect
+		want    []string
+		absent  []string
+	}{
+		{DialectOpenAI, []string{"max_completion_tokens", "reasoning_effort"}, []string{"max_tokens", "thinking", "reasoning"}},
+		{DialectDeepSeek, []string{"max_tokens", "thinking", "reasoning_effort"}, []string{"max_completion_tokens", "reasoning"}},
+		{DialectGLM, []string{"max_tokens", "thinking", "reasoning_effort"}, []string{"max_completion_tokens", "reasoning"}},
+		{DialectKimi, []string{"max_completion_tokens", "reasoning_effort"}, []string{"thinking", "reasoning"}},
+		{DialectGroq, []string{"max_completion_tokens", "reasoning_effort"}, []string{"thinking", "reasoning"}},
+		{DialectOpenRouter, []string{"max_tokens", "reasoning"}, []string{"max_completion_tokens", "thinking"}},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.dialect), func(t *testing.T) {
+			owned := OwnedWireFields(tt.dialect)
+			// Every dialect writes these, whatever else it maps.
+			for _, key := range []string{"model", "messages", "tools", "response_format", "temperature", "top_p"} {
+				if !slices.Contains(owned, key) {
+					t.Errorf("owned set is missing the shared key %q: %v", key, owned)
+				}
+			}
+			for _, key := range tt.want {
+				if !slices.Contains(owned, key) {
+					t.Errorf("owned set is missing %q: %v", key, owned)
+				}
+			}
+			for _, key := range tt.absent {
+				if slices.Contains(owned, key) {
+					t.Errorf("owned set claims %q, which this dialect never writes: %v", key, owned)
+				}
+			}
+		})
 	}
 }

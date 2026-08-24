@@ -80,6 +80,9 @@ type AnthropicClient struct {
 // key order is fixed by the declaration order and the wire goldens are
 // byte-stable; the caller's raw provider.params are merged afterwards
 // (see encodeBody).
+//
+// AnthropicOwnedWireFields lists these same keys for the params collision
+// check - keep the two in step when a field is added here.
 type anRequest struct {
 	Model     string      `json:"model"`
 	MaxTokens int         `json:"max_tokens"`
@@ -97,6 +100,18 @@ type anRequest struct {
 	// exact setting a deterministic run asks for.
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
+}
+
+// AnthropicOwnedWireFields returns the request-body keys the native Messages
+// API client writes itself - OwnedWireFields for a WIRE rather than a dialect,
+// since the dialect is not consulted on that path.
+//
+// CONTRACT: the list mirrors anRequest's json tags, which is what makes it the
+// right answer for provider.params collisions on this wire (config.
+// validateParams). Note the difference from every openai-wire dialect: thinking
+// and output_config ARE written here, and response_format is not.
+func AnthropicOwnedWireFields() []string {
+	return []string{"model", "max_tokens", "system", "messages", "tools", "thinking", "output_config", "temperature", "top_p"}
 }
 
 // anThinking is the thinking control object. Two shapes share it because they

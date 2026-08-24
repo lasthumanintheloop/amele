@@ -1513,9 +1513,24 @@ func TestValidateProviderTuning(t *testing.T) {
 			`provider.params key "messages"`,
 		},
 		{
-			"params collides with thinking",
-			func(c *Config) { c.Provider.Params = map[string]any{"thinking": map[string]any{"type": "enabled"}} },
+			// Owned where it is actually emitted: the deepseek mapper writes a
+			// thinking object, so params must not also write one.
+			"params collides with thinking on deepseek",
+			func(c *Config) {
+				c.Provider.Dialect = "deepseek"
+				c.Provider.Params = map[string]any{"thinking": map[string]any{"type": "enabled"}}
+			},
 			`provider.params key "thinking"`,
+		},
+		{
+			// ... and free where it is not: kimi emits no thinking object, so
+			// the K2.x controls stay reachable through the escape hatch.
+			"params thinking is allowed on kimi",
+			func(c *Config) {
+				c.Provider.Dialect = "kimi"
+				c.Provider.Params = map[string]any{"thinking": map[string]any{"type": "enabled", "keep": true}}
+			},
+			"",
 		},
 		{
 			"params with a provider-specific key",
@@ -1825,29 +1840,119 @@ func TestValidateSamplingWireBeatsDialect(t *testing.T) {
 	}
 }
 
-// TestValidateParamsRejectsEveryOwnedKey walks the whole owned-field set: each
-// name amele writes into the request body itself must be refused in params, or
-// the escape hatch would silently overwrite a contract (the tool definitions,
-// the response format, the budget cap).
-func TestValidateParamsRejectsEveryOwnedKey(t *testing.T) {
+// TestValidateParamsOwnedKeysAreDialectScoped walks the owned-field set per
+// TARGET. Each name the active dialect/wire writes into the request body itself
+// must be refused in params, or the escape hatch would silently overwrite a
+// contract (the tool definitions, the response format, the budget cap) - and
+// each name that target never writes must be ACCEPTED.
+//
+// The second half is the regression: the check used to refuse the union of
+// every wire's spellings, so `params: {thinking: ...}` was a config error on
+// kimi although the kimi mapper emits no thinking object at all. That left the
+// K2.x thinking controls unreachable from any config, blocked by a collision
+// with a field nothing was going to send.
+func TestValidateParamsOwnedKeysAreDialectScoped(t *testing.T) {
 	dir := t.TempDir()
-	owned := []string{
-		"model", "messages", "tools", "tool_choice", "response_format",
-		"max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
-		"thinking", "temperature", "top_p", "stream", "output_config", "system",
+	anthropicWire := func(c *Config) {
+		c.Provider.Type = ProviderTypeAnthropic
+		c.Provider.BaseURL = ""
 	}
-	for _, key := range owned {
-		t.Run(key, func(t *testing.T) {
-			cfg := tuningBase(dir)
-			cfg.Provider.Params = map[string]any{key: "x"}
-			err := cfg.Validate()
-			if err == nil {
-				t.Fatalf("params key %q was accepted", key)
-			}
-			if !strings.Contains(err.Error(), key) {
-				t.Errorf("error %q does not name the colliding key %q", err, key)
-			}
-		})
+	dialect := func(name string) func(*Config) {
+		return func(c *Config) { c.Provider.Dialect = name }
+	}
+	// Keys every openai-wire dialect writes, whatever else it maps.
+	shared := []string{"model", "messages", "tools", "response_format", "temperature", "top_p"}
+	tests := []struct {
+		name string
+		// apply selects the target.
+		apply func(*Config)
+		// refused must be a config error; allowed must validate.
+		refused []string
+		allowed []string
+	}{
+		{
+			name:    "openai dialect",
+			apply:   func(*Config) {},
+			refused: append(shared, "max_completion_tokens", "reasoning_effort", "stream", "tool_choice"),
+			allowed: []string{"max_tokens", "thinking", "reasoning", "output_config", "system"},
+		},
+		{
+			name:    "deepseek dialect",
+			apply:   dialect("deepseek"),
+			refused: append(shared, "max_tokens", "reasoning_effort", "thinking"),
+			allowed: []string{"max_completion_tokens", "reasoning", "output_config", "system"},
+		},
+		{
+			// The fix: kimi emits no thinking object, so params may carry the
+			// K2.x controls.
+			name:    "kimi dialect",
+			apply:   dialect("kimi"),
+			refused: append(shared, "max_completion_tokens", "reasoning_effort"),
+			allowed: []string{"thinking", "reasoning", "max_tokens"},
+		},
+		{
+			name:    "openrouter dialect",
+			apply:   dialect("openrouter"),
+			refused: append(shared, "max_tokens", "reasoning"),
+			allowed: []string{"reasoning_effort", "thinking", "max_completion_tokens"},
+		},
+		{
+			name:    "anthropic wire",
+			apply:   anthropicWire,
+			refused: []string{"model", "messages", "tools", "temperature", "top_p", "max_tokens", "thinking", "output_config", "system", "stream", "tool_choice"},
+			allowed: []string{"response_format", "reasoning", "reasoning_effort", "max_completion_tokens"},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, key := range tt.refused {
+			t.Run(tt.name+"/refused/"+key, func(t *testing.T) {
+				cfg := tuningBase(dir)
+				tt.apply(cfg)
+				cfg.Provider.Params = map[string]any{key: "x"}
+				err := cfg.Validate()
+				if err == nil {
+					t.Fatalf("params key %q was accepted", key)
+				}
+				if !strings.Contains(err.Error(), key) {
+					t.Errorf("error %q does not name the colliding key %q", err, key)
+				}
+			})
+		}
+		for _, key := range tt.allowed {
+			t.Run(tt.name+"/allowed/"+key, func(t *testing.T) {
+				cfg := tuningBase(dir)
+				tt.apply(cfg)
+				cfg.Provider.Params = map[string]any{key: "x"}
+				if err := cfg.Validate(); err != nil {
+					t.Fatalf("params key %q is not written by this target but was refused: %v", key, err)
+				}
+			})
+		}
+	}
+}
+
+// TestValidateParamsSkipsCollisionsOnUnknownDialect: which keys are owned is
+// now a dialect question, so an unparseable dialect makes it unanswerable. The
+// dialect itself is reported (once); guessing a collision on top would send the
+// operator to the wrong line, exactly as the other dialect-dependent rules
+// already decided.
+func TestValidateParamsSkipsCollisionsOnUnknownDialect(t *testing.T) {
+	cfg := tuningBase(t.TempDir())
+	cfg.Provider.Dialect = "kimi-k3"
+	cfg.Provider.Params = map[string]any{"messages": "x"}
+
+	joined := strings.Join(cfg.Violations(), "\n")
+	if !strings.Contains(joined, "provider.dialect") {
+		t.Fatalf("violations do not report the dialect:\n%s", joined)
+	}
+	if strings.Contains(joined, "provider.params key") {
+		t.Errorf("collision reported against a dialect that did not parse:\n%s", joined)
+	}
+	// The dialect-independent params rule still fires in the same pass.
+	cfg.Provider.Params = map[string]any{"bad": math.NaN()}
+	if joined := strings.Join(cfg.Violations(), "\n"); !strings.Contains(joined, "not JSON-serializable") {
+		t.Errorf("the dialect-independent params check was skipped too:\n%s", joined)
 	}
 }
 

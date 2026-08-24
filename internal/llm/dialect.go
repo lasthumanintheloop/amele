@@ -232,6 +232,49 @@ func reasoningField(d Dialect) string {
 	}
 }
 
+// reasoningWireFields lists the body-root keys MapReasoning can emit for this
+// dialect. It is the one part of the owned-field answer that is not visible in
+// the request struct, because the KEY itself is dialect data.
+//
+// CONTRACT: it must cover every key MapReasoning writes for this dialect -
+// TestOwnedWireFieldsCoverEveryMappedKey walks the whole vocabulary against the
+// mapper and fails if a key is missing, so the two cannot drift.
+func reasoningWireFields(d Dialect) []string {
+	switch d {
+	case DialectDeepSeek, DialectGLM:
+		return []string{"thinking", "reasoning_effort"}
+	case DialectOpenRouter:
+		return []string{"reasoning"}
+	case DialectOpenAI, DialectGroq, DialectKimi:
+		return []string{"reasoning_effort"}
+	default:
+		// Unreachable through ParseDialect; the zero value answers like openai.
+		return []string{"reasoning_effort"}
+	}
+}
+
+// OwnedWireFields returns the request-body keys the OpenAI-compatible client
+// WILL write for this dialect: the struct-encoded fields of oaRequest plus the
+// cap spelling and the reasoning keys this dialect maps. The zero-value Dialect
+// answers like DialectOpenAI.
+//
+// CONTRACT: it is the authority for provider.params collision checking
+// (config.validateParams), and it is deliberately DIALECT-SCOPED rather than a
+// union across every wire. A union blocked keys nothing was going to send - it
+// made `params: {thinking: ...}` a config error on kimi, whose mapper emits no
+// thinking object, and so put the K2.x thinking controls out of reach of every
+// config. Ownership means "amele writes this key here"; a key this target never
+// writes cannot be clobbered by it, and switching the dialect re-answers the
+// question at validate time (exit 2), visibly.
+//
+// Keys no target writes but that amele still reserves (stream, tool_choice)
+// are the caller's business: they are not owned, they are incompatible with
+// amele's transport and loop, and config names them separately.
+func OwnedWireFields(d Dialect) []string {
+	owned := []string{"model", "messages", "tools", "response_format", "temperature", "top_p", CapField(d)}
+	return append(owned, reasoningWireFields(d)...)
+}
+
 // ReasoningMapping is what one dialect makes of a ReasoningSpec: the request
 // body fragments to merge at the body root, and the human-readable lines that
 // describe the mapping.
@@ -343,9 +386,11 @@ func mapThinkingObjectDialect(d Dialect, spec ReasoningSpec) ReasoningMapping {
 }
 
 // mapKimi maps the level for the K-series: a top-level reasoning_effort and
-// never a thinking object. K3 has no thinking parameter at all, and K2.x users
-// who need one set it through provider.params (research §matrix "Reasoning
-// knob"), so amele emitting one would be a guess at the model behind the name.
+// never a thinking object. K3 has no thinking parameter at all (research
+// §matrix "Reasoning knob"), so amele emitting one would be a guess at the
+// model behind the name. Because nothing here writes that key, it is NOT in
+// this dialect's OwnedWireFields: a K2.x user reaches the older
+// thinking: {type, keep} controls through provider.params.
 func mapKimi(spec ReasoningSpec) ReasoningMapping {
 	var m ReasoningMapping
 	if spec.Effort == "" {

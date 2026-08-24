@@ -160,8 +160,10 @@ type ProviderConfig struct {
 	Retry *RetryConfig `yaml:"retry"`
 	// Params is the escape hatch: arbitrary keys merged verbatim into the
 	// request body root, for provider extras amele has no neutral field for.
-	// Keys amele writes itself are rejected at validation time (see
-	// ownedWireFields), so this can extend a request but never rewrite one.
+	// Keys amele writes itself ON THE ACTIVE TARGET are rejected at validation
+	// time (see forbiddenParamsKeys), so this can extend a request but never
+	// rewrite one - while a key that target never writes (thinking on kimi)
+	// stays reachable.
 	Params map[string]any `yaml:"params"`
 }
 
@@ -221,20 +223,19 @@ const (
 // between providers without being rewritten.
 var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
 
-// ownedWireFields are the request-body keys amele writes itself, and therefore
-// the keys provider.params must not carry.
+// reservedWireFields are request-body keys provider.params must not carry even
+// though NO target writes them, so they are not "owned" in the sense
+// llm.OwnedWireFields means.
 //
-// CONTRACT: params is merged verbatim into the request body root, so a
-// collision would either clobber an amele contract (tools, response_format) or
-// be clobbered by it - both silently. The list is deliberately the union across
-// every supported wire (openai and anthropic spellings together): params is not
-// dialect-scoped, and a key that is inert on today's dialect must not become a
-// live collision when the dialect changes.
-var ownedWireFields = []string{
-	"model", "messages", "tools", "tool_choice", "response_format",
-	"max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort",
-	"thinking", "temperature", "top_p", "stream", "output_config", "system",
-}
+// CONTRACT: they are refused because amele's own machinery cannot survive them,
+// not because they would clobber a field it writes:
+//   - stream: the clients read a single JSON body. An SSE stream decodes as a
+//     parse error, so the whole run would die on the first turn (streaming is a
+//     later roadmap slice, README §Roadmap).
+//   - tool_choice: the loop owns the tool protocol - it offers the tools and
+//     stops when the model answers without calling one. A pinned "required"
+//     removes that stopping condition and every run ends at max_turns (exit 3).
+var reservedWireFields = []string{"stream", "tool_choice"}
 
 // SubprocessTool declares an external executable the model may invoke as a
 // tool. The command is a fixed argv vector: there is no shell involved, so
@@ -1057,7 +1058,27 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 	}
 	c.validateReasoning(add, dialect, known)
 	c.validateSampling(add, dialect, known)
-	validateParams(add, c.Provider.Params)
+	validateParams(add, c.Provider.Params, c.forbiddenParamsKeys(dialect, known))
+}
+
+// forbiddenParamsKeys returns the request-body keys provider.params must not
+// carry for the ACTIVE target: what that dialect/wire writes itself, plus the
+// keys amele reserves on every target.
+//
+// It returns nil when the dialect did not parse - which key is owned is a
+// dialect question, so it is unanswerable then, and the same one-error rule the
+// other dialect-dependent rules follow applies: the dialect is reported once
+// instead of piling on a collision the operator cannot act on yet.
+func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
+	if c.Provider.Type == ProviderTypeAnthropic {
+		// The dialect is not consulted on this wire, so a leftover (even an
+		// unparseable) value cannot decide the answer.
+		return slices.Concat(llm.AnthropicOwnedWireFields(), reservedWireFields)
+	}
+	if !known {
+		return nil
+	}
+	return slices.Concat(llm.OwnedWireFields(dialect), reservedWireFields)
 }
 
 // validateReasoning checks the thinking knob against the effort vocabulary and
@@ -1166,17 +1187,22 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 	}
 }
 
-// validateParams checks the raw escape hatch: no collision with a field amele
-// owns, and nothing JSON cannot express.
-func validateParams(add func(format string, args ...any), params map[string]any) {
+// validateParams checks the raw escape hatch: no collision with a key the
+// active target writes itself (forbidden, empty when that is unanswerable), and
+// nothing JSON cannot express.
+//
+// CONTRACT: params is merged verbatim into the request body root, so a
+// collision would either clobber an amele contract (tools, response_format) or
+// be clobbered by it - both silently.
+func validateParams(add func(format string, args ...any), params map[string]any, forbidden []string) {
 	if len(params) == 0 {
 		return
 	}
 	// Sorted so the joined message is deterministic; Go map iteration order
 	// would otherwise shuffle violations between runs.
 	for _, key := range slices.Sorted(maps.Keys(params)) {
-		if slices.Contains(ownedWireFields, key) {
-			add("provider.params key %q is a request field amele sets itself; remove it (params carries provider-specific extras only)", key)
+		if slices.Contains(forbidden, key) {
+			add("provider.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", key)
 		}
 	}
 	// The values are serialized into the request body verbatim, so a value

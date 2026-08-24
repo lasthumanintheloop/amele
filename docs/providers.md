@@ -56,13 +56,39 @@ provider:
 | `top_p` | none | `(0, 1]`. `0` is rejected rather than clamped: an empty nucleus is a 400, not greedy decoding. |
 | `retry.max_attempts` | `3` | Total tries for one provider call (1 initial + retries), so `1` disables retrying. Accepted range 1..10; `0` (or omitted) means the default. |
 | `retry.initial_backoff` | `1s` | The wait before the second attempt; each further attempt doubles it. Accepted range `100ms`..`60s`; empty (or omitted) means the default. |
-| `params` | none | Arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for. Keys amele writes itself (`model`, `messages`, `tools`, `tool_choice`, `response_format`, `max_tokens`, `max_completion_tokens`, `reasoning`, `reasoning_effort`, `thinking`, `temperature`, `top_p`, `stream`, `output_config`, `system`) are a config error, so `params` can extend a request but never rewrite one. |
+| `params` | none | Arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for. Keys amele writes itself **on the active target** are a config error, so `params` can extend a request but never rewrite one - see [What `params` may not carry](#what-params-may-not-carry). |
 
 `provider.max_output_tokens`, `provider.reasoning.effort`,
 `provider.temperature` and `provider.top_p` are in the `--set` override
 allowlist, so one config can be swept over several settings from a shell loop.
 `provider.dialect`, `provider.reasoning.budget_tokens`, `provider.retry.*` and
 `provider.params` are deliberately not ([cli.md](contracts/cli.md#set)).
+
+### What `params` may not carry
+
+The refused set is **per target**: a key is a collision only where amele
+actually writes it.
+
+| target | keys amele writes itself |
+| --- | --- |
+| every openai-wire dialect | `model`, `messages`, `tools`, `response_format`, `temperature`, `top_p` |
+| + `openai`, `groq` | `max_completion_tokens`, `reasoning_effort` |
+| + `deepseek`, `glm` | `max_tokens`, `reasoning_effort`, `thinking` |
+| + `kimi` | `max_completion_tokens`, `reasoning_effort` |
+| + `openrouter` | `max_tokens`, `reasoning` |
+| anthropic wire | `model`, `max_tokens`, `system`, `messages`, `tools`, `thinking`, `output_config`, `temperature`, `top_p` |
+
+Two more are refused everywhere, for a different reason - not because amele
+writes them, but because its own machinery cannot survive them: `stream` (the
+clients read a single JSON body; an SSE stream is a parse error) and
+`tool_choice` (the loop stops when the model answers without calling a tool, so
+a pinned `required` turns every run into a `max_turns` failure).
+
+Everything else is yours. That is what makes a provider-specific control
+reachable even when amele has no neutral field for it: `thinking` is a config
+error on `deepseek`, where amele emits one, and perfectly legal on `kimi`, where
+it does not. Change the dialect and `amele validate` re-answers the question
+before the run.
 
 ### Retries
 
@@ -232,10 +258,16 @@ for the same reason - these models cannot stop thinking.
 
 amele sends no `thinking` object on this dialect: K3 has no such parameter, and
 emitting one would be a guess at which model generation is behind the name.
-That leaves the older K2.x thinking controls (`thinking: {type, keep}`)
-unreachable from a config - `params` cannot supply them, because `thinking` is
-a field amele owns and a collision there is a config error. Those models run
-with their own defaults; `reasoning.effort` is the knob amele offers.
+Because amele writes no `thinking` here, `params` may: the older K2.x controls
+(`thinking: {type, keep}`) are reachable through the escape hatch, and
+`reasoning.effort` remains the neutral knob for everything else.
+
+```yaml
+provider:
+  dialect: kimi
+  params:
+    thinking: {type: enabled, keep: true}   # K2.x only; amele writes no thinking here
+```
 
 ### Groq
 
