@@ -478,6 +478,7 @@ MODEL & PROVIDER
   provider type:   "openai"
   base_url:        "https://api.deepseek.com"
   request_timeout: default (120s)
+  retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "deepseek"
   max_output_tokens: 8192
   provider mapping (the wire fields this config will send):

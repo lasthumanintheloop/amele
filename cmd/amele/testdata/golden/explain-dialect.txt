@@ -3,6 +3,7 @@ MODEL & PROVIDER
   provider type:   "openai"
   base_url:        "https://api.groq.com/openai/v1"
   request_timeout: default (120s)
+  retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "deepseek"
   hint: base_url looks like api.groq.com; consider dialect: groq
   max_output_tokens: 4096
@@ -38,6 +39,7 @@ BUDGETS
 
 CONCURRENCY
   lock: disabled (concurrent runs of this config are allowed)
+  tool calls in a turn: parallel (default)
 
 OUTPUT
   schema: none (final answer is unconstrained text)

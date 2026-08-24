@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
@@ -18,6 +19,10 @@ import (
 // requirements: it keeps Render's executable probe off the host PATH so the
 // suite stays hermetic regardless of what happens to be installed.
 func alwaysFound(string) error { return nil }
+
+// ptrBool returns a pointer to b, for the tri-state config fields (tools.parallel)
+// where nil, true and false are three different answers.
+func ptrBool(b bool) *bool { return &b }
 
 // stubTool is the minimal tools.Tool for registry construction: explain only
 // reads names, so Def carries a name and Invoke is never called.
@@ -213,8 +218,11 @@ func TestRender(t *testing.T) {
 				c.Output.MaxSchemaRetries = 5
 				return c
 			},
-			want:    []string{"max_schema_retries: 5\n"},
-			notWant: []string{"(default)"},
+			want: []string{"max_schema_retries: 5\n"},
+			// Scoped to this row: other rows legitimately name their own
+			// defaults (the retry policy, the tool-call parallelism), so a bare
+			// "(default)" would no longer be about output.max_schema_retries.
+			notWant: []string{"max_schema_retries: 2 (default)"},
 		},
 		{
 			// The dry run must answer "can this config run twice at once?",
@@ -232,6 +240,68 @@ func TestRender(t *testing.T) {
 			},
 			want:    []string{"CONCURRENCY\n  lock: enabled (a run started while another holds <config>.lock exits 7)\n"},
 			notWant: []string{"lock: disabled"},
+		},
+		{
+			// The second concurrency question: two tool calls inside ONE turn.
+			// An omitted tools.parallel means true, which is exactly the fact
+			// an operator cannot read off the YAML file.
+			name: "parallel tool calls by default",
+			cfg:  baseCfg,
+			want: []string{"  tool calls in a turn: parallel (default)\n"},
+		},
+		{
+			name: "parallel tool calls turned off",
+			cfg: func() *config.Config {
+				c := baseCfg()
+				c.Tools.Parallel = ptrBool(false)
+				return c
+			},
+			want:    []string{"  tool calls in a turn: sequential (tools.parallel: false)\n"},
+			notWant: []string{"parallel (default)"},
+		},
+		{
+			// An explicit true is not a default, and saying so would misreport
+			// where the value came from.
+			name: "parallel tool calls asked for explicitly",
+			cfg: func() *config.Config {
+				c := baseCfg()
+				c.Tools.Parallel = ptrBool(true)
+				return c
+			},
+			want:    []string{"  tool calls in a turn: parallel (tools.parallel: true)\n"},
+			notWant: []string{"parallel (default)"},
+		},
+		{
+			// max_attempts: 0 is spelled "omitted" in RetryConfig, so an
+			// operator who typed the 0 on purpose has no other way to learn
+			// that the client still tries three times.
+			name: "retry policy defaults are named",
+			cfg:  baseCfg,
+			want: []string{"  retry:           3 attempts (default), 1s initial backoff (default)\n"},
+		},
+		{
+			name: "retry policy configured",
+			cfg: func() *config.Config {
+				c := baseCfg()
+				c.Provider.Retry = &config.RetryConfig{
+					MaxAttempts:    5,
+					InitialBackoff: config.Duration(2 * time.Second),
+				}
+				return c
+			},
+			want:    []string{"  retry:           5 attempts, 2s initial backoff\n"},
+			notWant: []string{"attempts (default)", "backoff (default)"},
+		},
+		{
+			// Half-configured must not read as fully defaulted: the annotation
+			// belongs to each number, not to the row.
+			name: "retry policy half configured",
+			cfg: func() *config.Config {
+				c := baseCfg()
+				c.Provider.Retry = &config.RetryConfig{MaxAttempts: 7}
+				return c
+			},
+			want: []string{"  retry:           7 attempts, 1s initial backoff (default)\n"},
 		},
 		{
 			// Reachable since explain reports on invalid configs too; the

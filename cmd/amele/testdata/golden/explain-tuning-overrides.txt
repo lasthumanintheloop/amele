@@ -1,18 +1,24 @@
+OVERRIDES
+  --set provider.max_output_tokens="4096"
+  --set provider.reasoning.effort="medium"
+  --set provider.temperature="0.2"
+  --set provider.top_p="0.9"
+
 MODEL & PROVIDER
   model:           "golden-model"
-  provider type:   "anthropic"
-  base_url:        (default: api.anthropic.com)
+  provider type:   "openai"
+  base_url:        "https://api.deepseek.com"
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
-  dialect:         "kimi" (ignored: the anthropic wire has no dialects)
-  max_output_tokens: 16384
+  dialect:         "deepseek"
+  max_output_tokens: 4096 (overridden via --set)
   provider mapping (the wire fields this config will send):
-    max_output_tokens: 16384 -> max_tokens: 16384
-    reasoning.budget_tokens: 8192 -> thinking: {"type":"enabled","budget_tokens":8192}
-    reasoning.effort: max not sent: the anthropic wire takes a thinking budget or an effort, not both
-    temperature: 0.5 -> temperature: 0.5
-    params keys (merged verbatim, values not shown): "top_k"
-    unknown request fields: rejected (400)
+    max_output_tokens: 4096 -> max_tokens: 4096 (overridden via --set)
+    reasoning.effort: medium -> thinking: {"type":"enabled"} (overridden via --set)
+    reasoning.effort: medium -> reasoning_effort: high (deepseek has no medium) (overridden via --set)
+    temperature: 0.2 -> temperature: 0.2 (overridden via --set)
+    top_p: 0.9 -> top_p: 0.9 (overridden via --set)
+    temperature/top_p: sent but ignored by deepseek in thinking mode (thinking is on by default)
 
 TOOLS
   workspace: "<TMP>"

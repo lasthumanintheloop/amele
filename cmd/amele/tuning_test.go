@@ -313,6 +313,9 @@ func TestExplainProviderMappingGolden(t *testing.T) {
 		name   string
 		golden string
 		yaml   string
+		// args are appended after the config path, for the case that pins
+		// what a --set of the tuning keys looks like in the report.
+		args []string
 	}{
 		{
 			// base_url deliberately does NOT match the dialect: the report
@@ -352,6 +355,32 @@ provider:
     top_k: 40
 `,
 		},
+		{
+			// The four tuning keys joined the --set allowlist on 2026-08-24.
+			// Three of them (effort, temperature, top_p) have no row of their
+			// own: a mapping row is the ONLY place their value is printed, so
+			// an unmarked one would attribute a command-line sweep to the YAML
+			// file the reviewer is holding.
+			name:   "tuning keys overridden from the command line",
+			golden: "explain-tuning-overrides.txt",
+			yaml: `model: golden-model
+provider:
+  base_url: https://api.deepseek.com
+  api_key: ${TEST_KEY}
+  dialect: deepseek
+  max_output_tokens: 1024
+  reasoning:
+    effort: low
+  temperature: 0.1
+  top_p: 0.5
+`,
+			args: []string{
+				"--set", "provider.max_output_tokens=4096",
+				"--set", "provider.reasoning.effort=medium",
+				"--set", "provider.temperature=0.2",
+				"--set", "provider.top_p=0.9",
+			},
+		},
 	}
 
 	for _, tc := range cases {
@@ -362,7 +391,8 @@ provider:
 				t.Fatal(err)
 			}
 
-			code, stdout, stderr := execCLI(t, []string{"explain", cfgPath}, "")
+			args := append([]string{"explain", cfgPath}, tc.args...)
+			code, stdout, stderr := execCLI(t, args, "")
 			if code != ExitOK {
 				t.Fatalf("exit %d, stderr: %s", code, stderr)
 			}

@@ -813,12 +813,36 @@ func providerSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	// client falls back to the official endpoint.
 	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, "(default: api.anthropic.com)"))
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
+	retryRow(b, cfg)
 	dialectRow(b, cfg)
 	if cfg.Provider.MaxOutputTokens > 0 {
-		fmt.Fprintf(b, "  max_output_tokens: %d\n", cfg.Provider.MaxOutputTokens)
+		fmt.Fprintf(b, "  max_output_tokens: %d%s\n",
+			cfg.Provider.MaxOutputTokens, set.mark("provider.max_output_tokens"))
 	}
-	providerMapping(b, cfg)
+	providerMapping(b, cfg, set)
 	b.WriteString("\n")
+}
+
+// retryRow reports the retry policy that will actually apply, the way
+// request_timeout above reports its own default.
+//
+// It states the EFFECTIVE numbers rather than echoing the YAML because the
+// zero value is not "no retries": `max_attempts: 0` is spelled "omitted" in
+// RetryConfig and yields the client default of 3, which an operator who typed
+// the 0 on purpose has no other way to discover. Each half is annotated
+// separately, so a config that sets only one of them does not read as if both
+// were defaults.
+func retryRow(b *strings.Builder, cfg *config.Config) {
+	attempts, backoff := "3 attempts (default)", "1s initial backoff (default)"
+	if r := cfg.Provider.Retry; r != nil {
+		if r.MaxAttempts > 0 {
+			attempts = fmt.Sprintf("%d attempts", r.MaxAttempts)
+		}
+		if d := r.InitialBackoff.Std(); d > 0 {
+			backoff = fmt.Sprintf("%s initial backoff", d)
+		}
+	}
+	fmt.Fprintf(b, "  retry:           %s, %s\n", attempts, backoff)
 }
 
 // anthropicWire reports whether this config talks to the Anthropic Messages
@@ -886,8 +910,8 @@ func baseURLDialectHint(cfg *config.Config) (string, bool) {
 // It exists because every one of those answers depends on the dialect, and the
 // operator reading a YAML file cannot see any of them. The block is omitted
 // entirely when the config sets no tuning at all.
-func providerMapping(b *strings.Builder, cfg *config.Config) {
-	lines := providerMappingLines(cfg)
+func providerMapping(b *strings.Builder, cfg *config.Config, set overrides) {
+	lines := providerMappingLines(cfg, set)
 	if len(lines) == 0 {
 		return
 	}
@@ -908,7 +932,12 @@ func providerMapping(b *strings.Builder, cfg *config.Config) {
 // call (llm.MapReasoning / llm.AnthropicReasoningNotes), and the unknown-field
 // policy from llm.UnknownFieldPolicy - so the report cannot promise a request
 // the clients will not send.
-func providerMappingLines(cfg *config.Config) []string {
+//
+// set marks the rows whose VALUE came from the command line. It matters more
+// here than anywhere else in the report: reasoning.effort, temperature and
+// top_p have no row of their own, so a mapping row is the only place their
+// value is printed - unmarked, it would be read as the YAML file's.
+func providerMappingLines(cfg *config.Config, set overrides) []string {
 	var lines []string
 	dialect, known := resolvedDialect(cfg)
 	if !known {
@@ -919,20 +948,23 @@ func providerMappingLines(cfg *config.Config) []string {
 	}
 
 	if capTokens := cfg.Provider.MaxOutputTokens; capTokens > 0 && known {
-		lines = append(lines, fmt.Sprintf("max_output_tokens: %d -> %s: %d", capTokens, capFieldFor(cfg, dialect), capTokens))
+		lines = append(lines, fmt.Sprintf("max_output_tokens: %d -> %s: %d%s",
+			capTokens, capFieldFor(cfg, dialect), capTokens, set.mark("provider.max_output_tokens")))
 	}
 	if known {
-		lines = append(lines, reasoningMappingLines(cfg, dialect)...)
+		lines = append(lines, reasoningMappingLines(cfg, dialect, set)...)
 	}
 	// Sampling is dialect-independent: both wires spell it temperature/top_p
 	// and pass the value through, so these rows survive an unknown dialect.
 	sampling := false
 	if t := cfg.Provider.Temperature; t != nil {
-		lines = append(lines, fmt.Sprintf("temperature: %g -> temperature: %g", *t, *t))
+		lines = append(lines, fmt.Sprintf("temperature: %g -> temperature: %g%s",
+			*t, *t, set.mark("provider.temperature")))
 		sampling = true
 	}
 	if p := cfg.Provider.TopP; p != nil {
-		lines = append(lines, fmt.Sprintf("top_p: %g -> top_p: %g", *p, *p))
+		lines = append(lines, fmt.Sprintf("top_p: %g -> top_p: %g%s",
+			*p, *p, set.mark("provider.top_p")))
 		sampling = true
 	}
 	// What the TARGET does with those values is not dialect-independent: a
@@ -991,7 +1023,14 @@ func reasoningSpec(cfg *config.Config) llm.ReasoningSpec {
 
 // reasoningMappingLines asks the client's own mapping function what this
 // config's reasoning knob becomes, and returns its notes verbatim.
-func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect) []string {
+//
+// One effort can produce several notes (deepseek sends a thinking object AND a
+// rounded reasoning_effort), so the override marker goes on every note that
+// actually prints the effort - marking only the first would leave the rest
+// looking like they came from the file. Notes rooted in budget_tokens are left
+// unmarked: that key is not settable, and a marker there would credit the
+// command line with a value only the YAML can carry.
+func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect, set overrides) []string {
 	r := cfg.Provider.Reasoning
 	// An empty block is what `--set provider.reasoning.effort=` leaves behind
 	// and means "the provider default" - the same as no block at all, so the
@@ -1000,10 +1039,24 @@ func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect) []string {
 		return nil
 	}
 	spec := reasoningSpec(cfg)
+	var notes []string
 	if anthropicWire(cfg) {
-		return llm.AnthropicReasoningNotes(spec)
+		notes = llm.AnthropicReasoningNotes(spec)
+	} else {
+		notes = llm.MapReasoning(dialect, spec).Notes
 	}
-	return llm.MapReasoning(dialect, spec).Notes
+	mark := set.mark("provider.reasoning.effort")
+	if mark == "" {
+		return notes
+	}
+	marked := make([]string, len(notes))
+	for i, note := range notes {
+		marked[i] = note
+		if strings.HasPrefix(note, "reasoning.effort:") {
+			marked[i] += mark
+		}
+	}
+	return marked
 }
 
 // unknownFieldPolicy answers what this target does with a request field it does
@@ -1122,24 +1175,48 @@ func budgetsSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	b.WriteString("\n")
 }
 
-// concurrencySection reports whether two runs of this config can overlap.
-// It is stated in both directions - a disabled lock is reported as loudly as
-// an enabled one - because "can this cron line run twice at once?" is a
-// question a dry run must answer, and silence would read as "no".
+// concurrencySection reports what this config lets run at the same time: two
+// whole runs of it (`lock`), and two tool calls inside one turn
+// (`tools.parallel`). Both are stated in both directions - a disabled lock is
+// reported as loudly as an enabled one - because "can this cron line run twice
+// at once?" is a question a dry run must answer, and silence would read as "no".
 //
 // The lock file is named generically (<config>.lock) rather than resolved:
 // Render is given the config's content, not the path it was loaded from.
 //
-// Alone among the reported settings this one takes no override marker: `lock`
-// left the --set allowlist on 2026-08-12 (config.SettableKeys), so the value
-// on this line can only have come from the YAML.
+// Alone among the reported settings these take no override marker: neither
+// `lock` (it left the --set allowlist on 2026-08-12) nor `tools.parallel` (no
+// tools.* key is settable, config.SettableKeys) can come from the command
+// line, so the values on these lines can only have come from the YAML.
 func concurrencySection(b *strings.Builder, cfg *config.Config) {
 	b.WriteString("CONCURRENCY\n")
 	if cfg.Lock {
-		b.WriteString("  lock: enabled (a run started while another holds <config>.lock exits 7)\n\n")
-		return
+		b.WriteString("  lock: enabled (a run started while another holds <config>.lock exits 7)\n")
+	} else {
+		b.WriteString("  lock: disabled (concurrent runs of this config are allowed)\n")
 	}
-	b.WriteString("  lock: disabled (concurrent runs of this config are allowed)\n\n")
+	b.WriteString("  tool calls in a turn: " + parallelismNote(cfg.Tools) + "\n\n")
+}
+
+// parallelismNote describes what happens when one turn asks for several tool
+// calls at once.
+//
+// It belongs in CONCURRENCY rather than TOOLS because it answers the same
+// question `lock` does one level down: can two things this config authorizes
+// be in flight at the same moment? An operator whose subprocess tool writes a
+// shared file needs that answer, and before this row the only way to get it was
+// to know that an omitted tools.parallel means true.
+func parallelismNote(t config.ToolsConfig) string {
+	// The word comes from IsParallel - the loop's own predicate - so the report
+	// cannot drift from the behavior; only the parenthetical, which says where
+	// the value came from, is decided here.
+	if !t.IsParallel() {
+		return "sequential (tools.parallel: false)"
+	}
+	if t.Parallel == nil {
+		return "parallel (default)"
+	}
+	return "parallel (tools.parallel: true)"
 }
 
 // outputSection reports whether a schema constrains stdout. The schema body is
