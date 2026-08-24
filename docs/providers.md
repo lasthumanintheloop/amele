@@ -230,7 +230,9 @@ off. That default also decides what your sampling knobs do: `temperature` and
 `top_p` are accepted and then **silently ignored while thinking**, so `explain`
 prints `temperature/top_p: sent but ignored by deepseek in thinking mode` next
 to the values rather than promising an effect the run will not have. With
-`effort: none` they take effect and the caveat disappears. `output.schema` runs on the fallback path here (no `json_schema` support).
+`effort: none` they take effect and the caveat disappears. `output.schema`
+travels as `response_format: {"type":"json_object"}` here - there is no
+`json_schema` on this API - and amele enforces the schema itself.
 
 ### GLM (Z.ai)
 
@@ -272,7 +274,7 @@ Because amele writes no `thinking` here, `params` may: the older K2.x controls
 provider:
   dialect: kimi
   params:
-    thinking: {type: enabled, keep: true}   # K2.x only; amele writes no thinking here
+    thinking: {type: enabled, keep: true}   # K2.x only; amele writes none
 ```
 
 ### Groq
@@ -401,11 +403,12 @@ establish it:
   per hosted model, the same way its `reasoning_effort` vocabulary does.
 
 For both, amele sends the schema and takes the fallback if the endpoint refuses
-it - the right behavior whichever way that documentation settles. The case worth knowing about
-is the third one: an endpoint that **accepts the field and ignores it** answers
-with no 400, so there is nothing to warn about and the local validate+retry
-layer is the only enforcement (the same silent degradation described under
-[OpenRouter](#openrouter)). The exit-code contract holds regardless.
+it - the right behavior whichever way that documentation settles. The case
+worth knowing about is the third one: an endpoint that **accepts the field and
+ignores it** answers with no 400, so there is nothing to warn about and the
+local validate+retry layer is the only enforcement (the same silent
+degradation described under [OpenRouter](#openrouter)). The exit-code contract
+holds regardless.
 
 ## When a provider says no
 
