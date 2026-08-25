@@ -266,20 +266,27 @@ config says - second-guessing it would be the silent degradation this page
 exists to prevent - and `explain` prints a note next to the value:
 `google recommends the default 1.0 on gemini 3 models; non-default may degrade output`.
 
-Two claims on this wire are **unverified** until the live smoke test in this
-milestone runs, and both are recorded here rather than smoothed over:
+Two claims on this wire started as open questions; the live smoke run
+(2026-08-25, gemini-3.7-flash and gemini-2.5-flash) settled both:
 
-- **The structured-output field form.** The SDK documents
-  `generationConfig.responseJsonSchema`, which is what amele sends; a newer
-  nested `responseFormat` shape appears in other Google documentation. If the
-  endpoint answers with a 400 naming the field, amele repeats that one request
-  without the schema - immediately, costing no retry budget - warns that native
-  enforcement was lost, and enforces `output.schema` itself. So the *contract*
-  holds either way; which spelling actually travels is the open question.
-- **Whether thinking debits `maxOutputTokens`.** On every other provider
-  reasoning is drawn from the output ceiling. Assume it does here too and leave
-  room in `max_output_tokens`; the alternative failure mode is a `MAX_TOKENS`
-  finish (exit 1) in the middle of an answer.
+- **The structured-output field form: `responseJsonSchema` is accepted.**
+  amele sends `generationConfig.responseJsonSchema` and the live run
+  produced schema-valid JSON with native enforcement (no fallback fired,
+  no degradation warning). The fallback path stays in place for
+  compatible gateways that reject the field: amele repeats that one
+  request without the schema - immediately, costing no retry budget -
+  warns that native enforcement was lost, and enforces `output.schema`
+  itself.
+- **Thinking debits `maxOutputTokens`: confirmed.** A live probe with
+  `max_output_tokens: 120` and `reasoning.effort: high` finished
+  `MAX_TOKENS` (amele reports `finish_reason: length`, exit 1) with the
+  thinking spend counted against the ceiling. Leave room in
+  `max_output_tokens` for the model's reasoning, exactly as on every
+  other provider.
+
+Still unverified on this wire: an MCP tool whose root schema empties to
+nothing after sanitizing (amele omits `parameters` entirely; the shape is
+unit-tested, not yet exercised against the live service).
 
 ## Quickstarts
 
