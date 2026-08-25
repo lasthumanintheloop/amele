@@ -955,9 +955,13 @@ func defaultHostNote(cfg *config.Config) string {
 		if v := cfg.Provider.Vertex; v != nil {
 			// The gemini wire has two backends and the vertex one is addressed
 			// by location, so naming the AI Studio host here would describe a
-			// request this config will never send. The full vertex reporting
-			// (the resolved path, the auth mode) is a later slice; this row only
-			// has to stop being wrong.
+			// request this config will never send. This row answers only "what
+			// does base_url default to"; the resolved path and the credential
+			// are vertexRows' two rows, immediately below it.
+			//
+			// SECURITY: the location reaches this string unvalidated, so the
+			// caller escapes the result - see providerSection's note on the
+			// base_url row.
 			return "(default: " + llm.VertexTarget{Location: v.Location}.Host() + ")"
 		}
 		return "(default: generativelanguage.googleapis.com)"

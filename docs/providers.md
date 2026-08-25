@@ -253,13 +253,19 @@ reach a session log; `amele explain` prints which mode a config resolves to and
 the path it will read, never a token and never a byte of the file.
 
 **IAM prerequisites.** The principal needs `roles/aiplatform.user` on the
-project, and `aiplatform.googleapis.com` must be enabled on it. gcloud **user**
-credentials additionally need `serviceusage.services.use` (Service Usage
-Consumer), because amele sends `x-goog-user-project` with those - the header
-Google requires when a user-credential call has to name the project that is
-billed and quota-tracked. If a 401 or 403 comes back, amele appends exactly this
-vocabulary to the error: the role, the API, the project, the location and the
-credential sources it searched.
+project - Google's "Agent Platform User", the role its own setup docs say to
+grant, and the one carrying `aiplatform.endpoints.predict`, the permission
+"required to make prompt requests". The Vertex API
+(`aiplatform.googleapis.com`) must also be enabled on the project; that is a
+numbered step in Google's own setup, and enabling it is itself gated by
+`serviceusage.services.enable`. gcloud **user** credentials additionally need
+`serviceusage.services.use` (Service Usage Consumer) - a different permission,
+on the calling principal rather than the operator - because amele sends
+`x-goog-user-project` with those, the header Google requires when a
+user-credential call has to name the project that is billed and quota-tracked.
+When a 401 or 403 comes back, amele appends the vocabulary the fix lives in;
+between them the two messages name the role, the API, the project, the location
+and the credential sources amele searched.
 
 That header is amele's own contract, so it is worth stating plainly: it is sent
 **only** for `authorized_user`-family credentials, and its value is always

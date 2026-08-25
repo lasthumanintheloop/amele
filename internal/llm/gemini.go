@@ -809,14 +809,21 @@ var geminiBackendSignatures = []geminiBackendSignature{
 		},
 	},
 	{
-		// A 404 on this endpoint is an ADDRESSING answer, and the API's body
-		// says only that the publisher model was not found. The two candidates
-		// are a wrong model id and a model that is simply not served where the
-		// request was sent: region support is per-model and far narrower than
-		// the 47-region host list (research §1.5 - gemini-3.5-flash is not
-		// served in us-central1 at all, and two Gemini 3 models are
-		// global-only). The advice names both, and repeats that the location
-		// is the operator's to change: amele will not reroute it.
+		// A 404 on this endpoint is an ADDRESSING answer, and the two
+		// candidates are a wrong model id and a model that is simply not
+		// served where the request was sent: region support is per-model and
+		// far narrower than the 47-region host list (research §1.5 -
+		// gemini-3.5-flash is not served in us-central1 at all, and two Gemini
+		// 3 models are global-only). The advice names both, and repeats that
+		// the location is the operator's to change: amele will not reroute it.
+		//
+		// UNVERIFIED: the research never captured a live 404 for an
+		// unavailable model - the probes had no credentials, so every response
+		// was the 401 in §2.10 - so neither its body wording nor the status
+		// itself is confirmed. That costs nothing here: a signature entry
+		// changes only the human-facing text (see the table's CONTRACT), so if
+		// the service answers that case some other way, the operator simply
+		// gets no hint rather than a wrong one. A live smoke settles it.
 		match: func(code int, _ string, vertex *VertexTarget) bool {
 			return code == http.StatusNotFound && vertex != nil
 		},
