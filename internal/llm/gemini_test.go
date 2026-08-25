@@ -795,8 +795,12 @@ func TestGeminiRefusesRedirects(t *testing.T) {
 	}))
 	t.Cleanup(elsewhere.Close)
 
+	// A fixed destination, not one derived from the request: the test is about
+	// what the CLIENT does with a 302, and echoing the request path back into
+	// the Location header is the open-redirect shape gosec (rightly) flags.
+	target := elsewhere.URL + "/v1beta/models/gemini-3-pro:generateContent"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusFound)
+		http.Redirect(w, r, target, http.StatusFound)
 	}))
 	t.Cleanup(srv.Close)
 

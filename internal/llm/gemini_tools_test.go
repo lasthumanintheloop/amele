@@ -147,11 +147,10 @@ func TestGeminiThoughtSignatureRoundTrip(t *testing.T) {
 	if got := string(contents[1].Parts); got != gemSignedPartsOnWire {
 		t.Errorf("model parts are not the echoed bytes.\ngot:  %s\nwant: %s", got, gemSignedPartsOnWire)
 	}
-	// The deviation is exactly the HTML escape and nothing else: everything
-	// outside that character class survives byte for byte.
-	if strings.Contains(string(contents[1].Parts), "<") {
-		t.Error("the encoder stopped escaping <; gemContent.MarshalJSON's documented deviation is stale")
-	}
+	// The comparison above is also what pins the deviation itself: the expected
+	// constant carries \u003c where the fixture carries "<", so an encoder that
+	// stopped escaping - or started mangling anything else - fails right here.
+	//
 	// The function NAME is not in the neutral tool-result message; it is
 	// recovered from the call the assistant turn announced - which the raw
 	// echo path must keep track of just as the rebuilt one does.
