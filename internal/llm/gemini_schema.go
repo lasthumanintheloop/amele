@@ -124,6 +124,13 @@ func sanitizeGeminiSchemaList(raw json.RawMessage, path string, stripped *[]stri
 	return encoded
 }
 
+// isEmptyJSONObject reports whether a sanitized schema carries nothing at all.
+// The comparison is against the exact bytes because every document this package
+// produces is compacted, so "{}" is the only spelling an empty object can have.
+func isEmptyJSONObject(raw json.RawMessage) bool {
+	return string(raw) == "{}"
+}
+
 // joinSchemaPath appends one segment to a schema-relative path.
 func joinSchemaPath(path, segment string) string {
 	if path == "" {

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -267,39 +268,88 @@ func TestGeminiParallelFunctionCalls(t *testing.T) {
 // TestGeminiParallelResultsShareOneTurn: both results of a parallel step go
 // back in ONE user content, in call order, each paired to its own call - the
 // shape this wire documents for parallel function responses.
+//
+// The two cases are the two pairing directions. With ids (Gemini 3) the result
+// is matched to the call that carries the same id; WITHOUT them (the 2.5-era
+// models send none) the pairing falls back to call order, and no id may be
+// invented on the way out - an empty id key would be a value amele made up.
 func TestGeminiParallelResultsShareOneTurn(t *testing.T) {
-	client := &GeminiClient{}
-	wire, _ := client.toWire(Request{
-		Model: "gemini-3-pro",
-		Messages: []Message{
-			{Role: RoleUser, Content: "scan both"},
-			{Role: RoleAssistant, ToolCalls: []ToolCall{
+	tests := []struct {
+		name    string
+		calls   []ToolCall
+		results []Message
+		wantIDs []string
+	}{
+		{
+			name: "ids match the calls",
+			calls: []ToolCall{
 				{ID: "call_a", Name: "fs_read", Arguments: `{"path":"a.log"}`},
 				{ID: "call_b", Name: "fs_list", Arguments: `{}`},
-			}},
+			},
 			// The loop appends results in call order; a provider is free to
 			// accept them in any order but amele keeps the deterministic one.
-			{Role: RoleTool, ToolCallID: "call_a", Content: "clean"},
-			{Role: RoleTool, ToolCallID: "call_b", Content: `{"entries":["a.log"]}`},
+			results: []Message{
+				{Role: RoleTool, ToolCallID: "call_a", Content: "clean"},
+				{Role: RoleTool, ToolCallID: "call_b", Content: `{"entries":["a.log"]}`},
+			},
+			wantIDs: []string{"call_a", "call_b"},
 		},
-	})
-	if len(wire.Contents) != 3 {
-		t.Fatalf("contents: got %d entries, want 3 (user, model, one tool turn)", len(wire.Contents))
+		{
+			name: "no ids at all pairs by call order",
+			calls: []ToolCall{
+				{Name: "fs_read", Arguments: `{"path":"a.log"}`},
+				{Name: "fs_list", Arguments: `{}`},
+			},
+			results: []Message{
+				{Role: RoleTool, Content: "clean"},
+				{Role: RoleTool, Content: `{"entries":["a.log"]}`},
+			},
+			wantIDs: []string{"", ""},
+		},
 	}
-	results := wire.Contents[2]
-	if results.Role != geminiRoleUser {
-		t.Errorf("tool turn role: got %q", results.Role)
-	}
-	if len(results.Parts) != 2 {
-		t.Fatalf("tool turn parts: got %d, want 2", len(results.Parts))
-	}
-	if results.Parts[0].FunctionResponse.Name != "fs_read" || results.Parts[1].FunctionResponse.Name != "fs_list" {
-		t.Errorf("names out of order: %q, %q",
-			results.Parts[0].FunctionResponse.Name, results.Parts[1].FunctionResponse.Name)
-	}
-	if results.Parts[0].FunctionResponse.ID != "call_a" || results.Parts[1].FunctionResponse.ID != "call_b" {
-		t.Errorf("ids out of order: %q, %q",
-			results.Parts[0].FunctionResponse.ID, results.Parts[1].FunctionResponse.ID)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			messages := append([]Message{
+				{Role: RoleUser, Content: "scan both"},
+				{Role: RoleAssistant, ToolCalls: tt.calls},
+			}, tt.results...)
+
+			client := &GeminiClient{}
+			wire, fields := client.toWire(Request{Model: "gemini-3-pro", Messages: messages})
+			if len(wire.Contents) != 3 {
+				t.Fatalf("contents: got %d entries, want 3 (user, model, one tool turn)", len(wire.Contents))
+			}
+			results := wire.Contents[2]
+			if results.Role != geminiRoleUser {
+				t.Errorf("tool turn role: got %q", results.Role)
+			}
+			if len(results.Parts) != 2 {
+				t.Fatalf("tool turn parts: got %d, want 2", len(results.Parts))
+			}
+			// The name is what the pairing recovers: a result labelled with
+			// the wrong function is worse than no result at all.
+			if results.Parts[0].FunctionResponse.Name != "fs_read" || results.Parts[1].FunctionResponse.Name != "fs_list" {
+				t.Errorf("names out of order: %q, %q",
+					results.Parts[0].FunctionResponse.Name, results.Parts[1].FunctionResponse.Name)
+			}
+			for i, want := range tt.wantIDs {
+				if got := results.Parts[i].FunctionResponse.ID; got != want {
+					t.Errorf("result %d id: got %q, want %q", i, got, want)
+				}
+			}
+
+			body, err := encodeBody(wire, fields)
+			if err != nil {
+				t.Fatalf("encodeBody: %v", err)
+			}
+			// CONTRACT: an id amele never received is an id it never sends.
+			// omitempty is what keeps the key off the wire here, and this is
+			// the assertion that would catch its removal.
+			if hasID := bytes.Contains(body, []byte(`"id"`)); hasID != (tt.wantIDs[0] != "") {
+				t.Errorf("id keys on the wire: got %v, want %v\nbody: %s", hasID, tt.wantIDs[0] != "", body)
+			}
+		})
 	}
 }
 
@@ -424,14 +474,19 @@ func TestGeminiToolsAreSanitized(t *testing.T) {
 		Tools: []ToolDef{
 			{Name: "fs_write", Description: "write a file", Parameters: json.RawMessage(fsWriteSchema)},
 			{Name: "ping", Description: "no arguments"},
+			// An MCP server that describes its input purely through $ref/$defs
+			// leaves the sanitizer with nothing.
+			{Name: "by_ref", Description: "schema by reference", Parameters: json.RawMessage(
+				`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/in",
+				  "$defs":{"in":{"type":"object"}}}`)},
 		},
 	})
 	if len(wire.Tools) != 1 {
 		t.Fatalf("tools: got %d entries, want 1 (all declarations share one tool object)", len(wire.Tools))
 	}
 	decls := wire.Tools[0].FunctionDeclarations
-	if len(decls) != 2 {
-		t.Fatalf("declarations: got %d, want 2", len(decls))
+	if len(decls) != 3 {
+		t.Fatalf("declarations: got %d, want 3", len(decls))
 	}
 	if got := string(decls[0].Parameters); got != `{"properties":{"content":{"description":"Full file content","type":"string"},`+
 		`"path":{"description":"Relative file path","type":"string"}},"required":["path","content"],"type":"object"}` {
@@ -440,5 +495,13 @@ func TestGeminiToolsAreSanitized(t *testing.T) {
 	// A tool without a schema declares no parameters key at all.
 	if decls[1].Parameters != nil {
 		t.Errorf("ping parameters: got %s, want none", decls[1].Parameters)
+	}
+	// CONTRACT: so does a tool whose schema the sanitizer emptied. Sending
+	// `parameters: {}` would bet on the service accepting a type-less Schema -
+	// an unverified guess, and a wrong one costs the whole request, not just
+	// this tool. The absent key is the shape the argument-less tool above
+	// already proves is accepted.
+	if decls[2].Parameters != nil {
+		t.Errorf("by_ref parameters: got %s, want none", decls[2].Parameters)
 	}
 }

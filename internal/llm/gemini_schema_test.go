@@ -108,9 +108,13 @@ func TestSanitizeGeminiSchema(t *testing.T) {
 			wantStripped: []string{"additionalProperties"},
 		},
 		{
-			// A schema of nothing but unsupported keywords becomes the empty
-			// schema rather than disappearing: the tool still takes an
-			// argument object, and the declaration must stay well-formed.
+			// A schema of nothing but unsupported keywords empties out to {}
+			// rather than disappearing: this function's job is to remove
+			// keywords, not to decide what an emptied schema means. Whether a
+			// type-less Schema is a shape the service accepts is NOT settled
+			// here - the caller decides what to do with an empty root, and
+			// applyTools drops the parameters key entirely rather than betting
+			// on it (unverified until the Task 6 live smoke).
 			name:         "a schema emptied by the sanitizer stays an object",
 			raw:          `{"$ref":"#/$defs/x"}`,
 			want:         `{}`,

@@ -865,6 +865,16 @@ func (out *gemRequest) applyTools(defs []ToolDef) {
 	decls := make([]gemFunctionDecl, 0, len(defs))
 	for _, def := range defs {
 		clean, _ := SanitizeGeminiSchema(def.Parameters)
+		// A schema the sanitizer emptied (an MCP tool that describes its input
+		// purely through $ref/$defs, say) declares NO parameters key at all
+		// rather than an empty Schema object. Both readings are guesses about
+		// what a type-less Schema means to the service; the absent key is the
+		// one already known to work - it is what a genuinely argument-less tool
+		// sends - and this wire punishes an unexpected shape with a 400 that
+		// fails every other tool in the request too.
+		if isEmptyJSONObject(clean) {
+			clean = nil
+		}
 		decls = append(decls, gemFunctionDecl{
 			Name:        def.Name,
 			Description: def.Description,
