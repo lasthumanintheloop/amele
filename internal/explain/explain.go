@@ -1189,7 +1189,7 @@ func geminiSchemaLines(cfg *config.Config, reg *tools.Registry) []string {
 	}
 	// Registration order, which is the order the tools travel in: a report an
 	// operator diffs between runs must not shuffle.
-	lines := []string{"tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword is a 400 there)"}
+	lines := []string{"tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword or shape is a 400 there)"}
 	for _, def := range defs {
 		_, stripped := llm.SanitizeGeminiSchema(def.Parameters)
 		if len(stripped) == 0 {

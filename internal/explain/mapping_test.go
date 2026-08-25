@@ -453,7 +453,11 @@ func registryWithSchemas(t *testing.T, tools_ ...schemaTool) *tools.Registry {
 // their order (registration order, which is the order the tools travel in) are
 // pinned together. The fixture holds both outcomes - a schema that loses two
 // keywords at two depths, and one that loses nothing - because "no keys
-// stripped" is the row an operator reads as an all-clear.
+// stripped" is the row an operator reads as an all-clear. The third schema
+// carries the two unsupported SHAPES instead of unsupported keys - a nullable
+// type union and a boolean sub-schema, both of which an MCP server really does
+// publish - because those rewrites travel to the operator through this very
+// list and must be as visible as a removed keyword.
 //
 // SECURITY: keys and paths only. A tool schema's `pattern`, `default` or
 // `description` can carry operator text - and, from an MCP server, REMOTE text
@@ -462,6 +466,8 @@ func TestGeminiToolSchemaGolden(t *testing.T) {
 	dirty := `{"type":"object","additionalProperties":false,
 		"properties":{"path":{"type":"string","pattern":"^secret-value$"}}}`
 	clean := `{"type":"object","properties":{"path":{"type":"string"}}}`
+	shapes := `{"type":"object","properties":{"path":{"type":["string","null"],"default":"secret-value"},
+		"deep":true}}`
 
 	cfg := baseCfg()
 	cfg.Provider.Type = config.ProviderTypeGemini
@@ -473,6 +479,7 @@ func TestGeminiToolSchemaGolden(t *testing.T) {
 	reg := registryWithSchemas(t,
 		schemaTool{name: "fs_write", schema: dirty},
 		schemaTool{name: "tidy_tool", schema: clean},
+		schemaTool{name: "shapey_tool", schema: shapes},
 	)
 	got := Render(cfg, reg, nil, nil, alwaysFound, nil)
 

@@ -334,8 +334,17 @@ and an unknown keyword is a hard 400 that fails the *whole* request - every
 tool, not just the offending one. amele therefore strips what the subset cannot
 carry (`additionalProperties`, `$schema`, `$ref`, `pattern`, ... - it is an
 allowlist, so a keyword invented after this release goes too) from its own
-builtins and from whatever schemas your MCP servers publish. The cost is a
-constraint the model no longer sees, so nothing is stripped silently:
+builtins and from whatever schemas your MCP servers publish.
+
+Two unsupported *shapes* are rewritten as well, because no keyword filter could
+catch them and each is the same whole-request 400: a schema position holding
+something that is not an object (a boolean sub-schema) becomes `{}`, and the
+JSON-Schema nullable idiom `"type": ["string", "null"]` becomes
+`"type": "string"` with `"nullable": true` (a union that narrows to nothing -
+a bare `"null"` - loses the keyword). A declaration whose *root* schema empties
+out this way sends no `parameters` key at all rather than an empty one.
+
+The cost is a constraint the model no longer sees, so nothing is changed silently:
 `amele explain` lists the removed paths per tool, and a run prints one warning
 line naming them. Values are never printed - only key paths.
 

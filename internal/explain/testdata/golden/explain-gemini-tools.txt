@@ -12,9 +12,10 @@ MODEL & PROVIDER
     google recommends the default 1.0 on gemini 3 models; non-default may degrade output
     params keys (merged verbatim, values not shown): "labels"
     unknown request fields: rejected (400) - strict protobuf JSON
-    tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword is a 400 there)
+    tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword or shape is a 400 there)
       "fs_write": stripped "additionalProperties", "properties.path.pattern"
       "tidy_tool": no keys stripped
+      "shapey_tool": stripped "properties.deep (non-object schema replaced)", "properties.path.default", "properties.path.type (type array narrowed)"
 
 TOOLS
   workspace: "/ws"

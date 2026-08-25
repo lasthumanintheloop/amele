@@ -479,14 +479,23 @@ func TestGeminiToolsAreSanitized(t *testing.T) {
 			{Name: "by_ref", Description: "schema by reference", Parameters: json.RawMessage(
 				`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"#/$defs/in",
 				  "$defs":{"in":{"type":"object"}}}`)},
+			// A declaration whose parameters are not a Schema OBJECT at all. It
+			// used to travel verbatim and 400 the request - taking every tool
+			// above it down with it - so the shape half of the sanitizer is what
+			// this row pins.
+			{Name: "boolean_schema", Description: "anything goes", Parameters: json.RawMessage(`true`)},
+			// The nullable union an MCP server publishes: the declaration keeps
+			// its parameters, with the union collapsed onto this wire's spelling.
+			{Name: "nullable_arg", Description: "one optional path", Parameters: json.RawMessage(
+				`{"type":"object","properties":{"path":{"type":["string","null"]}}}`)},
 		},
 	})
 	if len(wire.Tools) != 1 {
 		t.Fatalf("tools: got %d entries, want 1 (all declarations share one tool object)", len(wire.Tools))
 	}
 	decls := wire.Tools[0].FunctionDeclarations
-	if len(decls) != 3 {
-		t.Fatalf("declarations: got %d, want 3", len(decls))
+	if len(decls) != 5 {
+		t.Fatalf("declarations: got %d, want 5", len(decls))
 	}
 	if got := string(decls[0].Parameters); got != `{"properties":{"content":{"description":"Full file content","type":"string"},`+
 		`"path":{"description":"Relative file path","type":"string"}},"required":["path","content"],"type":"object"}` {
@@ -503,5 +512,14 @@ func TestGeminiToolsAreSanitized(t *testing.T) {
 	// already proves is accepted.
 	if decls[2].Parameters != nil {
 		t.Errorf("by_ref parameters: got %s, want none", decls[2].Parameters)
+	}
+	// A non-object schema becomes the empty schema, which applyTools then drops
+	// like any other emptied declaration - the tool loses its (unreadable)
+	// constraints, the request keeps every other tool.
+	if decls[3].Parameters != nil {
+		t.Errorf("boolean_schema parameters: got %s, want none", decls[3].Parameters)
+	}
+	if got := string(decls[4].Parameters); got != `{"properties":{"path":{"nullable":true,"type":"string"}},"type":"object"}` {
+		t.Errorf("nullable_arg parameters: got %s", got)
 	}
 }

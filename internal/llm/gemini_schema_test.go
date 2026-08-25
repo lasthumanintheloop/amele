@@ -121,27 +121,105 @@ func TestSanitizeGeminiSchema(t *testing.T) {
 			wantStripped: []string{"$ref"},
 		},
 		{
-			// Not an object, so there is no keyword to strip: passed through
-			// compacted, and the wire's own 400 names it if it is wrong.
-			name: "a non-object schema passes through",
-			raw:  `[ 1, 2 ]`,
-			want: `[1,2]`,
+			// Not an object, so there is no keyword to strip - but the wire
+			// wants a Schema object here, and one bad declaration 400s the
+			// WHOLE toolset. It becomes an empty schema, and the report says so.
+			name:         "a non-object schema becomes an empty schema",
+			raw:          `[ 1, 2 ]`,
+			want:         `{}`,
+			wantStripped: []string{"root (non-object schema replaced)"},
 		},
 		{
-			// Not JSON at all: nothing is invented and nothing is dropped, so
-			// the failure stays visible (the encoder refuses the body) instead
-			// of a tool quietly losing its parameters.
-			name: "an unparseable schema passes through",
-			raw:  `{"broken":`,
-			want: `{"broken":`,
+			// Not JSON at all: same answer. Passing it through used to fail the
+			// whole request at the encoder, which is the one outcome this
+			// sanitizer exists to prevent.
+			name:         "an unparseable schema becomes an empty schema",
+			raw:          `{"broken":`,
+			want:         `{}`,
+			wantStripped: []string{"root (non-object schema replaced)"},
 		},
 		{
-			// A schema position holding something that is not a schema is left
-			// alone: recursing into it is impossible, and rewriting it would
-			// be a guess.
-			name: "unreadable schema positions are left alone",
+			// Every schema position holds a Schema object after this function
+			// runs, including the ones the input filled with something else.
+			name: "unreadable schema positions become empty schemas",
 			raw:  `{"properties":"nonsense","items":true,"anyOf":[1,"x"]}`,
-			want: `{"anyOf":[1,"x"],"items":true,"properties":"nonsense"}`,
+			want: `{"anyOf":[{},{}],"items":{},"properties":{}}`,
+			wantStripped: []string{
+				"anyOf[0] (non-object schema replaced)",
+				"anyOf[1] (non-object schema replaced)",
+				"items (non-object schema replaced)",
+				"properties (non-object schema replaced)",
+			},
+		},
+		{
+			// The JSON-Schema nullable idiom. The value is an ARRAY on an
+			// ALLOWED key, so the keyword allowlist never sees it - and this
+			// wire's type is a single OpenAPI type, with nullability spelled by
+			// its own keyword.
+			name:         "a nullable type union becomes a type plus nullable",
+			raw:          `{"type":["string","null"],"description":"d"}`,
+			want:         `{"description":"d","nullable":true,"type":"string"}`,
+			wantStripped: []string{"type (type array narrowed)"},
+		},
+		{
+			// A union of two real types keeps the first and gains NO nullable:
+			// the constraint the model loses is reported, not invented.
+			name:         "a type union without null narrows to its first member",
+			raw:          `{"type":["integer","string"]}`,
+			want:         `{"type":"integer"}`,
+			wantStripped: []string{"type (type array narrowed)"},
+		},
+		{
+			// An explicit nullable: false loses to a union that says null is
+			// allowed - the two contradict, and the union is the one the
+			// operator (or the MCP server) wrote last.
+			name:         "the narrowed union wins over a contradicting nullable",
+			raw:          `{"type":["string","null"],"nullable":false}`,
+			want:         `{"nullable":true,"type":"string"}`,
+			wantStripped: []string{"type (type array narrowed)"},
+		},
+		{
+			// "the value is null" has no OpenAPI spelling at all, so the
+			// keyword goes rather than travelling as a type this wire rejects.
+			name:         "a null type is removed",
+			raw:          `{"type":"null","title":"t"}`,
+			want:         `{"title":"t"}`,
+			wantStripped: []string{"type (type removed)"},
+		},
+		{
+			// Nothing usable survives the union either.
+			name:         "a union of nothing but null is removed",
+			raw:          `{"type":["null"]}`,
+			want:         `{}`,
+			wantStripped: []string{"type (type removed)"},
+		},
+		{
+			// A type that is not a string and not an array of them is a shape
+			// this wire cannot read; it is removed rather than forwarded.
+			name:         "a type that is neither a string nor an array is removed",
+			raw:          `{"type":7}`,
+			want:         `{}`,
+			wantStripped: []string{"type (type removed)"},
+		},
+		{
+			// The MCP-style fixture: both shapes in one declaration, nested,
+			// next to an ordinary stripped keyword. This is the schema that
+			// used to 400 every OTHER tool in the request too.
+			name: "an mcp-style schema carrying both shapes",
+			raw: `{"type":"object","additionalProperties":false,
+				"properties":{"path":{"type":["string","null"],"description":"d"},
+				"deep":true,"mode":{"type":"null"},
+				"tags":{"type":"array","items":{"type":["string","null"]}}}}`,
+			want: `{"properties":{"deep":{},"mode":{},` +
+				`"path":{"description":"d","nullable":true,"type":"string"},` +
+				`"tags":{"items":{"nullable":true,"type":"string"},"type":"array"}},"type":"object"}`,
+			wantStripped: []string{
+				"additionalProperties",
+				"properties.deep (non-object schema replaced)",
+				"properties.mode.type (type removed)",
+				"properties.path.type (type array narrowed)",
+				"properties.tags.items.type (type array narrowed)",
+			},
 		},
 	}
 

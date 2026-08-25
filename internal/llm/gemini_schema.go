@@ -39,9 +39,28 @@ var geminiSchemaKeywords = map[string]bool{
 //
 // CONTRACT: nothing is dropped silently - a keyword that leaves the schema is
 // always named in stripped. An empty document returns (nil, nil) so the
-// declaration carries no parameters key at all, and a document that is not a
-// JSON object is passed through compacted: there is no keyword to strip, and
-// the wire's own error names it better than a guess here would.
+// declaration carries no parameters key at all.
+//
+// CONTRACT: the allowlist answers unsupported KEYS; two unsupported SHAPES are
+// answered as well, because neither could ever be caught by a key filter and
+// each is a hard 400 that fails the WHOLE toolset, not just the declaration
+// carrying it:
+//
+//   - a schema POSITION holding something that is not an object (a boolean
+//     schema, a stray array, bytes that are not JSON at all) becomes {} - the
+//     empty schema - and is reported with a "(non-object schema replaced)"
+//     note. Passing it through instead used to fail the request at the encoder
+//     or at the wire, which is the one outcome this function exists to prevent.
+//   - the JSON-Schema union spelling of type ("type": ["string","null"]) is
+//     narrowed to its first non-"null" member, with nullable: true when the
+//     union admitted null. This wire's type is ONE OpenAPI type and nullability
+//     is its own keyword; a type that narrows to nothing (a bare "null", an
+//     empty or unreadable array, a number) is removed entirely.
+//
+// The notes ride in the same report as the stripped keys and are still PATHS
+// plus a fixed phrase - no schema value is ever quoted, which is what lets
+// `explain` and the run's warning line print this list for a remote MCP
+// server's schemas (see geminiSchemaLines).
 //
 // The input is never modified: every value that survives is a copy.
 func SanitizeGeminiSchema(raw json.RawMessage) (clean json.RawMessage, stripped []string) {
@@ -57,9 +76,18 @@ func SanitizeGeminiSchema(raw json.RawMessage) (clean json.RawMessage, stripped 
 func sanitizeGeminiSchema(raw json.RawMessage, path string, stripped *[]string) json.RawMessage {
 	obj, ok := decodeJSONObject(raw)
 	if !ok {
-		return compactJSON(raw)
+		// A schema position that is not a Schema object. See the shape half of
+		// SanitizeGeminiSchema's contract: the empty schema is the one value
+		// this wire is known to accept everywhere a schema is expected, and the
+		// note is what keeps the loss visible.
+		*stripped = append(*stripped, noteSchemaPath(path, "non-object schema replaced"))
+		return json.RawMessage("{}")
 	}
 	out := make(map[string]json.RawMessage, len(obj))
+	// nullable is remembered rather than written immediately: it is decided by
+	// the type key and must survive an explicit "nullable" that contradicts it,
+	// whichever order the two keys are visited in.
+	nullable := false
 	// Sorted iteration, not map order: the stripped paths are a report an
 	// operator reads and a golden pins, and Go randomizes map iteration.
 	for _, key := range slices.Sorted(maps.Keys(obj)) {
@@ -75,12 +103,24 @@ func sanitizeGeminiSchema(raw json.RawMessage, path string, stripped *[]string) 
 			out[key] = sanitizeGeminiProperties(obj[key], joinSchemaPath(path, key), stripped)
 		case "items", "anyOf":
 			out[key] = sanitizeGeminiSchemaList(obj[key], joinSchemaPath(path, key), stripped)
+		case "type":
+			narrowed, addNullable, keep := narrowGeminiType(obj[key], joinSchemaPath(path, key), stripped)
+			if keep {
+				out[key] = narrowed
+			}
+			nullable = nullable || addNullable
 		default:
 			// Every other allowed keyword is a leaf as far as this subset goes
 			// (no schema hides inside an enum or a required list), so the value
 			// travels verbatim - compacted, never re-encoded.
 			out[key] = compactJSON(obj[key])
 		}
+	}
+	if nullable {
+		// Overwrites an explicit nullable: false. The two contradict, and the
+		// union that admits null is the more specific statement of the same
+		// document - dropping it would silently tighten the model's contract.
+		out["nullable"] = json.RawMessage("true")
 	}
 	// Marshalling this map sorts the keys and compacts the values, and cannot
 	// fail: every value is either a RawMessage that already decoded or output
@@ -90,12 +130,68 @@ func sanitizeGeminiSchema(raw json.RawMessage, path string, stripped *[]string) 
 	return encoded
 }
 
+// narrowGeminiType maps a JSON Schema type value onto the single OpenAPI type
+// this wire's Schema carries. It reports the value to emit, whether the schema
+// must also gain nullable: true, and whether the key survives at all; a removal
+// or a rewrite is appended to stripped under path.
+//
+// The union spelling is the reason this exists: "type": ["string","null"] is
+// how JSON Schema says "nullable string", it rides on a key the allowlist
+// ALLOWS, and this wire answers the array with a 400 that fails every tool in
+// the request. The first non-"null" member is kept because a union amele cannot
+// express has to collapse to something, and the first member is the one the
+// author wrote first; the loss is reported rather than guessed at silently.
+func narrowGeminiType(raw json.RawMessage, path string, stripped *[]string) (value json.RawMessage, nullable, keep bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var members []string
+		if err := json.Unmarshal(trimmed, &members); err != nil {
+			*stripped = append(*stripped, noteSchemaPath(path, "type removed"))
+			return nil, false, false
+		}
+		// nullable follows the union's OWN membership, not its length: a
+		// ["integer","string"] union loses a type but gains no nullability.
+		hasNull := slices.Contains(members, "null")
+		for _, member := range members {
+			if member == "null" {
+				continue
+			}
+			// Re-encoded rather than sliced out of the input: this is the one
+			// place a value is rewritten, and the encoder is what guarantees
+			// the result is a well-formed JSON string.
+			encoded, err := json.Marshal(member)
+			if err != nil {
+				break
+			}
+			*stripped = append(*stripped, noteSchemaPath(path, "type array narrowed"))
+			return encoded, hasNull, true
+		}
+		// Nothing but "null" (or an empty array): there is no type left to be
+		// nullable ABOUT, so the keyword goes without one.
+		*stripped = append(*stripped, noteSchemaPath(path, "type removed"))
+		return nil, false, false
+	}
+	var single string
+	if err := json.Unmarshal(trimmed, &single); err != nil || single == "null" {
+		// Either a shape this wire cannot read (a number, an object) or the
+		// null type, which has no OpenAPI spelling at all.
+		*stripped = append(*stripped, noteSchemaPath(path, "type removed"))
+		return nil, false, false
+	}
+	return compactJSON(raw), false, true
+}
+
 // sanitizeGeminiProperties sanitizes each property's schema, keeping the
 // property NAMES as they are.
+//
+// A properties value that is not an object holds no property schema to walk and
+// is a 400 on this wire, so it is replaced by the empty map and reported, the
+// same answer a schema position gets.
 func sanitizeGeminiProperties(raw json.RawMessage, path string, stripped *[]string) json.RawMessage {
 	obj, ok := decodeJSONObject(raw)
 	if !ok {
-		return compactJSON(raw)
+		*stripped = append(*stripped, noteSchemaPath(path, "non-object schema replaced"))
+		return json.RawMessage("{}")
 	}
 	out := make(map[string]json.RawMessage, len(obj))
 	for _, name := range slices.Sorted(maps.Keys(obj)) {
@@ -129,6 +225,21 @@ func sanitizeGeminiSchemaList(raw json.RawMessage, path string, stripped *[]stri
 // produces is compacted, so "{}" is the only spelling an empty object can have.
 func isEmptyJSONObject(raw json.RawMessage) bool {
 	return string(raw) == "{}"
+}
+
+// noteSchemaPath renders one SHAPE rewrite for the stripped-path report: the
+// position, then a fixed phrase saying what happened to it.
+//
+// The root of a document has no path, so it is named "root" rather than
+// reported as an empty string - these lines are read by an operator and quoted
+// verbatim by `explain`. The phrase is always a constant from this file: no
+// part of the schema's own text may reach a report (see the CONTRACT on
+// SanitizeGeminiSchema).
+func noteSchemaPath(path, note string) string {
+	if path == "" {
+		path = "root"
+	}
+	return path + " (" + note + ")"
 }
 
 // joinSchemaPath appends one segment to a schema-relative path.

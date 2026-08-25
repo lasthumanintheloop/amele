@@ -1887,7 +1887,7 @@ func warnSanitizedToolSchemas(cfg *config.Config, reg *tools.Registry, stderr io
 		return
 	}
 	_, _ = fmt.Fprintln(stderr, secrets.Redact(
-		"warning: tool schemas sanitized for the gemini wire (unsupported JSON Schema keywords removed): "+
+		"warning: tool schemas sanitized for the gemini wire (unsupported JSON Schema keywords and shapes removed): "+
 			strings.Join(stripped, ", ")))
 }
 
