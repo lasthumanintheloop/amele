@@ -196,6 +196,35 @@ func TestVertexEndpointRefusesUnaddressableTargets(t *testing.T) {
 	}
 }
 
+// TestValidVertexID pins the charset itself, which is exported because
+// internal/config validates against this same function rather than a copy of
+// the rule (see its CONTRACT note). The rows are the boundary cases: what may
+// lead, what may not, and every separator that would matter in a hostname or a
+// path.
+func TestValidVertexID(t *testing.T) {
+	valid := []string{"my-project", "p", "p1", "123456789012", "global", "us", "europe-west4", "a-b-c-1"}
+	for _, v := range valid {
+		if !ValidVertexID(v) {
+			t.Errorf("ValidVertexID(%q) = false, want true", v)
+		}
+	}
+
+	invalid := []string{
+		"",                 // no coordinate at all
+		"-leading",         // cannot start a DNS label
+		"My-Project", "US", // upper case: GCP has none, and the host is lowercase
+		"under_score", "a b", // not host- or path-safe
+		"dot.ted",         // would extend the hostname
+		"a/b", "../other", // would climb the path
+		"p@h", "p:1", "p?q", // userinfo, port, query
+	}
+	for _, v := range invalid {
+		if ValidVertexID(v) {
+			t.Errorf("ValidVertexID(%q) = true, want false", v)
+		}
+	}
+}
+
 // TestGeminiAIStudioEndpointUnaffected: the AI Studio path keeps its own host,
 // version and shape. Vertex is a mode, not a rewrite of the client.
 func TestGeminiAIStudioEndpointUnaffected(t *testing.T) {
@@ -430,13 +459,28 @@ func TestVertexBodyIsIdenticalToAIStudio(t *testing.T) {
 // TestGeminiWireFieldsPinTheVertexDiffTable is the tripwire under the claim
 // above. The vertex body diffs are inert only for as long as this client sends
 // none of the fields they concern, and that is a property of the wire structs -
-// so the field set is pinned here.
+// so the field set of the WHOLE request tree is pinned here, not just its root.
 //
-// A new field appearing in this list fails the test on purpose: whoever adds it
-// must check it against the diff table in
+// The tree matters because the research finds divergences at every level, not
+// only at the top: Part is Vertex-only for audioTranscription and AI
+// Studio-only for mediaProcessing/partMetadata/toolCall/toolResponse (§2.6),
+// and Tool is Vertex-only for enterpriseWebSearch/retrieval and AI Studio-only
+// for fileSearch/mcpServers (§2.7). A future `mcpServers` on gemTool would 400
+// on Vertex; a root-only pin would not have noticed.
+//
+// A new field appearing in any of these lists fails the test on purpose:
+// whoever adds it must check it against the diff table in
 // docs/superpowers/specs/2026-08-25-vertex-adc-research.md §2 and decide
 // whether vertex mode needs to spell it differently, rather than discovering
 // the difference as a 400 from a live run.
+//
+// ONE EXCLUSION, deliberate: the walk reads json tags, so a field tagged `json:"-"`
+// is invisible to it - gemContent.PartsRaw is the only one today, and it is the
+// verbatim echo carrier, which by construction sends back bytes the PROVIDER
+// produced rather than a field amele chose to spell. The wire goldens are the
+// backstop for that path. Response types are out of scope here too: the client
+// decodes only the shared fields, and a field it does not decode cannot be
+// mis-sent.
 func TestGeminiWireFieldsPinTheVertexDiffTable(t *testing.T) {
 	tags := func(v any) []string {
 		var out []string
@@ -452,28 +496,80 @@ func TestGeminiWireFieldsPinTheVertexDiffTable(t *testing.T) {
 		return out
 	}
 
-	wantRequest := []string{"contents", "generationConfig", "systemInstruction", "tools"}
-	if got := tags(gemRequest{}); !slices.Equal(got, wantRequest) {
-		t.Errorf("the request body grew a field: got %v, want %v - check it against the vertex diff table", got, wantRequest)
+	// Every struct the request body is assembled from, with the note that says
+	// why the diff table does not reach it as it stands.
+	pins := []struct {
+		name string
+		zero any
+		want []string
+		why  string
+	}{
+		{
+			name: "gemRequest",
+			zero: gemRequest{},
+			want: []string{"contents", "generationConfig", "systemInstruction", "tools"},
+			why:  "labels (vertex-only) and serviceTier/store/model (AI Studio-only) are all absent; safetySettings is owned but never written, so its vertex-only `method` key has nothing to attach to",
+		},
+		{
+			name: "gemGenerationConfig",
+			zero: gemGenerationConfig{},
+			want: []string{
+				"maxOutputTokens", "responseJsonSchema", "responseMimeType",
+				"stopSequences", "temperature", "thinkingConfig", "topP",
+			},
+			why: "topK is absent (its TYPE differs: float on vertex, integer on AI Studio) and responseFormat is absent (its SHAPE differs: an array vs an object); structured output travels as responseJsonSchema, which is shared",
+		},
+		{
+			name: "gemThinking",
+			zero: gemThinking{},
+			want: []string{"thinkingBudget", "thinkingLevel"},
+			why:  "thinkingConfig has an identical field set on both backends (§2.4); only the enum ORDER differs, which is not a wire fact",
+		},
+		{
+			name: "gemContent",
+			zero: gemContent{},
+			want: []string{"parts", "role"},
+			why:  "Content is exactly identical on both backends (§2.7)",
+		},
+		{
+			name: "gemPart",
+			zero: gemPart{},
+			want: []string{"functionCall", "functionResponse", "text", "thought", "thoughtSignature"},
+			why:  "all five are shared; the diverging Part keys - audioTranscription on vertex, mediaProcessing/partMetadata/toolCall/toolResponse on AI Studio - are none of them, and thoughtSignature is byte-identical on both (§2.6)",
+		},
+		{
+			name: "gemFunctionCall",
+			zero: gemFunctionCall{},
+			want: []string{"args", "id", "name"},
+			why:  "FunctionCall is shared",
+		},
+		{
+			name: "gemFunctionResponse",
+			zero: gemFunctionResponse{},
+			want: []string{"id", "name", "response"},
+			why:  "FunctionResponse is shared",
+		},
+		{
+			name: "gemTool",
+			zero: gemTool{},
+			want: []string{"functionDeclarations"},
+			why:  "the ONE shared tool kind amele uses; the vertex-only kinds (enterpriseWebSearch, retrieval, ...) and the AI Studio-only ones (fileSearch, mcpServers) are all absent (§2.7)",
+		},
+		{
+			name: "gemFunctionDecl",
+			zero: gemFunctionDecl{},
+			want: []string{"description", "name", "parameters"},
+			why:  "FunctionDeclaration is exactly identical on both backends - the core tool-calling contract is portable (§2.7)",
+		},
 	}
 
-	// topK is deliberately absent: it is the field whose TYPE differs between
-	// the backends (float on vertex, integer on AI Studio), and amele exposes
-	// no knob for it. responseFormat is absent for the same reason - its SHAPE
-	// differs (an array on vertex, an object on AI Studio) - and structured
-	// output travels as responseJsonSchema, which is shared.
-	wantConfig := []string{
-		"maxOutputTokens", "responseJsonSchema", "responseMimeType",
-		"stopSequences", "temperature", "thinkingConfig", "topP",
-	}
-	if got := tags(gemGenerationConfig{}); !slices.Equal(got, wantConfig) {
-		t.Errorf("generationConfig grew a field: got %v, want %v - check it against the vertex diff table", got, wantConfig)
-	}
-
-	// safetySettings is owned (params cannot supply it) but never written, so
-	// the vertex-only safetySettings.method has nothing to apply to.
-	if slices.Contains(tags(gemRequest{}), "safetySettings") {
-		t.Error("safetySettings is now written; vertex accepts an extra method field on it")
+	for _, pin := range pins {
+		t.Run(pin.name, func(t *testing.T) {
+			if got := tags(pin.zero); !slices.Equal(got, pin.want) {
+				t.Errorf("%s changed shape: got %v, want %v\ninert because: %s\ncheck the new field against the vertex diff table before shipping it",
+					pin.name, got, pin.want, pin.why)
+			}
+		})
 	}
 }
 

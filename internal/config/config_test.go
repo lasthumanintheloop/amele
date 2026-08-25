@@ -1415,6 +1415,48 @@ func TestVertexValidation(t *testing.T) {
 	}
 }
 
+// TestVertexIDRuleIsShared is the anti-drift guard under the frozen exit-code
+// contract: whatever the CLIENT will accept as a project or location at request
+// time, validate must accept at load time, and vice versa.
+//
+// The rule exists once (llm.ValidVertexID) and this test proves the config
+// layer really consults it rather than carrying a copy: a value the predicate
+// rejects must produce a config error, and one it accepts must not. A second
+// definition would eventually drift, and the drift would surface as a config
+// that passes `amele validate` and then dies of its own CONFIGURATION mid-run -
+// the one thing exit 2 is meant to rule out.
+func TestVertexIDRuleIsShared(t *testing.T) {
+	// Values chosen around the edges of the charset, not for realism.
+	candidates := []string{
+		"my-project", "p1", "123456789012", "global", "us", "europe-west4",
+		"My-Project", "US", "under_score", "dot.ted", "trailing ", "-leading",
+		"evil.example.com/v1", "../other", "a/b", "p@h",
+	}
+	for _, value := range candidates {
+		t.Run(value, func(t *testing.T) {
+			want := llm.ValidVertexID(value)
+
+			for _, field := range []string{"project", "location"} {
+				cfg := tuningBase(t.TempDir())
+				cfg.Provider.Type = ProviderTypeGemini
+				cfg.Provider.BaseURL = ""
+				vertex := VertexConfig{Project: "p", Location: "us-central1"}
+				if field == "project" {
+					vertex.Project = value
+				} else {
+					vertex.Location = value
+				}
+				cfg.Provider.Vertex = &vertex
+
+				err := cfg.Validate()
+				if got := err == nil; got != want {
+					t.Errorf("%s %q: validate accepted=%v, llm.ValidVertexID=%v (err: %v)", field, value, got, want, err)
+				}
+			}
+		})
+	}
+}
+
 // TestVertexRequiresGeminiType: the block describes ONE wire's endpoint, so it
 // is refused rather than ignored anywhere else. An ignored block would be a
 // config that reads as a Vertex deployment and runs against OpenAI.

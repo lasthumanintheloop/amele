@@ -1075,20 +1075,16 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 	c.validateProviderTuning(add)
 }
 
-// vertexIDPattern is the charset every vertex path segment must fit: lowercase
-// letters, digits and hyphens.
-//
-// SECURITY: the location is interpolated into the endpoint HOST
-// ("{location}-aiplatform.googleapis.com") and both values become URL path
-// segments, so an unconstrained value could name a different host altogether or
-// climb out of the path amele chose. Escaping in the client defends the path;
-// this rule defends the host, where escaping has no meaning. The charset costs
-// nothing real: Google project ids and locations are lowercase-alphanumeric
-// with hyphens by construction, and a project NUMBER is digits.
-var vertexIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
-
 // validateVertex checks the Vertex AI block: presence relative to the wire, the
 // two required coordinates, and the charset that keeps them addressable.
+//
+// CONTRACT: the charset is not restated here - llm.ValidVertexID owns it, and
+// this function calls the same predicate the client will apply at request time.
+// A second copy would be a config that passes `amele validate` and then fails
+// its CONFIGURATION mid-run the day one side is loosened, which the frozen
+// exit-code contract forbids (docs/engineering.md §7: exit 2 is decided before
+// the run, never during it). The SECURITY reasoning behind the charset lives
+// with the definition.
 func (c *Config) validateVertex(add func(format string, args ...any)) {
 	v := c.Provider.Vertex
 	if v == nil {
@@ -1110,7 +1106,7 @@ func (c *Config) validateVertex(add func(format string, args ...any)) {
 	}
 	if v.Project == "" {
 		add("provider.vertex.project is required (the google cloud project id or number that owns the quota)")
-	} else if !vertexIDPattern.MatchString(v.Project) {
+	} else if !llm.ValidVertexID(v.Project) {
 		add("provider.vertex.project %q must be a lowercase project id or project number (letters, digits and hyphens): it becomes a path segment of the endpoint", v.Project)
 	}
 	if v.Location == "" {
@@ -1119,7 +1115,7 @@ func (c *Config) validateVertex(add func(format string, args ...any)) {
 		// decision amele made on the operator's behalf - and it does not even
 		// serve the current Gemini models.
 		add("provider.vertex.location is required (e.g. us-central1, europe-west4, or global)")
-	} else if !vertexIDPattern.MatchString(v.Location) {
+	} else if !llm.ValidVertexID(v.Location) {
 		add("provider.vertex.location %q must be a lowercase region id like us-central1 or global (letters, digits and hyphens): it becomes part of the endpoint host", v.Location)
 	}
 }

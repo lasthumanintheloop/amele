@@ -182,9 +182,16 @@ type GeminiTokenSource interface {
 // serviceTier (AI Studio); this client decodes neither - it reads only the
 // token counts, which carry the same names on both.
 //
+// The request tree diverges at more than its root - Part (§2.6) and Tool (§2.7)
+// each carry backend-only keys too - and amele writes none of those either: its
+// parts are text/functionCall/functionResponse/thought/thoughtSignature and its
+// only tool kind is functionDeclarations, all shared.
+//
 // Source: docs/superpowers/specs/2026-08-25-vertex-adc-research.md §2 and §6.
-// TestGeminiWireFieldsPinTheVertexDiffTable fails when a field is added to
-// either struct, so the next knob cannot skip this table.
+// TestGeminiWireFieldsPinTheVertexDiffTable fails when a field is added to ANY
+// struct this body is assembled from (request, generationConfig, thinkingConfig,
+// content, part, functionCall, functionResponse, tool, functionDeclaration), so
+// the next knob cannot skip this table.
 type gemRequest struct {
 	Contents []gemContent `json:"contents"`
 	// SystemInstruction is a pointer so the key vanishes when no system prompt
@@ -1364,27 +1371,51 @@ func vertexHost(location string) string {
 	}
 }
 
-// checkVertexID refuses a project or location that could address something
-// other than what it names.
+// ValidVertexID reports whether a string may be used as a Vertex project or
+// location: non-empty, lowercase letters, digits and hyphens, not starting with
+// a hyphen.
 //
-// SECURITY: the location is interpolated into the HOSTNAME, so a value carrying
-// a dot, a slash or an @ could send the whole request - prompt included - to a
-// server nobody configured; both values are also path segments. Config
-// validation applies the same charset (config.vertexIDPattern), so reaching
-// this error means a caller constructed the client directly; it stays because
-// the alternative failure is silent misrouting, and because the check is what
-// lets the URL be assembled by concatenation above.
+// CONTRACT: this is the SINGLE definition of that charset. internal/config
+// calls it for provider.vertex.project/location so that validate and the client
+// can never disagree - a config that passes `amele validate` must not fail its
+// CONFIGURATION at run time (docs/engineering.md §7), which a second copy of
+// this rule would eventually break by drifting.
+//
+// SECURITY: the location is interpolated into the endpoint HOSTNAME, so a value
+// carrying a dot, a slash or an @ could send a whole request - prompt included
+// - to a server nobody configured; both values are also URL path segments. This
+// check is what lets vertexEndpoint assemble the URL by concatenation, and
+// percent-escaping is no substitute for it: escaping has no meaning inside a
+// hostname. A hyphen may not lead because it cannot start a DNS label.
+//
+// The charset costs nothing real: Google project ids and locations are
+// lowercase-alphanumeric with hyphens by construction, and a project NUMBER is
+// digits.
+func ValidVertexID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		alnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if alnum || (r == '-' && i > 0) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// checkVertexID turns ValidVertexID into the client's typed error, separating
+// the two reasons a coordinate can be unusable so the message says which.
+//
+// Config validation applies the same rule through the same function, so
+// reaching this error means a caller constructed the client directly; it stays
+// because the alternative failure is silent misrouting.
 func checkVertexID(kind, value string) error {
 	if value == "" {
 		return fmt.Errorf("%w: vertex %s is empty: a vertex request is addressed by project AND location", ErrProvider, kind)
 	}
-	for i, r := range value {
-		alnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
-		// A leading hyphen is refused with the rest: it cannot start a DNS
-		// label, and the same rule is what config enforces.
-		if alnum || (r == '-' && i > 0) {
-			continue
-		}
+	if !ValidVertexID(value) {
 		return fmt.Errorf("%w: vertex %s %q is not addressable: lowercase letters, digits and hyphens only", ErrProvider, kind, value)
 	}
 	return nil
