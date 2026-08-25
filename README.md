@@ -31,7 +31,7 @@ no Python · no Node · no platform · no account
   language already speaks. Nobody has to write Go.
 - **For everyone.** If you can edit a config file, you can author an agent.
   Nothing to install around it, nobody to sign up with.
-- **Zero dependencies, runs everywhere.** One static ~9.3 MB binary; the
+- **Zero dependencies, runs everywhere.** One static ~11 MB binary; the
   answer to `pip install` is `scp`.
 - **A well-mannered process.** Meaningful exit codes, schema-guaranteed JSON
   on stdout, one JSONL log per run - your scripts get a contract, not a

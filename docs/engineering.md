@@ -120,9 +120,10 @@ primary unit; USD is informational only.
 
 Measured on every PR; exceeding one fails the build. Binary size <= 14 MB
 (target 12 MB, `-ldflags="-s -w" -trimpath`; raised from 10 MB on 2026-08-19
-for the MCP go-sdk. Measured with the MCP client in: **9,777,336 bytes**
-(9.3 MB) on linux/amd64 - the +4.6 MB the SDK adds to a bare binary is partly
-absorbed by dependencies amele already carried). Harness token load (system
+for the MCP go-sdk. Measured with the MCP client, OAuth and the gemini and
+vertex wires in: **11,047,096 bytes** (11 MB) on linux/amd64 - the +4.6 MB the
+SDK adds to a bare binary is partly absorbed by dependencies amele already
+carried). Harness token load (system
 prompt + builtin tool definitions) <= 1500 tokens. Coverage >= 80% across
 `internal/`. Builds are reproducible: `-trimpath`, pinned Go version,
 verified `go.sum`.

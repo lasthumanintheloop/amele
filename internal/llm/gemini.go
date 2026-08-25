@@ -544,13 +544,12 @@ func matchesGeminiCannotDisableThinking(body string) bool {
 // rejectsResponseJSONSchema reports whether this failure looks like "I do not
 // support responseJsonSchema".
 //
-// The gemini counterpart of rejectsResponseFormat, and a heuristic for a
-// sharper reason than the OpenAI one: the design doc records an OPEN QUESTION
-// about this very field - the SDK documents responseJsonSchema while a newer
-// nested responseFormat shape appears elsewhere - and the live smoke (Task 6)
-// is what decides it. Until then the client sends the documented form and
-// treats a 400 naming it as capability discovery, so a wrong guess degrades to
-// validate+retry instead of failing every structured-output run.
+// The gemini counterpart of rejectsResponseFormat. The first-party API accepts
+// the field - the live smoke settled the design doc's open question about it
+// (see applyResponseFormat) - so this is not a probe for amele's own guess any
+// more: it is capability discovery for the OpenAI-shaped gateways and proxies
+// that also answer this path, where a 400 naming the field degrades one request
+// to validate+retry instead of failing every structured-output run.
 //
 // Both spellings are matched: the wire is camelCase, but this API's error text
 // echoes the protobuf field name in snake_case ("Unknown name
@@ -1448,11 +1447,12 @@ func (out *gemRequest) applyKnobs(req Request) {
 // validate+retry layer above can still work with, whereas an empty
 // responseJsonSchema would be a shape this API rejects.
 //
-// TODO(#17): the design doc records an OPEN QUESTION here - the SDK documents
+// The design doc recorded an OPEN QUESTION here - the SDK documents
 // responseJsonSchema while a newer nested responseFormat shape appears
-// elsewhere. The documented form is what ships; the live smoke (plan task 6) is
-// the decider, and until then a 400 naming the field degrades through the
-// fallback in Chat rather than failing the run.
+// elsewhere - and the live smoke (2026-08-25, AI Studio) SETTLED it: this field
+// is accepted and enforced natively, no fallback fired. The fallback in Chat
+// stays for the compatible gateways that reject the field, where a 400 naming
+// it degrades to validate+retry rather than failing the run.
 func (g *gemGenerationConfig) applyResponseFormat(format ResponseFormat) {
 	g.ResponseMimeType = geminiJSONMimeType
 	if len(bytes.TrimSpace(format.Schema)) == 0 {

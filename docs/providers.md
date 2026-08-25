@@ -19,9 +19,12 @@ The promise is not "every feature works everywhere". It is:
 
 **How to read this page.** Every behavior described here is either pinned by a
 test in this repository or verified against the provider's official
-documentation on 2026-08-24. Where neither is true - a provider documents
-nothing, or documents two contradictory things - the claim is marked
-**unverified** and says what amele does about it. Model ids and base URLs are
+documentation - on 2026-08-24 for the OpenAI-compatible dialects and the
+Anthropic wire, and on 2026-08-25 for the Gemini wire (whose AI Studio half was
+additionally exercised against the live service that day; the Vertex half was
+not - see [The Gemini wire](#the-gemini-wire)). Where neither is true - a
+provider documents nothing, or documents two contradictory things - the claim
+is marked **unverified** and says what amele does about it. Model ids and base URLs are
 the parts that rot fastest; copy them from your provider's own docs if they
 have moved.
 
@@ -364,10 +367,12 @@ release does not know are provider errors (exit 5) naming the reason. The
 alternative - passing an unrecognized reason down to the loop - accepts the turn
 whenever it carried text, which in a cron run is exit 0 on a failed turn.
 
-**Thinking is billed as output.** `usage.output_tokens` is
-`candidatesTokenCount` **plus** `thoughtsTokenCount`, because that is what
-Google bills - a run whose budget ignored the thinking half would be off by the
-most expensive part of the turn.
+**Both halves of the usage are summed from two counters.**
+`usage.output_tokens` is `candidatesTokenCount` **plus** `thoughtsTokenCount`,
+because thinking is billed as output - a run whose budget ignored it would be
+off by the most expensive part of the turn. `usage.input_tokens` is
+`promptTokenCount` **plus** `toolUsePromptTokenCount`, the tokens your tool
+declarations cost, which a large MCP toolset pays on every turn.
 
 **Sampling has a recommendation, not a rule.** Google documents `1.0` as the
 Gemini 3 default and recommends leaving it alone. amele sends whatever your
@@ -376,7 +381,8 @@ exists to prevent - and `explain` prints a note next to the value:
 `google recommends the default 1.0 on gemini 3 models; non-default may degrade output`.
 
 Two claims on this wire started as open questions; the live smoke run
-(2026-08-25, gemini-3.7-flash and gemini-2.5-flash) settled both:
+(2026-08-25, gemini-3.7-flash and gemini-2.5-flash, **AI Studio backend**)
+settled both:
 
 - **The structured-output field form: `responseJsonSchema` is accepted.**
   amele sends `generationConfig.responseJsonSchema` and the live run
@@ -393,9 +399,19 @@ Two claims on this wire started as open questions; the live smoke run
   `max_output_tokens` for the model's reasoning, exactly as on every
   other provider.
 
-Still unverified on this wire: an MCP tool whose root schema empties to
-nothing after sanitizing (amele omits `parameters` entirely; the shape is
-unit-tested, not yet exercised against the live service).
+Still unverified on this wire:
+
+- **The whole Vertex backend.** Everything above about `vertex:` - the endpoint
+  construction, the ADC chain, the service-account key exchange, the
+  quota-project header, and the advice attached to a 401, 403 or 404 - is
+  implemented and unit-tested, and **has never been exercised against the live
+  service**. The live smoke that settled the two questions above ran on the AI
+  Studio half only. Treat the Vertex half as "reasoned from Google's discovery
+  documents and documentation", not as "seen working": run
+  `amele explain` and one cheap prompt before you put it in a cron line.
+- An MCP tool whose root schema empties to nothing after sanitizing (amele
+  omits `parameters` entirely; the shape is unit-tested, not yet exercised
+  against the live service).
 
 ## Quickstarts
 
@@ -460,6 +476,12 @@ provider:
   max_output_tokens: 8192         # leave room: thinking is billed here too
   reasoning: {effort: medium}
 ```
+
+**This half has not been run against the live service.** The endpoint, the
+credential chain, the quota header and the failure advice are unit-tested and
+reasoned from Google's own discovery documents, but no amele release has yet
+completed a real Vertex request - so expect to spend one cheap prompt proving
+your wiring before a cron line depends on it.
 
 There is no key on this half: authenticate with `gcloud auth
 application-default login`, or `GOOGLE_APPLICATION_CREDENTIALS`, or
@@ -646,7 +668,7 @@ provider; what differs is who enforces it.
   wire: the schema travels in the request (`response_format: json_schema`,
   `output_config.format` on the Messages API, or
   `generationConfig.responseJsonSchema` + `responseMimeType` on
-  `generateContent` - the last one **unverified**, see [The Gemini
+  `generateContent` - the live smoke settled that last one, see [The Gemini
   wire](#the-gemini-wire)).
 - **By `json_object` + local enforcement** on `deepseek` and `glm`. Neither has
   `json_schema` on this wire, so amele sends the JSON mode they do have -
@@ -660,9 +682,10 @@ provider; what differs is who enforces it.
 - **By fallback** on `kimi` and `groq`, whose support is unverified (below).
   When the endpoint answers a schema-carrying request with a 400 naming the
   field, amele repeats that one request without it - once, immediately, costing
-  no retry budget - and enforces the schema itself. The gemini wire carries the
-  same fallback behind its native attempt, for the field-form question the
-  section above records.
+  no retry budget - and enforces the schema itself. The gemini wire keeps the
+  same fallback behind its native attempt - not because the field form is in
+  doubt any more, but for the compatible gateways that reject
+  `responseJsonSchema` outright.
 
 "Enforces the schema itself" means the same thing in both cases: the answer is
 validated against `output.schema` and violations are fed back to the model for
