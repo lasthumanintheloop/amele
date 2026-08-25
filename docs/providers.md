@@ -317,7 +317,7 @@ is `v1`.
 | `output.schema` | `generationConfig.responseJsonSchema` + `generationConfig.responseMimeType: application/json` |
 | `params` | merged into the body **root**, never into `generationConfig` |
 
-Five things behave differently enough here to state on their own.
+Six things behave differently enough here to state on their own.
 
 **Thought signatures round-trip untouched.** Gemini 3 signs the steps it
 produces, and a tool loop that sends a step back without its signature is a 400.
@@ -354,6 +354,15 @@ parameter schema, rather than being handed to the loop as an empty answer that
 would exit 0 on a broken turn. Like every error turn on every wire, it carries
 **no usage** into the run's accounting: the tokens it burned are real but
 unreported, so a `limits.max_tokens` budget cannot see them.
+
+**No finish reason passes through unread.** `MAX_TOKENS` is `length` (exit 1),
+and `SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`, `SPII`, `RECITATION` and
+`LANGUAGE` are all `content_filter` (exit 1) - a turn cut for a policy reason is
+not a finished answer, even when a paragraph of it arrived. `OTHER`,
+`FINISH_REASON_UNSPECIFIED`, `MISSING_THOUGHT_SIGNATURE` and any reason this
+release does not know are provider errors (exit 5) naming the reason. The
+alternative - passing an unrecognized reason down to the loop - accepts the turn
+whenever it carried text, which in a cron run is exit 0 on a failed turn.
 
 **Thinking is billed as output.** `usage.output_tokens` is
 `candidatesTokenCount` **plus** `thoughtsTokenCount`, because that is what

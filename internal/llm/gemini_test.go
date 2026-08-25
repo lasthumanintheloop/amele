@@ -485,6 +485,11 @@ func TestGeminiNoCandidates(t *testing.T) {
 // TestGeminiFinishReasonMapping walks the documented vocabulary. The mapping is
 // load-bearing: the loop hard-fails a truncated turn on "length" and would
 // accept it as a finished answer under any other name.
+//
+// CONTRACT: there is no passthrough. A reason this table does not name is a
+// provider error naming it, because badFinish ACCEPTS an unknown reason
+// whenever the turn carried content - which is how a RECITATION turn with a
+// preamble used to exit 0 in an unattended run.
 func TestGeminiFinishReasonMapping(t *testing.T) {
 	tests := []struct {
 		reason  string
@@ -497,11 +502,18 @@ func TestGeminiFinishReasonMapping(t *testing.T) {
 		{"PROHIBITED_CONTENT", "content_filter", false},
 		{"BLOCKLIST", "content_filter", false},
 		{"SPII", "content_filter", false},
-		{"RECITATION", "recitation", false},
-		{"LANGUAGE", "language", false},
-		{"OTHER", "other", false},
+		{"RECITATION", "content_filter", false},
+		{"LANGUAGE", "content_filter", false},
+		{"OTHER", "", true},
+		{"FINISH_REASON_UNSPECIFIED", "", true},
+		// An absent finishReason is not an unknown one: the field simply was
+		// not sent, and the loop's own "" branch already refuses an empty
+		// answer under it.
 		{"", "", false},
 		{"MALFORMED_FUNCTION_CALL", "", true},
+		{"MISSING_THOUGHT_SIGNATURE", "", true},
+		// The future reason nobody has written a case for yet.
+		{"MODEL_ARMOR", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.reason, func(t *testing.T) {
@@ -509,6 +521,9 @@ func TestGeminiFinishReasonMapping(t *testing.T) {
 			if tt.wantErr {
 				if !errors.Is(err, ErrProvider) {
 					t.Fatalf("err: got %v, want a provider error", err)
+				}
+				if !strings.Contains(err.Error(), tt.reason) {
+					t.Errorf("error %q does not name the finish reason %q", err, tt.reason)
 				}
 				return
 			}
@@ -571,8 +586,24 @@ func TestGeminiUsageArithmetic(t *testing.T) {
 		{"negative thoughts", `{"promptTokenCount": 10, "candidatesTokenCount": 5, "thoughtsTokenCount": -1}`, 10, 0, true},
 		{"negative prompt", `{"promptTokenCount": -5, "candidatesTokenCount": 5}`, 0, 5, true},
 		{
+			// CONTRACT: the tool-use prompt is INPUT that promptTokenCount does
+			// not include - the API reports the tokens the tool declarations
+			// cost in a counter of their own. A run with a large MCP toolset
+			// pays for it every turn, so leaving it out understated the input
+			// half of every budgeted tool run.
+			"tool-use prompt tokens are input",
+			`{"promptTokenCount": 10, "toolUsePromptTokenCount": 4, "candidatesTokenCount": 5}`,
+			14, 5, false,
+		},
+		{
+			"negative tool-use prompt",
+			`{"promptTokenCount": 10, "toolUsePromptTokenCount": -1, "candidatesTokenCount": 5}`,
+			0, 5, true,
+		},
+		{
 			"absurd counts saturate",
-			`{"promptTokenCount": 9000000000000000000, "candidatesTokenCount": 9000000000000000000, "thoughtsTokenCount": 9000000000000000000}`,
+			`{"promptTokenCount": 9000000000000000000, "toolUsePromptTokenCount": 9000000000000000000,
+			  "candidatesTokenCount": 9000000000000000000, "thoughtsTokenCount": 9000000000000000000}`,
 			maxTokensPerResponse, maxTokensPerResponse, false,
 		},
 	}

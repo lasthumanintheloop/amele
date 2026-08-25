@@ -415,9 +415,14 @@ type gemResponse struct {
 	// int64, not int: a 32-bit build must be able to DECODE an absurd count
 	// (json rejects an int overflow outright) so parseUsage can clamp it.
 	UsageMetadata *struct {
-		PromptTokenCount     int64 `json:"promptTokenCount"`
-		CandidatesTokenCount int64 `json:"candidatesTokenCount"`
-		ThoughtsTokenCount   int64 `json:"thoughtsTokenCount"`
+		PromptTokenCount int64 `json:"promptTokenCount"`
+		// ToolUsePromptTokenCount is the INPUT the tool declarations cost. The
+		// API reports it separately from promptTokenCount, so a run with a
+		// large MCP toolset pays for it on every turn while a budget reading
+		// only the prompt count never saw it.
+		ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount"`
+		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
 }
 
@@ -911,36 +916,41 @@ func geminiResponse(wire gemResponse) (*Response, error) {
 		resp.UsageMissing = true
 		return resp, nil
 	}
-	// CONTRACT: thinking tokens are BILLED AS OUTPUT (design doc
-	// §"Gemini-specific mechanics" item 5), so they are added to the visible
-	// output count. Counting only candidatesTokenCount would let a reasoning
-	// run spend far past limits.max_tokens while the budget reported it as
-	// cheap. Sanitizing happens in parseUsage, the same boundary every other
-	// wire crosses.
+	// CONTRACT: this wire splits each half of the usage across two counters,
+	// and BOTH halves are folded in or the budget undercounts every turn.
+	//   - thinking tokens are BILLED AS OUTPUT (design doc §"Gemini-specific
+	//     mechanics" item 5), so thoughtsTokenCount joins the visible output
+	//     count; counting candidatesTokenCount alone would let a reasoning run
+	//     spend far past limits.max_tokens while the budget reported it cheap.
+	//   - the tool declarations are INPUT the prompt count does not include,
+	//     reported as toolUsePromptTokenCount; a large MCP toolset pays for it
+	//     on every turn of the loop.
+	// Sanitizing happens in parseUsage, the same boundary every other wire
+	// crosses.
 	usage, trustworthy := parseUsage(
-		wire.UsageMetadata.PromptTokenCount,
-		geminiOutputTokens(wire.UsageMetadata.CandidatesTokenCount, wire.UsageMetadata.ThoughtsTokenCount),
+		geminiTokenSum(wire.UsageMetadata.PromptTokenCount, wire.UsageMetadata.ToolUsePromptTokenCount),
+		geminiTokenSum(wire.UsageMetadata.CandidatesTokenCount, wire.UsageMetadata.ThoughtsTokenCount),
 	)
 	resp.Usage = usage
 	resp.UsageMissing = !trustworthy
 	return resp, nil
 }
 
-// geminiOutputTokens folds the two output-side counters into the single number
-// the neutral Usage carries.
+// geminiTokenSum folds the two counters this wire reports for one side of the
+// usage (input or output) into the single number the neutral Usage carries.
 //
 // CONTRACT: it preserves the two signals parseUsage keys on. A negative counter
 // (impossible, therefore untrustworthy) must stay negative rather than cancel
 // against a positive sibling, and an absurd pair must saturate rather than
 // overflow int64 into a small - or negative - total that reads as "cheap".
-func geminiOutputTokens(candidates, thoughts int64) int64 {
-	if candidates < 0 || thoughts < 0 {
+func geminiTokenSum(a, b int64) int64 {
+	if a < 0 || b < 0 {
 		return -1
 	}
-	if thoughts > math.MaxInt64-candidates {
+	if b > math.MaxInt64-a {
 		return math.MaxInt64
 	}
-	return candidates + thoughts
+	return a + b
 }
 
 // gemAssistantMessage turns the raw parts array of one candidate into the
@@ -1011,26 +1021,43 @@ func gemParts(raw json.RawMessage) ([]gemPart, error) {
 }
 
 // mapGeminiFinishReason translates a Gemini finish reason into the
-// OpenAI-compatible vocabulary the loop understands. Unknown values pass
-// through lowercased: the loop's badFinish path already handles unrecognized
-// reasons defensively, and inventing a translation here would hide new provider
-// states.
+// OpenAI-compatible vocabulary the loop understands.
 //
-// Two reasons become ERRORS instead. The API answers 200 with them, so nothing
-// below this client would notice the turn failed: the loop would take whatever
-// text arrived - or an empty answer - and stop as if the task were done, which
-// in an unattended cron run means exit 0 on a broken turn.
+// CONTRACT: every reason is mapped or refused - there is NO passthrough. The
+// loop's badFinish accepts an unrecognized reason whenever the turn carried
+// content (providers spell an ordinary stop in many ways on the
+// OpenAI-compatible wire), so a lowercased passthrough here meant a RECITATION
+// turn that happened to include a preamble ended the run at exit 0. That is the
+// same trap the MAX_TOKENS case below documents, and this is amele's OWN native
+// wire: the vocabulary is Google's published enum, so a value outside it means
+// something is wrong rather than that a gateway has its own dialect.
+//
+// The failures the API answers 200 with therefore become provider errors naming
+// the reason. Nothing below this client would otherwise notice the turn failed:
+// the loop would take whatever text arrived - or an empty answer - and stop as
+// if the task were done, which in an unattended cron run means exit 0 on a
+// broken turn.
 func mapGeminiFinishReason(reason string) (string, error) {
 	switch reason {
 	case "STOP":
 		return "stop", nil
+	case "":
+		// Not an unknown reason: the field was not sent at all. The loop treats
+		// it exactly like "stop" and still refuses an empty answer under it, so
+		// there is nothing here to fail closed ON.
+		return "", nil
 	case "MAX_TOKENS":
 		// CONTRACT: truncation must map to "length" so the loop hard-fails the
 		// run; the passthrough default would land it in badFinish's
 		// unknown-reason branch, which accepts non-empty content - letting a
 		// truncated answer exit 0 in unattended cron runs.
 		return "length", nil
-	case "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII":
+	case "SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "RECITATION", "LANGUAGE":
+		// RECITATION (the answer reproduced training data) and LANGUAGE (an
+		// unsupported language) are refusals like the four before them: the
+		// turn was CUT for a policy reason, so the loop must hard-fail it
+		// rather than accept the fragment that arrived. "content_filter" is the
+		// neutral word badFinish already refuses unconditionally.
 		return "content_filter", nil
 	case "MALFORMED_FUNCTION_CALL":
 		return "", fmt.Errorf("%w: the model emitted a malformed function call (finish reason MALFORMED_FUNCTION_CALL); simplify the tool's parameter schema or retry the run", ErrProvider)
@@ -1042,8 +1069,17 @@ func mapGeminiFinishReason(reason string) (string, error) {
 		// makes this amele's bug rather than the operator's; and a turn that
 		// carried a plausible-looking answer alongside it would otherwise exit 0.
 		return "", fmt.Errorf("%w: the model's step is missing a thought signature (finish reason MISSING_THOUGHT_SIGNATURE); amele echoes thought signatures automatically - this is a bug; please report it with the session log", ErrProvider)
+	case "OTHER", "FINISH_REASON_UNSPECIFIED":
+		// The API's own "something went wrong / nothing to say" values. Neither
+		// describes a finished answer, and both can arrive with text attached.
+		return "", fmt.Errorf("%w: the model stopped for an unspecified reason (finish reason %s); the turn is not a finished answer - retry the run, and check the model and prompt if it repeats", ErrProvider, reason)
 	default:
-		return strings.ToLower(reason), nil
+		// CONTRACT: fail closed on a reason nobody has written a case for.
+		// Google may add one (and this client would then be one release behind
+		// its meaning), so the choice is between accepting a turn whose status
+		// amele cannot read and stopping the run with the vocabulary needed to
+		// look it up. In an unattended run the second is the only honest one.
+		return "", fmt.Errorf("%w: unknown finish reason %q; amele cannot tell whether this turn is a finished answer, so it fails the run - please report it with the session log", ErrProvider, reason)
 	}
 }
 
