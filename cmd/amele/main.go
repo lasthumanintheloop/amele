@@ -1831,6 +1831,9 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		reportRun(agent, &loop.Result{}, mcpErr, code, validator != nil, parsed.quiet, stderr, secrets.Redact)
 		return code
 	}
+	// After the MCP tools joined the registry: their schemas are the ones most
+	// likely to lose a keyword, and they do not exist until this point.
+	warnSanitizedToolSchemas(cfg, agent.Registry, stderr, parsed.quiet, secrets)
 
 	res, runErr := agent.RunMessages(ctx, openingHistory(cfg, task))
 	code := exitCodeFor(runErr)
@@ -1845,6 +1848,47 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		_, _ = fmt.Fprintln(stdout, answer(res))
 	}
 	return code
+}
+
+// warnSanitizedToolSchemas prints the one line that says which JSON Schema
+// keywords the gemini wire's sanitizer removed from which tool, or nothing at
+// all when there was nothing to remove (and on every other wire).
+//
+// CONTRACT (design doc §"Gemini-specific mechanics" 1): nothing is dropped
+// silently. Gemini's FunctionDeclaration.parameters is an OpenAPI-3.0 subset
+// whose unknown keywords are hard 400s, so amele strips them rather than
+// failing the run - which costs the model a constraint it can no longer see
+// ("pattern", "additionalProperties"), and that trade has to be visible to the
+// operator. `amele explain` lists it per tool before a token is spent; this is
+// the same fact for the run that was never explained, which for an MCP toolset
+// is the common case: those schemas arrive from the other side and can change
+// under a config nobody edited.
+//
+// It is called AFTER the MCP servers joined the registry, so the line covers
+// the definitions actually sent. quiet drops it like every other note (-q is
+// errors only, docs/contracts/cli.md), and the text goes through the run's
+// secret registry because a tool schema can carry an interpolated value.
+//
+// SECURITY: names and key PATHS only, each quoted with %q - no schema values,
+// and no unescaped newline from a remote key that could forge a line.
+func warnSanitizedToolSchemas(cfg *config.Config, reg *tools.Registry, stderr io.Writer,
+	quiet bool, secrets *session.SecretSet) {
+	if quiet || cfg.Provider.Type != config.ProviderTypeGemini || reg == nil {
+		return
+	}
+	var stripped []string
+	for _, def := range reg.Defs() {
+		_, keys := llm.SanitizeGeminiSchema(def.Parameters)
+		for _, key := range keys {
+			stripped = append(stripped, fmt.Sprintf("%q: %q", def.Name, key))
+		}
+	}
+	if len(stripped) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintln(stderr, secrets.Redact(
+		"warning: tool schemas sanitized for the gemini wire (unsupported JSON Schema keywords removed): "+
+			strings.Join(stripped, ", ")))
 }
 
 // interruptedError renders an interruption of a run that had already started,
@@ -2161,6 +2205,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		}
 		return s.finish(stderr, exitCodeFor(mcpErr), mcpErr)
 	}
+	warnSanitizedToolSchemas(cfg, agent.Registry, stderr, parsed.quiet, secrets)
 
 	return s.repl(ctx, lines, stdout, stderr)
 }
@@ -2575,9 +2620,9 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 }
 
 // buildProvider constructs the LLM client selected by provider.type. Validate
-// has already constrained the type, so anything that is not anthropic is the
-// OpenAI-compatible default - including "", which is what every pre-Type
-// config carries.
+// has already constrained the type, so anything that is neither anthropic nor
+// gemini is the OpenAI-compatible default - including "", which is what every
+// pre-Type config carries.
 //
 // ResponseFormat is deliberately NOT decided here: buildAgent sets it on the
 // loop for every provider, and each client maps it to its own wire spelling -
@@ -2608,6 +2653,25 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 			MaxAttempts:     maxAttempts,
 			InitialBackoff:  initialBackoff,
 			MaxOutputTokens: cfg.Provider.MaxOutputTokens,
+		}, nil
+	}
+	if cfg.Provider.Type == config.ProviderTypeGemini {
+		// The dialect is not parsed here either, for a stronger reason than on
+		// the anthropic path: a dialect with type gemini is a validate ERROR
+		// (internal/config.tuningDialect), so this line is unreachable with one
+		// - and parsing it would trade that clear message for a vocabulary
+		// complaint about a key that has to go.
+		//
+		// max_output_tokens, reasoning, sampling and params are absent on
+		// purpose: they travel per request through loop.Tuning, exactly as on
+		// the openai wire. Only the Messages API needs its cap on the client,
+		// because it requires the field on every request.
+		return &llm.GeminiClient{
+			BaseURL:        cfg.Provider.BaseURL,
+			APIKey:         cfg.Provider.APIKey,
+			RequestTimeout: cfg.Provider.RequestTimeout.Std(),
+			MaxAttempts:    maxAttempts,
+			InitialBackoff: initialBackoff,
 		}, nil
 	}
 	dialect, err := llm.ParseDialect(cfg.Provider.Dialect)

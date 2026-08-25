@@ -1,0 +1,53 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "gemini"
+  base_url:        (default: generativelanguage.googleapis.com)
+  request_timeout: default (120s)
+  retry:           3 attempts (default), 1s initial backoff (default)
+  max_output_tokens: 4096
+  provider mapping (the wire fields this config will send):
+    max_output_tokens: 4096 -> generationConfig.maxOutputTokens: 4096
+    reasoning.effort: xhigh -> thinkingConfig.thinkingLevel: high (gemini has no level above high)
+    temperature: 0.2 -> temperature: 0.2
+    top_p: 0.9 -> top_p: 0.9
+    google recommends the default 1.0 on gemini 3 models; non-default may degrade output
+    params keys (merged verbatim, values not shown): "labels"
+    unknown request fields: rejected (400) - strict protobuf JSON
+    tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword is a 400 there)
+      "fs_read": stripped "additionalProperties"
+      "fs_write": stripped "additionalProperties"
+      "fs_list": stripped "additionalProperties"
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): enabled
+  shell: disabled
+  subprocess tools: (none)
+
+REQUIREMENTS
+  env:
+    TEST_KEY        ✓ set
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  20
+  max_tokens: UNBOUNDED (no token budget)
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+  tool calls in a turn: parallel (default)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+
+WARNINGS
+  - limits.max_tokens is 0: no token budget bounds this run
+  - session_dir is not set: no session log (audit trail) will be written

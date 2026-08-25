@@ -1018,6 +1018,19 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
 	}
 
+	if c.Provider.Type == ProviderTypeGemini && c.Provider.APIKey == "" {
+		// The Gemini API has two auth paths and amele speaks one of them today:
+		// the AI Studio key. Vertex (Google credentials, a project and a region)
+		// arrives with the `vertex` block, and until it does a keyless config
+		// would reach the wire unauthenticated and come back a 401 from a run
+		// nobody was watching - so the successor is NAMED here rather than left
+		// for the operator to infer from the endpoint's refusal.
+		//
+		// Scoped to this wire: a keyless openai-compatible config is a local
+		// Ollama server, which is a supported deployment.
+		add("provider.api_key: gemini needs api_key (Vertex support lands with the vertex block)")
+	}
+
 	if c.Provider.RequestTimeout < 0 {
 		add("provider.request_timeout must not be negative")
 	}

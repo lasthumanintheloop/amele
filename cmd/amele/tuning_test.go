@@ -356,6 +356,29 @@ provider:
 `,
 		},
 		{
+			// The gemini wire end to end: its own default host, NO dialect row
+			// (a dialect is a validate error there), its own cap and thinking
+			// spellings, the sampling caveat, the protobuf-JSON params policy
+			// and the per-tool sanitizer rows the fs builtins trigger.
+			name:   "gemini wire with tuning and sanitized tool schemas",
+			golden: "explain-gemini-tuning.txt",
+			yaml: `model: golden-model
+provider:
+  type: gemini
+  api_key: ${TEST_KEY}
+  max_output_tokens: 4096
+  reasoning:
+    effort: xhigh
+  temperature: 0.2
+  top_p: 0.9
+  params:
+    labels:
+      team: ops
+tools:
+  fs: true
+`,
+		},
+		{
 			// The four tuning keys joined the --set allowlist on 2026-08-24.
 			// Three of them (effort, temperature, top_p) have no row of their
 			// own: a mapping row is the ONLY place their value is printed, so

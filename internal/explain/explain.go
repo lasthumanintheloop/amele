@@ -281,7 +281,7 @@ func Render(cfg *config.Config, reg *tools.Registry, overridePairs, problems []s
 	var b strings.Builder
 	problemsSection(&b, problems)
 	overridesSection(&b, overridePairs)
-	providerSection(&b, cfg, set)
+	providerSection(&b, cfg, reg, set)
 	toolsSection(&b, cfg, set)
 	mcpSection(&b, mcpReports)
 	requirementsSection(&b, cfg, probe)
@@ -796,7 +796,7 @@ func overridesSection(b *strings.Builder, pairs []string) {
 
 // providerSection reports the model and endpoint. api_key is deliberately
 // absent - not masked, absent - so no formatting bug can ever leak it.
-func providerSection(b *strings.Builder, cfg *config.Config, set overrides) {
+func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry, set overrides) {
 	b.WriteString("MODEL & PROVIDER\n")
 	// "(unset)" is reachable now that explain reports on configs that fail
 	// validation: an empty field would print as trailing whitespace, which
@@ -809,9 +809,10 @@ func providerSection(b *strings.Builder, cfg *config.Config, set overrides) {
 		ptype = config.ProviderTypeOpenAI
 	}
 	fmt.Fprintf(b, "  provider type:   %s\n", field(ptype, "(unset)"))
-	// Validate only lets base_url stay empty on the anthropic path, where the
-	// client falls back to the official endpoint.
-	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, "(default: api.anthropic.com)"))
+	// base_url may stay empty on the two native wires, each of which has ONE
+	// official host its client falls back to. Naming the wrong one would tell an
+	// operator their run goes somewhere it does not.
+	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, defaultHostNote(cfg)))
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
 	retryRow(b, cfg)
 	dialectRow(b, cfg)
@@ -819,7 +820,7 @@ func providerSection(b *strings.Builder, cfg *config.Config, set overrides) {
 		fmt.Fprintf(b, "  max_output_tokens: %d%s\n",
 			cfg.Provider.MaxOutputTokens, set.mark("provider.max_output_tokens"))
 	}
-	providerMapping(b, cfg, set)
+	providerMapping(b, cfg, reg, set)
 	b.WriteString("\n")
 }
 
@@ -853,6 +854,28 @@ func anthropicWire(cfg *config.Config) bool {
 	return cfg.Provider.Type == config.ProviderTypeAnthropic
 }
 
+// geminiWire reports whether this config talks to the native Gemini
+// generateContent API - the third wire family, which like the anthropic one
+// consults no dialect and spells every tuning knob its own way.
+func geminiWire(cfg *config.Config) bool {
+	return cfg.Provider.Type == config.ProviderTypeGemini
+}
+
+// defaultHostNote is the base_url placeholder: the host the selected client
+// falls back to when the config names none.
+//
+// The openai-compatible path has no such host - OpenAI, OpenRouter, vLLM and
+// Ollama all differ, which is why base_url is required there - so an empty
+// value on that wire is a PROBLEMS entry, and this row keeps the phrasing it
+// has always had rather than growing a fourth answer for a state validate
+// refuses.
+func defaultHostNote(cfg *config.Config) string {
+	if geminiWire(cfg) {
+		return "(default: generativelanguage.googleapis.com)"
+	}
+	return "(default: api.anthropic.com)"
+}
+
 // dialectRow reports the resolved dialect and, when base_url names a provider
 // whose dialect the config did not pick, the hint that says so.
 //
@@ -860,6 +883,14 @@ func anthropicWire(cfg *config.Config) bool {
 // dialect and points nowhere recognizable keeps the report it had before
 // dialects existed.
 func dialectRow(b *strings.Builder, cfg *config.Config) {
+	if geminiWire(cfg) {
+		// No row at all on this wire, in either direction. A dialect here is a
+		// validate ERROR (PROBLEMS carries it, in the operator's own words), so
+		// echoing the value next to the gemini mapping rows could only suggest
+		// it applies to something - and there is no default to report either,
+		// because this wire has no dialects to default to.
+		return
+	}
 	if anthropicWire(cfg) {
 		// A dialect left behind while switching wires is inert, not wrong.
 		// Saying so beats both silence (the operator believes it applies) and
@@ -889,10 +920,12 @@ func dialectRow(b *strings.Builder, cfg *config.Config) {
 // reshape every request in a way the YAML file does not show. The report names
 // the host, and the operator picks.
 func baseURLDialectHint(cfg *config.Config) (string, bool) {
-	if anthropicWire(cfg) {
+	if anthropicWire(cfg) || geminiWire(cfg) {
 		// The CN trio's anthropic-compatible endpoints are a documented setup
 		// (docs/providers.md); hinting at a dialect that wire ignores would
-		// send the operator to change a field that changes nothing.
+		// send the operator to change a field that changes nothing. On the
+		// gemini wire the same hint would be worse than useless: a dialect
+		// there is refused at validate.
 		return "", false
 	}
 	suggested, known := llm.DialectForBaseURL(cfg.Provider.BaseURL)
@@ -905,13 +938,15 @@ func baseURLDialectHint(cfg *config.Config) (string, bool) {
 
 // providerMapping prints what the tuning knobs become on the wire: which field
 // carries the output cap, how the reasoning knob is spelled (and rounded), the
-// sampling values, and what the endpoint does with the raw params keys.
+// sampling values, what the endpoint does with the raw params keys, and - on
+// the gemini wire - which JSON Schema keywords leave each tool definition.
 //
-// It exists because every one of those answers depends on the dialect, and the
+// It exists because every one of those answers depends on the target, and the
 // operator reading a YAML file cannot see any of them. The block is omitted
-// entirely when the config sets no tuning at all.
-func providerMapping(b *strings.Builder, cfg *config.Config, set overrides) {
-	lines := providerMappingLines(cfg, set)
+// entirely when the config sets no tuning at all and the target has nothing of
+// its own to report.
+func providerMapping(b *strings.Builder, cfg *config.Config, reg *tools.Registry, set overrides) {
+	lines := providerMappingLines(cfg, reg, set)
 	if len(lines) == 0 {
 		return
 	}
@@ -925,19 +960,21 @@ func providerMapping(b *strings.Builder, cfg *config.Config, set overrides) {
 }
 
 // providerMappingLines builds the mapping rows in a fixed order: cap, then
-// reasoning, then sampling, then the raw params.
+// reasoning, then sampling, then the raw params, then the tool schemas.
 //
 // CONTRACT: not one mapping decision is made here. The cap field comes from
 // llm.CapField, the reasoning lines from the same mapping functions the clients
-// call (llm.MapReasoning / llm.AnthropicReasoningNotes), and the unknown-field
-// policy from llm.UnknownFieldPolicy - so the report cannot promise a request
-// the clients will not send.
+// call (llm.MapReasoning / llm.AnthropicReasoningNotes / llm.GeminiReasoningNotes),
+// the unknown-field policy from llm.UnknownFieldPolicy and its two per-wire
+// counterparts, and the stripped schema keys from llm.SanitizeGeminiSchema -
+// the same function the gemini client sanitizes with - so the report cannot
+// promise a request the clients will not send.
 //
 // set marks the rows whose VALUE came from the command line. It matters more
 // here than anywhere else in the report: reasoning.effort, temperature and
 // top_p have no row of their own, so a mapping row is the only place their
 // value is printed - unmarked, it would be read as the YAML file's.
-func providerMappingLines(cfg *config.Config, set overrides) []string {
+func providerMappingLines(cfg *config.Config, reg *tools.Registry, set overrides) []string {
 	var lines []string
 	dialect, known := resolvedDialect(cfg)
 	if !known {
@@ -970,10 +1007,8 @@ func providerMappingLines(cfg *config.Config, set overrides) []string {
 	// What the TARGET does with those values is not dialect-independent: a
 	// value that is accepted and then ignored has to say so next to the row
 	// that promises it, or the report promises an effect the run will not have.
-	if sampling && known && !anthropicWire(cfg) {
-		if note := llm.SamplingNote(dialect, reasoningSpec(cfg)); note != "" {
-			lines = append(lines, note)
-		}
+	if note := samplingNote(cfg, dialect, sampling, known); note != "" {
+		lines = append(lines, note)
 	}
 	if len(cfg.Provider.Params) > 0 {
 		// SECURITY: KEYS only. A params value is arbitrary text from the YAML
@@ -986,15 +1021,82 @@ func providerMappingLines(cfg *config.Config, set overrides) []string {
 			lines = append(lines, "unknown request fields: "+policy)
 		}
 	}
+	return append(lines, geminiSchemaLines(cfg, reg)...)
+}
+
+// samplingNote returns the caveat that belongs next to the temperature/top_p
+// rows on this target, or "" when the values take effect as sent.
+//
+// The two wires ask different QUESTIONS of the llm package: the openai wire's
+// answer is keyed on the dialect (deepseek ignores sampling while thinking),
+// the gemini wire's on the temperature VALUE (Google recommends its default and
+// honors everything else). Calling the dialect-keyed one on the gemini path
+// would return "" every time - a silent wrong answer, which is why the split is
+// made here rather than inside a single function with two meanings.
+func samplingNote(cfg *config.Config, dialect llm.Dialect, sampling, known bool) string {
+	if !sampling {
+		return ""
+	}
+	if geminiWire(cfg) {
+		return llm.GeminiSamplingNote(cfg.Provider.Temperature)
+	}
+	if !known || anthropicWire(cfg) {
+		return ""
+	}
+	return llm.SamplingNote(dialect, reasoningSpec(cfg))
+}
+
+// geminiSchemaLines reports what the tool-schema sanitizer will remove, one row
+// per tool, or nothing at all on the two wires that have no sanitizer.
+//
+// It exists because this is the one mapping amele performs on the MODEL's
+// behalf rather than the operator's: Gemini's FunctionDeclaration.parameters is
+// an OpenAPI-3.0 subset that answers an unknown keyword with a hard 400 for the
+// WHOLE request, so amele strips them (llm.SanitizeGeminiSchema) - and a
+// constraint that silently left a tool schema is exactly the kind of change a
+// dry run exists to surface. CONTRACT (design doc §"Gemini-specific mechanics"
+// 1): nothing is dropped silently.
+//
+// SECURITY: KEYS and PATHS only, quoted. A schema's values are operator text
+// and, for an MCP server's tools, REMOTE text - a description, a default, an
+// enum member - so none of them may reach a report written for sharing. The
+// quoting also flattens a newline in a remote key, which would otherwise forge
+// a row.
+//
+// A nil registry (one that could not be built - PROBLEMS says why) reports
+// nothing rather than guessing at a toolset.
+func geminiSchemaLines(cfg *config.Config, reg *tools.Registry) []string {
+	if !geminiWire(cfg) || reg == nil {
+		return nil
+	}
+	defs := reg.Defs()
+	if len(defs) == 0 {
+		return nil
+	}
+	// Registration order, which is the order the tools travel in: a report an
+	// operator diffs between runs must not shuffle.
+	lines := []string{"tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword is a 400 there)"}
+	for _, def := range defs {
+		_, stripped := llm.SanitizeGeminiSchema(def.Parameters)
+		if len(stripped) == 0 {
+			lines = append(lines, fmt.Sprintf("  %s: no keys stripped", field(def.Name, `""`)))
+			continue
+		}
+		for i, path := range stripped {
+			stripped[i] = field(path, `""`)
+		}
+		lines = append(lines, fmt.Sprintf("  %s: stripped %s", field(def.Name, `""`), strings.Join(stripped, ", ")))
+	}
 	return lines
 }
 
 // resolvedDialect parses the config's dialect, reporting whether it is usable.
-// On the anthropic wire the dialect is not consulted, so it always resolves
-// (to a value the callers ignore) rather than blocking that wire's rows on a
-// leftover value.
+// On the anthropic and gemini wires the dialect is not consulted, so it always
+// resolves (to a value the callers ignore) rather than blocking those wires'
+// rows on a leftover value - which on the gemini wire is refused at validate
+// anyway, and must not take the mapping report down with it.
 func resolvedDialect(cfg *config.Config) (llm.Dialect, bool) {
-	if anthropicWire(cfg) {
+	if anthropicWire(cfg) || geminiWire(cfg) {
 		return llm.DialectOpenAI, true
 	}
 	dialect, err := llm.ParseDialect(cfg.Provider.Dialect)
@@ -1003,9 +1105,15 @@ func resolvedDialect(cfg *config.Config) (llm.Dialect, bool) {
 
 // capFieldFor names the request field that will carry max_output_tokens.
 func capFieldFor(cfg *config.Config, dialect llm.Dialect) string {
-	if anthropicWire(cfg) {
+	switch {
+	case anthropicWire(cfg):
 		// The Messages API has exactly one spelling and requires it.
 		return "max_tokens"
+	case geminiWire(cfg):
+		// Qualified with its parent object because that is where an operator
+		// has to put a `params` key to reach a neighbour of it - and because
+		// generationConfig sub-keys are NOT paramable in this slice.
+		return "generationConfig.maxOutputTokens"
 	}
 	return llm.CapField(dialect)
 }
@@ -1040,9 +1148,12 @@ func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect, set override
 	}
 	spec := reasoningSpec(cfg)
 	var notes []string
-	if anthropicWire(cfg) {
+	switch {
+	case anthropicWire(cfg):
 		notes = llm.AnthropicReasoningNotes(spec)
-	} else {
+	case geminiWire(cfg):
+		notes = llm.GeminiReasoningNotes(spec)
+	default:
 		notes = llm.MapReasoning(dialect, spec).Notes
 	}
 	mark := set.mark("provider.reasoning.effort")
@@ -1064,6 +1175,9 @@ func reasoningMappingLines(cfg *config.Config, dialect llm.Dialect, set override
 func unknownFieldPolicy(cfg *config.Config, dialect llm.Dialect, known bool) string {
 	if anthropicWire(cfg) {
 		return llm.AnthropicUnknownFieldPolicy()
+	}
+	if geminiWire(cfg) {
+		return llm.GeminiUnknownFieldPolicy()
 	}
 	if !known {
 		return ""

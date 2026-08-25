@@ -10,11 +10,13 @@ import (
 // explain` must be able to say about a config before a single request is made.
 //
 // CONTRACT: nothing here decides anything. Every function either reads the same
-// table the wire encoder reads (CapField, UnknownFieldPolicy) or derives its
+// table the wire encoder reads (CapField, UnknownFieldPolicy,
+// AnthropicUnknownFieldPolicy, GeminiUnknownFieldPolicy) or derives its
 // sentences from the mapping function's OWN result (AnthropicReasoningNotes,
-// and MapReasoning.Notes on the openai wire). A report that re-implemented a
-// mapping would drift from the request it describes, which is the one failure
-// mode an explain report must not have.
+// GeminiReasoningNotes, GeminiSamplingNote, and MapReasoning.Notes on the
+// openai wire). A report that re-implemented a mapping would drift from the
+// request it describes, which is the one failure mode an explain report must
+// not have.
 
 // UnknownFieldPolicy describes, in one phrase, what this dialect's endpoint
 // does with a request field it does not recognize. It is the answer explain
@@ -63,6 +65,10 @@ func UnknownFieldPolicy(d Dialect) string {
 // CONTRACT: a report that showed `temperature: 0.2 -> temperature: 0.2` and
 // stopped there would promise an effect the run will not have - the same
 // silent-degradation failure the dialect layer exists to prevent.
+//
+// This function answers for the openai wire ONLY. The gemini wire has no
+// dialect, so a caller on that path would get "" from here silently: see
+// GeminiSamplingNote, which takes the temperature VALUE instead.
 func SamplingNote(d Dialect, spec ReasoningSpec) string {
 	if d != DialectDeepSeek || spec.Effort == effortNone {
 		return ""
@@ -140,6 +146,17 @@ func GeminiReasoningNotes(spec ReasoningSpec) []string {
 // all on that path, so the report needs its own answer. The Messages API is
 // strict and answers an unrecognized field with a 400.
 func AnthropicUnknownFieldPolicy() string { return "rejected (400)" }
+
+// GeminiUnknownFieldPolicy is UnknownFieldPolicy for the Gemini generateContent
+// API, the third wire without a dialect.
+//
+// The phrase names the REASON as well as the code because this endpoint's
+// strictness is a property of its encoding rather than a product decision: the
+// body is protobuf JSON, so an unknown key is refused by the decoder before any
+// handler sees it - which is also why a params key that merely LOOKS like a
+// generationConfig sub-key cannot be smuggled in (design doc §Mapping, "params
+// merged into request body ROOT").
+func GeminiUnknownFieldPolicy() string { return "rejected (400) - strict protobuf JSON" }
 
 // baseURLDialects maps a provider's API host to the dialect that speaks its
 // variation of the wire. It backs a HINT and nothing else: amele never

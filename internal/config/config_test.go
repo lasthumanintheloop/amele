@@ -1246,6 +1246,55 @@ func TestGeminiWireRejectsDialect(t *testing.T) {
 	}
 }
 
+// TestGeminiRequiresAPIKey pins slice 1's one auth path: the AI Studio key.
+// The Gemini API has a second one - Vertex, with Google credentials - and it is
+// not built yet, so a `type: gemini` config with no key would otherwise reach
+// the wire as an unauthenticated request and come back a 401 from a run nobody
+// was watching. The message names the successor explicitly: an operator who
+// wanted Vertex must learn that here, not from a 401.
+//
+// The rule is deliberately NOT in the JSON Schema: it is a cross-field relation
+// (and Task 7 relaxes it to "api_key or vertex"), which the schema copies would
+// have to re-encode identically in three places.
+func TestGeminiRequiresAPIKey(t *testing.T) {
+	base := func() *Config {
+		cfg := tuningBase(t.TempDir())
+		cfg.Provider.Type = ProviderTypeGemini
+		cfg.Provider.BaseURL = ""
+		return cfg
+	}
+
+	cfg := base()
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("type gemini without api_key must be a config error")
+	}
+	const want = "gemini needs api_key (Vertex support lands with the vertex block)"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not carry %q", err, want)
+	}
+
+	withKey := base()
+	withKey.Provider.APIKey = "k"
+	if err := withKey.Validate(); err != nil {
+		t.Errorf("type gemini with an api_key must validate: %v", err)
+	}
+
+	// The rule is scoped to the gemini wire: a keyless openai-compatible config
+	// is a local Ollama server, and a keyless anthropic one is already refused
+	// by the endpoint itself rather than by amele.
+	for _, typ := range []string{"", ProviderTypeOpenAI, ProviderTypeAnthropic} {
+		other := tuningBase(t.TempDir())
+		other.Provider.Type = typ
+		if typ == ProviderTypeAnthropic {
+			other.Provider.BaseURL = ""
+		}
+		if err := other.Validate(); err != nil {
+			t.Errorf("type %q without api_key must still validate: %v", typ, err)
+		}
+	}
+}
+
 // TestProviderTypeOpenAIParity: "" and "openai" are the same OpenAI-compatible
 // path - both accept a valid base_url and both keep requiring one.
 func TestProviderTypeOpenAIParity(t *testing.T) {
@@ -1539,6 +1588,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
 			},
 			"",
@@ -1548,6 +1598,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Reasoning = &ReasoningConfig{Effort: "high"}
 			},
 			"",
@@ -1557,6 +1608,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Reasoning = &ReasoningConfig{Effort: "high", BudgetTokens: 8192}
 			},
 			"gemini accepts thinkingLevel or thinkingBudget, not both",
@@ -1569,6 +1621,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Dialect = "kimi"
 				c.Provider.Reasoning = &ReasoningConfig{Effort: "high", BudgetTokens: 8192}
 			},
@@ -1594,6 +1647,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Reasoning = &ReasoningConfig{Effort: "none"}
 			},
 			"",
@@ -1603,6 +1657,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Dialect = "deepseek"
 			},
 			"provider.dialect: \"deepseek\" applies to the openai wire; remove it for type gemini",
@@ -1612,6 +1667,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 			},
 			"",
 		},
@@ -1726,6 +1782,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Params = map[string]any{"generationConfig": map[string]any{"topK": 5}}
 			},
 			`provider.params key "generationConfig"`,
@@ -1735,6 +1792,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Params = map[string]any{"safety_settings": []any{}}
 			},
 			`provider.params key "safety_settings"`,
@@ -1746,6 +1804,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Params = map[string]any{"messages": []any{}}
 			},
 			"",
@@ -1757,6 +1816,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Params = map[string]any{"stream": true}
 			},
 			`provider.params key "stream"`,
@@ -1814,6 +1874,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Temperature = ptrFloat(1.5)
 			},
 			"",
@@ -1823,6 +1884,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
 				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
 				c.Provider.Temperature = ptrFloat(2.5)
 			},
 			"provider.temperature",
