@@ -1,0 +1,42 @@
+MODEL & PROVIDER
+  model:           "gemini-3.5-flash"
+  provider type:   "gemini"
+  base_url:        (default: europe-west4-aiplatform.googleapis.com)
+  vertex endpoint: https://europe-west4-aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west4/publishers/google/models/gemini-3.5-flash:generateContent
+  vertex auth:     service account file "/etc/amele/sa-key.json"
+  request_timeout: default (120s)
+  retry:           3 attempts (default), 1s initial backoff (default)
+  provider mapping (the wire fields this config will send):
+    tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword is a 400 there)
+      "fs_read": no keys stripped
+      "fs_write": no keys stripped
+      "fs_list": no keys stripped
+
+TOOLS
+  workspace: "/ws"
+  fs builtins (fs_read, fs_write, fs_list): enabled
+  shell: disabled
+  subprocess tools: (none)
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  20
+  max_tokens: 50000
+  timeout:    none
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+  tool calls in a turn: parallel (default)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: "/ws/sessions"
+
+WARNINGS
+  (none)

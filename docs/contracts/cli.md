@@ -399,6 +399,20 @@ up yet.
   prints the same fact as one `warning:` line on stderr (suppressed by `-q`).
   SECURITY: schema **values are never printed** - a tool schema can carry
   operator text, and remote text when it came from an MCP server.
+- **Vertex rows** (additive, 2026-08-25): with a `provider.vertex` block the
+  `MODEL & PROVIDER` block carries two more rows, directly under `base_url`.
+  `vertex endpoint:` is the FULL resolved address - scheme, host and the
+  `/v1/projects/<p>/locations/<l>/publishers/google/models/<m>:generateContent`
+  path - built by the same function the client sends with, so the project and
+  the location are visible where they are actually spent (an unset `model`
+  shows as `{model}`, and coordinates that cannot become a URL show as
+  `(unresolved: <reason>)` with the violation itself in `PROBLEMS`).
+  `vertex auth:` names the credential mode: `service account file "<path>"`, or
+  `application default credentials` followed by the chain amele will walk.
+  SECURITY: the auth row prints a **mode and a path only** - never an access
+  token, never a byte of the key file, which is not read at all. Neither row
+  appears on the AI Studio half, which has no project, location or Google
+  credential to report.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
   ✗ MISSING), every executable the config needs on `PATH` (✓ found /

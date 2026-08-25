@@ -812,7 +812,13 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 	// base_url may stay empty on the two native wires, each of which has ONE
 	// official host its client falls back to. Naming the wrong one would tell an
 	// operator their run goes somewhere it does not.
-	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, defaultHostNote(cfg)))
+	//
+	// SECURITY: singleLine on the placeholder, not on the value - field quotes
+	// the value, but a placeholder is bare prose and the vertex one embeds the
+	// configured location (an unvalidated config reaches this report), so
+	// without it a newline there could forge a row.
+	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, singleLine(defaultHostNote(cfg))))
+	vertexRows(b, cfg)
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
 	retryRow(b, cfg)
 	dialectRow(b, cfg)
@@ -822,6 +828,81 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 	}
 	providerMapping(b, cfg, reg, set)
 	b.WriteString("\n")
+}
+
+// vertexModelSentinel stands in for an unset model while the address is built.
+// It is spelled out of characters the client's single-segment path escaping
+// leaves untouched (letters and hyphens), so vertexRows can put it back as
+// "{model}" by an exact match rather than by guessing at an encoding.
+const vertexModelSentinel = "-model-unset-"
+
+// vertexRows reports the two things a Vertex run cannot be reviewed without,
+// and which no other row shows: WHERE the request goes, and WITH WHICH
+// credential.
+//
+// Neither is readable from the YAML. The address is assembled from a project
+// and a location that also decide the hostname (three different host shapes,
+// see llm.VertexTarget), and the credential is either a file the config names
+// or the ADC chain amele will walk on the host - a difference an operator
+// discovers at 03:00 otherwise. Printing the full path rather than just the
+// host also puts the project and the location where they are actually spent:
+// the location is a data-residency decision amele will never reroute, so the
+// report shows it in the address it commits to.
+//
+// SECURITY: the auth row prints a MODE and, for a key file, its PATH. Never a
+// token, never a byte of the file's contents - `explain` output is what people
+// paste into issues. Nothing here reads the file at all.
+//
+// Nothing is printed on the AI Studio half: no project, no location and no
+// Google credential exist there, and rows describing a request this config will
+// not send are worse than no rows.
+func vertexRows(b *strings.Builder, cfg *config.Config) {
+	v := cfg.Provider.Vertex
+	if v == nil || !geminiWire(cfg) {
+		return
+	}
+	target := llm.VertexTarget{Project: v.Project, Location: v.Location}
+	// An unset model would leave "models/:generateContent", which reads as a
+	// rendering bug rather than as the violation PROBLEMS already names. The
+	// placeholder keeps the SHAPE of the address - the part this row exists to
+	// show - honest about the one segment that is missing.
+	model := cfg.Model
+	if model == "" {
+		model = vertexModelSentinel
+	}
+	endpoint, err := target.Endpoint(cfg.Provider.BaseURL, model)
+	if err != nil {
+		// explain reports on configs that FAIL validation (the contract on
+		// Render), and an unaddressable project or location is one of them.
+		// Saying so beats printing half a URL; PROBLEMS carries the violation
+		// itself in the validator's own words.
+		endpoint = "(unresolved: " + err.Error() + ")"
+	} else if cfg.Model == "" {
+		// The braces go on here rather than into Endpoint because the client
+		// escapes the model as a SINGLE path segment, which would return them
+		// as %7B/%7D. Guarded on the empty model so a config that literally
+		// names the sentinel still reports its own address.
+		endpoint = strings.Replace(endpoint, "/"+vertexModelSentinel+":", "/{model}:", 1)
+	}
+	// SECURITY: singleLine, because both values embed config text that reached
+	// here without passing validation - a newline in a location would otherwise
+	// forge a row in a report someone reads as amele's own words.
+	fmt.Fprintf(b, "  vertex endpoint: %s\n", singleLine(endpoint))
+	fmt.Fprintf(b, "  vertex auth:     %s\n", singleLine(vertexAuthMode(v.Credentials)))
+}
+
+// vertexAuthMode names the credential a Vertex run will authenticate with.
+//
+// The ADC wording lists the chain in the order the library walks it, because
+// "application default credentials" alone does not tell an operator which of
+// the three the host will actually answer with - and the fix for a 401 is
+// different for each.
+func vertexAuthMode(credentials string) string {
+	if credentials == "" {
+		return "application default credentials " +
+			"(GOOGLE_APPLICATION_CREDENTIALS, then gcloud user credentials, then the metadata server)"
+	}
+	return "service account file " + strconv.Quote(credentials)
 }
 
 // retryRow reports the retry policy that will actually apply, the way

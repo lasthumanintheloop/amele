@@ -121,6 +121,21 @@ type VertexTarget struct {
 // without building a request or duplicating the mapping.
 func (t VertexTarget) Host() string { return vertexHost(t.Location) }
 
+// Endpoint returns the full generateContent URL this target and model resolve
+// to, with baseURL overriding the host exactly as it does on a real request
+// (empty means the host Host reports). The error is the same one a run would
+// fail with - a project or location that cannot become a URL segment, or a
+// base_url that is not an absolute http(s) URL.
+//
+// CONTRACT: it is the client's OWN address, not a second copy of the mapping.
+// `amele explain` prints the answer of the very function Chat builds its
+// request with, so the report cannot promise a destination the run will not
+// reach. That guarantee is the whole reason this is exported rather than
+// re-derived in internal/explain.
+func (t VertexTarget) Endpoint(baseURL, model string) (string, error) {
+	return vertexEndpoint(baseURL, t, model)
+}
+
 // GeminiTokenSource supplies the OAuth access token a Vertex request
 // authenticates with.
 //
@@ -722,86 +737,140 @@ func (c *GeminiClient) authorize(ctx context.Context, req *http.Request) error {
 	return nil
 }
 
-// vertexAuthSignature is the status-code counterpart of errorSignature: an
-// entry keyed on the HTTP status rather than on the body text.
+// geminiBackendSignature is the backend-aware counterpart of errorSignature: an
+// entry that may key on the status code, on the body, AND on which of this
+// wire's two backends the request went to.
 //
-// The two tables are separate because they answer different questions. The
-// geminiErrorSignatures entries are body heuristics consulted for 400s on BOTH
-// backends; these are about credentials, apply only in vertex mode (a 401 on
-// the AI Studio backend is about an api_key, and there is no Google Cloud
-// project to name), and key on a status code the shared table deliberately does
-// not look at.
-type vertexAuthSignature struct {
-	code   int
-	advice func(VertexTarget) string
+// The two tables are separate because they answer different questions.
+// geminiErrorSignatures holds body heuristics consulted for 400s on BOTH
+// backends through the shared adviceFor, whose 400 gate is what keeps a generic
+// phrase like "Unknown name" off a 401 on the OpenAI and Anthropic wires as
+// well. The entries here are about credentials and addressing: they need the
+// statuses that gate rules out, and every one of them is mode-dependent - a 401
+// on the AI Studio backend is about an api_key and has no Google Cloud project
+// to name, and a 404 there has no location to blame.
+type geminiBackendSignature struct {
+	// match reports whether this entry explains the failure. vertex is the
+	// client's target, nil on the AI Studio backend; body is the (possibly
+	// truncated) error body statusFailure already read.
+	match func(code int, body string, vertex *VertexTarget) bool
+	// advice renders the hint. CONTRACT: it is called only after match
+	// returned true for the same vertex value, so an entry whose match
+	// requires a non-nil target may dereference it here.
+	advice func(vertex *VertexTarget) string
 }
 
-// vertexAuthSignatures is the ordered table consulted for an authentication or
-// authorization failure in vertex mode. First match wins.
+// geminiBackendSignatures is the ordered table consulted for a failure the
+// shared 400 gate cannot reach. First match wins.
 //
 // CONTRACT: like every signature table, these entries change NOTHING but the
 // human-facing text - no retry, no rewrite. What they add is the vocabulary the
 // fix lives in: the live 401 body says only "Request is missing required
 // authentication credential" (research §2.10), which names neither the IAM
 // role, nor the project, nor the credential sources amele searched.
-var vertexAuthSignatures = []vertexAuthSignature{
+var geminiBackendSignatures = []geminiBackendSignature{
 	{
-		code: http.StatusUnauthorized,
-		advice: func(t VertexTarget) string {
+		// Express-mode keys. Google documents an API-key form of the Vertex
+		// endpoint; the live service answers it with this 401 for both
+		// :generateContent and :streamGenerateContent (research §3.3), which
+		// is the generic "this method has no API-key auth" reply rather than
+		// "bad key". amele can only arrive here on the KEYED backend - config
+		// refuses api_key next to a vertex block, and vertex mode never sends
+		// x-goog-api-key - so this is an AI Studio config aimed at a Vertex
+		// host, and the fix is a vertex block, not another key.
+		match: func(code int, body string, vertex *VertexTarget) bool {
+			return code == http.StatusUnauthorized && vertex == nil &&
+				strings.Contains(body, "API keys are not supported by this API")
+		},
+		advice: func(*VertexTarget) string {
+			return "vertex requires OAuth credentials; api keys are not supported (express-mode keys are rejected " +
+				"live too) - replace provider.api_key with a provider.vertex block naming project and location"
+		},
+	},
+	{
+		match: func(code int, _ string, vertex *VertexTarget) bool {
+			return code == http.StatusUnauthorized && vertex != nil
+		},
+		advice: func(t *VertexTarget) string {
 			return "vertex rejected the credential: check that it resolves (provider.vertex.credentials, " +
 				"GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`) and that its principal " +
 				"has roles/aiplatform.user on project " + t.Project
 		},
 	},
 	{
-		code: http.StatusForbidden,
-		advice: func(t VertexTarget) string {
+		match: func(code int, _ string, vertex *VertexTarget) bool {
+			return code == http.StatusForbidden && vertex != nil
+		},
+		advice: func(t *VertexTarget) string {
 			return "vertex authenticated the credential but refused the call: grant roles/aiplatform.user on project " +
-				t.Project + ", confirm the model is served in location " + t.Location +
+				t.Project + ", confirm the aiplatform.googleapis.com API is enabled there and that the model is " +
+				"served in location " + t.Location +
 				", and - for gcloud user credentials - serviceusage.services.use for the x-goog-user-project header"
+		},
+	},
+	{
+		// A 404 on this endpoint is an ADDRESSING answer, and the API's body
+		// says only that the publisher model was not found. The two candidates
+		// are a wrong model id and a model that is simply not served where the
+		// request was sent: region support is per-model and far narrower than
+		// the 47-region host list (research §1.5 - gemini-3.5-flash is not
+		// served in us-central1 at all, and two Gemini 3 models are
+		// global-only). The advice names both, and repeats that the location
+		// is the operator's to change: amele will not reroute it.
+		match: func(code int, _ string, vertex *VertexTarget) bool {
+			return code == http.StatusNotFound && vertex != nil
+		},
+		advice: func(t *VertexTarget) string {
+			return "vertex has no such model at that address: check the model id, and that the model is served in " +
+				"location " + t.Location + " (availability is per-model and narrower than the region list - some " +
+				"models are served only on `global`). amele never reroutes a configured location"
 		},
 	},
 }
 
-// vertexAuthAdvice returns the hint for one status code, or "" when the table
-// has no entry for it.
-func vertexAuthAdvice(code int, target VertexTarget) string {
-	for _, sig := range vertexAuthSignatures {
-		if sig.code == code {
-			return sig.advice(target)
+// geminiBackendAdvice returns the hint for one failure, or "" when no entry
+// claims it.
+func geminiBackendAdvice(code int, body string, vertex *VertexTarget) string {
+	for _, sig := range geminiBackendSignatures {
+		if sig.match(code, body, vertex) {
+			return sig.advice(vertex)
 		}
 	}
 	return ""
 }
 
-// failure turns a non-200 reply into the typed provider error, adding the one
-// thing this wire does differently: the retry delay arrives in the BODY as a
-// google.rpc.RetryInfo detail, not in a Retry-After header.
+// failure turns a non-200 reply into the typed provider error, adding the two
+// things this wire does differently: advice that depends on which backend the
+// request went to (geminiBackendSignatures), and a retry delay that arrives in
+// the BODY as a google.rpc.RetryInfo detail rather than in a Retry-After
+// header.
 func (c *GeminiClient) failure(httpResp *http.Response) (*Response, bool, time.Duration, error) {
 	// Shared with the other clients: same retry band (429 and every 5xx), same
 	// typed statusError, same header reading - only the error-signature table
 	// and the body-borne delay below differ.
 	retryable, retryAfter, err := statusFailure(httpResp, geminiErrorSignatures)
-	// The credential advice is appended here rather than through the shared
-	// table because it depends on the BACKEND, which statusFailure cannot see.
-	if c.Vertex != nil {
-		if advice := vertexAuthAdvice(httpResp.StatusCode, *c.Vertex); advice != "" {
-			err = fmt.Errorf("%w — %s", err, advice)
-		}
-	}
-	if !retryable || retryAfter > 0 {
-		return nil, retryable, retryAfter, err
-	}
-	// The snippet statusFailure already read is the only copy of the body (it
-	// consumed the reader), so the delay is recovered from there rather than by
-	// re-reading. A body truncated at maxErrorBody no longer parses as JSON and
-	// simply yields no wish - the exponential ladder then stands, which is the
-	// same outcome as an endpoint that sent no RetryInfo at all.
+	// One errors.As for both gemini-specific steps. The snippet statusFailure
+	// already read is the ONLY copy of the body - it consumed the reader - so
+	// everything below reads it from the typed error rather than from the
+	// response.
 	var se *statusError
 	if errors.As(err, &se) {
-		var env gemErrorEnvelope
-		if json.Unmarshal([]byte(se.snippet), &env) == nil {
-			retryAfter = parseGoogleRetryDelay(env.Error.Details)
+		// The backend-aware advice is appended here rather than through the
+		// shared table because it depends on the BACKEND and on statuses the
+		// shared 400 gate excludes, neither of which statusFailure can see.
+		if advice := geminiBackendAdvice(se.code, se.snippet, c.Vertex); advice != "" {
+			err = fmt.Errorf("%w — %s", err, advice)
+		}
+		if retryable && retryAfter == 0 {
+			// This wire carries the retry delay in the BODY as a
+			// google.rpc.RetryInfo detail, not in a Retry-After header. A body
+			// truncated at maxErrorBody no longer parses as JSON and simply
+			// yields no wish - the exponential ladder then stands, which is the
+			// same outcome as an endpoint that sent no RetryInfo at all.
+			var env gemErrorEnvelope
+			if json.Unmarshal([]byte(se.snippet), &env) == nil {
+				retryAfter = parseGoogleRetryDelay(env.Error.Details)
+			}
 		}
 	}
 	return nil, retryable, retryAfter, err

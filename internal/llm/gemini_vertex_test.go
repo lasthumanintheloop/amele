@@ -124,6 +124,16 @@ func TestVertexEndpoint(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("endpoint:\n got %q\nwant %q", got, tt.want)
 			}
+			// The exported reporting seam must answer with the very same URL:
+			// `amele explain` prints it, and a report that could drift from
+			// the request would be worse than no report.
+			reported, err := tt.target.Endpoint(tt.base, tt.model)
+			if err != nil {
+				t.Fatalf("VertexTarget.Endpoint: %v", err)
+			}
+			if reported != got {
+				t.Errorf("VertexTarget.Endpoint:\n got %q\nwant %q (the client's own)", reported, got)
+			}
 		})
 	}
 }
@@ -661,15 +671,16 @@ func TestVertexQuotaProjectHeader(t *testing.T) {
 	}
 }
 
-// TestVertexAuthFailureAdvice: a 401 or 403 from the Vertex endpoint says
+// TestVertexFailureAdvice: a 401, 403 or 404 from the Vertex endpoint says
 // nothing an operator can act on ("Request is missing required authentication
-// credential" - research §2.10), so amele appends the IAM vocabulary the fix
-// actually lives in: the role, the project and the location.
+// credential" - research §2.10), so amele appends the vocabulary the fix
+// actually lives in: the role, the API, the project and the location.
 //
-// The advice is mode-dependent, which is why it is not an entry in
+// Every row is mode-dependent, which is why none of them is an entry in
 // geminiErrorSignatures: the same status on the AI Studio backend is about an
-// api_key, and that table is consulted for 400s on both backends alike.
-func TestVertexAuthFailureAdvice(t *testing.T) {
+// api_key or a model id, and that table is consulted for 400s on both backends
+// alike.
+func TestVertexFailureAdvice(t *testing.T) {
 	tests := []struct {
 		name string
 		code int
@@ -681,9 +692,24 @@ func TestVertexAuthFailureAdvice(t *testing.T) {
 			want: []string{"roles/aiplatform.user", "my-project", "provider.vertex.credentials"},
 		},
 		{
-			name: "403 names the role, the location and the quota header",
+			name: "403 names the role, the location, the API and the quota header",
 			code: http.StatusForbidden,
-			want: []string{"roles/aiplatform.user", "my-project", "europe-west4", "serviceusage.services.use"},
+			want: []string{
+				"roles/aiplatform.user", "my-project", "europe-west4",
+				"serviceusage.services.use", "aiplatform.googleapis.com",
+			},
+		},
+		{
+			// A 404 here is almost never "no such project": region support is
+			// per-model and much narrower than the 47-region host list
+			// (research §1.5 - gemini-3.5-flash is not served in us-central1,
+			// and two Gemini 3 models are global-only), while the location is
+			// never rerouted for the operator. Both halves of that answer have
+			// to be in the message, because the API's own body says only that
+			// the publisher model was not found.
+			name: "404 names the model id and the location together",
+			code: http.StatusNotFound,
+			want: []string{"europe-west4", "model"},
 		},
 	}
 	for _, tc := range tests {
@@ -728,5 +754,93 @@ func TestAIStudioAuthFailureKeepsItsOwnMessage(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "roles/aiplatform.user") {
 		t.Errorf("the vertex IAM advice reached an AI Studio failure: %v", err)
+	}
+	if strings.Contains(err.Error(), "api keys are not supported") {
+		t.Errorf("the express-mode advice claimed a plain AI Studio 401: %v", err)
+	}
+}
+
+// expressKeyRejection is the live body the Vertex endpoint answers an API key
+// with - reproduced twice against the real service, for both :generateContent
+// and :streamGenerateContent (research §3.3). It is NOT an "invalid key" error:
+// it is the generic ESF response for a method that has no API-key auth
+// configured at all, which is why documented express-mode keys do not work
+// here and why the advice sends the operator to a vertex block rather than to
+// a different key.
+const expressKeyRejection = `{"error":{"code":401,"message":"API keys are not supported by this API. ` +
+	`Expected OAuth2 access token or other authentication credentials that assert a principal. ` +
+	`See https://cloud.google.com/docs/authentication","status":"UNAUTHENTICATED"}}`
+
+// TestExpressModeKeyRejectionAdvice: the one way an operator can reach this
+// 401 through amele is the keyed backend pointed at a Vertex host - config
+// refuses api_key next to a vertex block (exit 2), and the client never sends
+// x-goog-api-key in vertex mode. So the advice must fire on the AI STUDIO half,
+// where the config change is "stop using a key here".
+func TestExpressModeKeyRejectionAdvice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(expressKeyRejection))
+	}))
+	defer srv.Close()
+
+	client := &GeminiClient{BaseURL: srv.URL, APIKey: "k"}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	for _, want := range []string{
+		"vertex requires OAuth credentials; api keys are not supported",
+		"provider.vertex",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestExpressModeAdviceYieldsToTheCredentialAdvice: the same body reaching a
+// client that IS in vertex mode (a proxy in front of the endpoint, say) must
+// keep the credential advice. There, the api-key sentence would be a dead end -
+// amele sent no key, and the operator's question is why the OAuth token was
+// refused.
+func TestExpressModeAdviceYieldsToTheCredentialAdvice(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(expressKeyRejection))
+	}))
+	defer srv.Close()
+
+	client := &GeminiClient{
+		BaseURL:     srv.URL,
+		Vertex:      &VertexTarget{Project: "my-project", Location: "europe-west4"},
+		TokenSource: &fakeTokenSource{token: "t"},
+	}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !strings.Contains(err.Error(), "roles/aiplatform.user") {
+		t.Errorf("the vertex credential advice was lost: %v", err)
+	}
+	if strings.Contains(err.Error(), "api keys are not supported") {
+		t.Errorf("the express-mode advice shadowed the credential advice: %v", err)
+	}
+}
+
+// TestAIStudioNotFoundKeepsItsOwnMessage: the location half of the 404 advice
+// is meaningless on a wire that has no locations, so it must not attach there.
+func TestAIStudioNotFoundKeepsItsOwnMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	client := &GeminiClient{BaseURL: srv.URL, APIKey: "k"}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "location") {
+		t.Errorf("the vertex 404 advice reached an AI Studio failure: %v", err)
 	}
 }
