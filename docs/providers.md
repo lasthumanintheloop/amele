@@ -1,13 +1,15 @@
 # Providers: one config, many endpoints
 
-amele speaks two wire formats: OpenAI-compatible `chat/completions` (the
-default) and the native Anthropic Messages API (`provider.type: anthropic`).
-The first one is nominally a single protocol and is in practice a family of
-them - the providers speaking it disagree about which field carries the output
-cap, how the reasoning knob is spelled, and whether the model's own reasoning
-has to be handed back to it inside a tool loop. `provider.dialect` names which
+amele speaks three wire formats: OpenAI-compatible `chat/completions` (the
+default), the native Anthropic Messages API (`provider.type: anthropic`) and
+the native Google Gemini `generateContent` API (`provider.type: gemini`). The
+first one is nominally a single protocol and is in practice a family of them -
+the providers speaking it disagree about which field carries the output cap,
+how the reasoning knob is spelled, and whether the model's own reasoning has to
+be handed back to it inside a tool loop. `provider.dialect` names which
 variation your endpoint speaks, and one config can then say what it *wants*
-once and be run against any of them.
+once and be run against any of them. The two native wires are their own
+families, not variations: `dialect` is ignored on one and refused on the other.
 
 The promise is not "every feature works everywhere". It is:
 
@@ -27,7 +29,7 @@ have moved.
 
 ```yaml
 provider:
-  type: openai                # openai (default) | anthropic - the WIRE
+  type: openai                # openai (default) | anthropic | gemini - the WIRE
   dialect: deepseek           # openai (default) | deepseek | glm | kimi
                               #                  | groq | openrouter
   base_url: https://api.deepseek.com
@@ -35,8 +37,8 @@ provider:
   max_output_tokens: 8192     # the per-request output ceiling
   reasoning:
     effort: high              # none | low | medium | high | xhigh | max
-    budget_tokens: 8192       # a token count instead of a level;
-                              # anthropic wire / openrouter only
+    budget_tokens: 8192       # a token count instead of a level; anthropic
+                              # wire / gemini wire / openrouter only
   temperature: 0.2
   top_p: 0.9
   retry:
@@ -48,11 +50,11 @@ provider:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `type` | `openai` | The wire format. `anthropic` selects the native Messages API, where `dialect` is not consulted at all. |
+| `type` | `openai` | The wire format. `anthropic` selects the native Messages API, where `dialect` is not consulted at all; `gemini` selects the native `generateContent` API, where a `dialect` is a config error (exit 2) rather than an ignored key. |
 | `dialect` | `openai` | Which variation of the OpenAI-compatible format this endpoint speaks. **Explicit, never sniffed** from `base_url`: a silently chosen dialect would reshape every request in a way the YAML file does not show. `explain` prints a hint when the host is one it recognizes. |
-| `max_output_tokens` | none (openai wire) / `8192` (anthropic wire) | The per-request output ceiling. The dialect picks the field name (`max_completion_tokens` or `max_tokens`); the Messages API requires the field, so that wire always sends one. **Reasoning tokens are billed against this ceiling** on every provider that reports them. |
+| `max_output_tokens` | none (openai and gemini wires) / `8192` (anthropic wire) | The per-request output ceiling. The dialect picks the field name (`max_completion_tokens` or `max_tokens`; `generationConfig.maxOutputTokens` on the gemini wire); the Messages API requires the field, so that wire always sends one. **Reasoning tokens are billed against this ceiling** on every provider that reports them. |
 | `reasoning.effort` | none | The reasoning depth, in a vocabulary that is the UNION of what the providers accept - no single provider takes all six values. A dialect with a smaller vocabulary rounds **up** to the nearest level it has and says so in `explain`: the config asked for at least this much thinking, and quietly buying less is the failure mode you cannot see in the output. |
-| `reasoning.budget_tokens` | none | A token budget instead of a level. Only the anthropic wire and the `openrouter` dialect can carry one; anywhere else it is a config error (exit 2) rather than a silently dropped field. |
+| `reasoning.budget_tokens` | none | A token budget instead of a level. Only the anthropic wire, the gemini wire and the `openrouter` dialect can carry one; anywhere else it is a config error (exit 2) rather than a silently dropped field. On the gemini wire it is an *alternative* to `effort`, never a companion - setting both is exit 2. |
 | `temperature` | none | `[0, 2]`, narrowed to `[0, 1]` on the anthropic wire and on the `glm` dialect. Unset means the provider decides - which is not the same as `0`. |
 | `top_p` | none | `(0, 1]`. `0` is rejected rather than clamped: an empty nucleus is a 400, not greedy decoding. |
 | `retry.max_attempts` | `3` | Total tries for one provider call (1 initial + retries), so `1` disables retrying. Accepted range 1..10; `0` (or omitted) means the default. |
@@ -78,6 +80,7 @@ actually writes it.
 | + `kimi` | `max_completion_tokens`, `reasoning_effort` |
 | + `openrouter` | `max_tokens`, `reasoning` |
 | anthropic wire | `model`, `max_tokens`, `system`, `messages`, `tools`, `thinking`, `output_config`, `temperature`, `top_p` |
+| gemini wire | `contents`, `systemInstruction`, `tools`, `toolConfig`, `generationConfig`, `safetySettings`, `cachedContent` - each in **both** spellings (protobuf JSON accepts the snake_case form too) |
 
 Two more are refused everywhere, for a different reason - not because amele
 writes them, but because its own machinery cannot survive them: `stream` (the
@@ -90,6 +93,13 @@ reachable even when amele has no neutral field for it: `thinking` is a config
 error on `deepseek`, where amele emits one, and perfectly legal on `kimi`, where
 it does not. Change the dialect and `amele validate` re-answers the question
 before the run.
+
+On the gemini wire `params` merges into the request body **root**, which is the
+only level it reaches: `generationConfig` sub-keys (`topK`, `seed`,
+`stopSequences`) are not addressable through `params` in this slice, because
+merging into a nested object amele also writes would need a merge rule this
+strict endpoint gives no room to get wrong. Ask for a neutral field if you need
+one.
 
 ### Retries
 
@@ -105,9 +115,12 @@ because retrying earlier than the rate limiter allows burns an attempt for
 nothing. **No single wait exceeds 60s**, whichever produced it: the doubling
 flattens at the same ceiling, so the longest ladder you can configure
 (`max_attempts: 10`) spends at most 9 x 60s - roughly 9 minutes - asleep,
-rather than the hours plain doubling would reach on the last rungs. Both wires
-share the policy: the same block applies whether `type` is `openai` or
-`anthropic`. When the attempts run out, the run ends as a provider error
+rather than the hours plain doubling would reach on the last rungs. All three
+wires share the policy: the same block applies whichever `type` you set. The
+gemini wire is the one that carries the provider's wish somewhere else - a 429
+there has **no `Retry-After` header**, and the delay arrives in the error body
+as a `google.rpc.RetryInfo` detail; amele reads it and feeds the same
+stretch-never-shrink mechanism. When the attempts run out, the run ends as a provider error
 (exit 5), so a longer ladder trades latency for surviving a rate-limit window.
 `limits.timeout` stays the wall-clock kill switch above all of it: a backoff
 wait is cut short when the run deadline fires, and the run then ends as a
@@ -183,6 +196,91 @@ DeepSeek, GLM and Kimi all publish Anthropic-compatible endpoints
 `budget_tokens` there, for instance. Those are documentation facts, not amele
 behavior: nothing in the code special-cases them.
 
+## The Gemini wire
+
+`provider.type: gemini` selects the native `generateContent` API. It is a third
+family rather than a variation: a `dialect:` next to it is a **config error**
+(exit 2), not an ignored key, because nothing was ever written against this wire
+and strictness costs no working config while buying you the certainty that no
+knob is quietly dropped.
+
+Today amele speaks the AI Studio half of this API: `api_key` is the
+`x-goog-api-key` header and is **required** (`gemini needs api_key` at exit 2).
+Vertex AI - Google credentials, a project and a region - is a later slice and
+arrives as a `vertex:` block; until then there is no way to reach it, which the
+validate message says out loud rather than leaving you to read a 401.
+
+`base_url` is optional (the client knows `generativelanguage.googleapis.com`)
+and must **not** carry the version segment: amele appends
+`/v1beta/models/{model}:generateContent` itself, so a `base_url` ending in
+`/v1beta` or `/v1` is exit 2 rather than a 404 at 03:00.
+
+| config | request |
+| --- | --- |
+| `reasoning.effort: low\|medium\|high` | `generationConfig.thinkingConfig.thinkingLevel` with the same word |
+| `reasoning.effort: xhigh\|max` | `thinkingLevel: high` - this wire has nothing above it, and `explain` prints the rounding |
+| `reasoning.effort: none` | `thinkingConfig.thinkingBudget: 0`. Gemini 3 models **cannot** stop thinking and answer this with a 400; amele does not guess a model generation from its name, so that stays a runtime error with advice |
+| `reasoning.budget_tokens: 8192` | `thinkingConfig.thinkingBudget: 8192` (the 2.5-era spelling). A level and a budget are **alternatives** - both together is exit 2, because the API refuses the pair |
+| `max_output_tokens: 4096` | `generationConfig.maxOutputTokens` |
+| `temperature` / `top_p` | `generationConfig.temperature` / `topP`, sent as given |
+| `output.schema` | `generationConfig.responseJsonSchema` + `responseMimeType: application/json` |
+| `params` | merged into the body **root**, never into `generationConfig` |
+
+Five things behave differently enough here to state on their own.
+
+**Thought signatures round-trip untouched.** Gemini 3 signs the steps it
+produces, and a tool loop that sends a step back without its signature is a 400.
+amele stores the model turn's **entire raw `parts` array** and re-emits it
+verbatim as the next request's model content - never parsed, never reordered,
+never rebuilt - so the signature stays on the part it belongs to by
+construction. If you ever see a `missing a thought_signature` 400 from amele,
+that is a bug in amele: it says so in the error advice, and the session log is
+what to attach to the report.
+
+**Tool schemas are sanitized, and the strip is announced.** A
+`FunctionDeclaration.parameters` is an OpenAPI-3.0 **subset**, not JSON Schema,
+and an unknown keyword is a hard 400 that fails the *whole* request - every
+tool, not just the offending one. amele therefore strips what the subset cannot
+carry (`additionalProperties`, `$schema`, `$ref`, `pattern`, ... - it is an
+allowlist, so a keyword invented after this release goes too) from its own
+builtins and from whatever schemas your MCP servers publish. The cost is a
+constraint the model no longer sees, so nothing is stripped silently:
+`amele explain` lists the removed paths per tool, and a run prints one warning
+line naming them. Values are never printed - only key paths.
+
+**A malformed function call ends the turn.** `MALFORMED_FUNCTION_CALL` is
+reported as a provider error (exit 5) with the advice to simplify the tool's
+parameter schema, rather than being handed to the loop as an empty answer that
+would exit 0 on a broken turn. Like every error turn on every wire, it carries
+**no usage** into the run's accounting: the tokens it burned are real but
+unreported, so a `limits.max_tokens` budget cannot see them.
+
+**Thinking is billed as output.** `usage.output_tokens` is
+`candidatesTokenCount` **plus** `thoughtsTokenCount`, because that is what
+Google bills - a run whose budget ignored the thinking half would be off by the
+most expensive part of the turn.
+
+**Sampling has a recommendation, not a rule.** Google documents `1.0` as the
+Gemini 3 default and recommends leaving it alone. amele sends whatever your
+config says - second-guessing it would be the silent degradation this page
+exists to prevent - and `explain` prints a note next to the value:
+`google recommends the default 1.0 on gemini 3 models; non-default may degrade output`.
+
+Two claims on this wire are **unverified** until the live smoke test in this
+milestone runs, and both are recorded here rather than smoothed over:
+
+- **The structured-output field form.** The SDK documents
+  `generationConfig.responseJsonSchema`, which is what amele sends; a newer
+  nested `responseFormat` shape appears in other Google documentation. If the
+  endpoint answers with a 400 naming the field, amele repeats that one request
+  without the schema - immediately, costing no retry budget - warns that native
+  enforcement was lost, and enforces `output.schema` itself. So the *contract*
+  holds either way; which spelling actually travels is the open question.
+- **Whether thinking debits `maxOutputTokens`.** On every other provider
+  reasoning is drawn from the output ceiling. Assume it does here too and leave
+  room in `max_output_tokens`; the alternative failure mode is a `MAX_TOKENS`
+  finish (exit 1) in the middle of an answer.
+
 ## Quickstarts
 
 Copy one, set the key in your environment, run `amele explain` before you spend
@@ -215,6 +313,24 @@ provider:
   max_output_tokens: 16384
   reasoning: {budget_tokens: 4096}   # Haiku 4.5 and older; newer: effort
 ```
+
+### Gemini (AI Studio)
+
+```yaml
+model: gemini-3-pro
+provider:
+  type: gemini                    # native generateContent; no version in base_url
+  api_key: ${GEMINI_API_KEY}      # required today - Vertex needs the vertex block
+  max_output_tokens: 8192         # leave room: thinking is billed here too
+  reasoning: {effort: medium}     # -> thinkingConfig.thinkingLevel: medium
+```
+
+`api_key` is not optional on this wire, and `base_url` is: the client knows the
+first-party host and appends the version itself. Swap `effort` for
+`budget_tokens: 8192` on a 2.5-era model - one or the other, never both. If your
+agent has tools, run `amele explain` once and read the `tool schemas:` rows:
+they list every JSON Schema keyword this API cannot carry, per tool, before the
+first request pays for the discovery.
 
 ### DeepSeek (native)
 
@@ -371,9 +487,12 @@ the answer is a smaller model rather than a knob.
 [`output.schema`](features.md#structured-output-outputschema) works on every
 provider; what differs is who enforces it.
 
-- **Natively** on `openai`, `openrouter` and the anthropic wire: the schema
-  travels in the request (`response_format: json_schema`, or
-  `output_config.format` on the Messages API).
+- **Natively** on `openai`, `openrouter`, the anthropic wire and the gemini
+  wire: the schema travels in the request (`response_format: json_schema`,
+  `output_config.format` on the Messages API, or
+  `generationConfig.responseJsonSchema` + `responseMimeType` on
+  `generateContent` - the last one **unverified**, see [The Gemini
+  wire](#the-gemini-wire)).
 - **By `json_object` + local enforcement** on `deepseek` and `glm`. Neither has
   `json_schema` on this wire, so amele sends the JSON mode they do have -
   `response_format: {"type":"json_object"}` - in the first request and enforces
@@ -386,7 +505,9 @@ provider; what differs is who enforces it.
 - **By fallback** on `kimi` and `groq`, whose support is unverified (below).
   When the endpoint answers a schema-carrying request with a 400 naming the
   field, amele repeats that one request without it - once, immediately, costing
-  no retry budget - and enforces the schema itself.
+  no retry budget - and enforces the schema itself. The gemini wire carries the
+  same fallback behind its native attempt, for the field-form question the
+  section above records.
 
 "Enforces the schema itself" means the same thing in both cases: the answer is
 validated against `output.schema` and violations are fed back to the model for
@@ -431,6 +552,10 @@ hint, never correctness.
 | `'max_tokens' is not supported ... use 'max_completion_tokens'` | this model requires `max_completion_tokens`; set `provider.dialect` to a dialect that maps it (`openai`/`groq`/`kimi`) |
 | `Unsupported value: 'temperature' does not support ...` | this model rejects non-default sampling; remove `provider.temperature`/`top_p` |
 | `temperature may only be set to 1 when thinking is enabled` (anthropic) | this model rejects non-default sampling; remove `provider.temperature`/`top_p` |
+| a 400 naming both `thinkingLevel` and `thinkingBudget` (gemini) | set only one of `provider.reasoning.effort` or `budget_tokens` |
+| `... budget 0 is invalid` / `cannot disable thinking` (gemini) | this model cannot disable thinking; remove `reasoning.effort: none` |
+| `Unknown name ...` (gemini) | the gemini API rejects unknown fields; if this key came from `provider.params`, remove it |
+| a 400 saying a part is missing a `thought_signature` (gemini) | amele must echo signatures automatically - this is a bug, please report it with the session log |
 
 ### The gpt-5.6 chat/completions restriction
 

@@ -382,6 +382,20 @@ up yet.
   <d>` row follows the dialect row: amele never auto-detects a dialect, it only
   says what it noticed. A config that sets no tuning gets no such block, so
   existing reports are unchanged.
+- **Gemini wire rows** (additive, 2026-08-25): with `provider.type: gemini` the
+  same block answers for that wire instead - `base_url` defaults to
+  `generativelanguage.googleapis.com`, there is **no dialect row** (a dialect
+  is a config error there), the cap row names
+  `generationConfig.maxOutputTokens`, the reasoning rows name
+  `thinkingConfig.thinkingLevel`/`thinkingBudget`, a non-default `temperature`
+  earns Google's own recommendation as a note, and the unknown-field policy
+  reads `rejected (400) - strict protobuf JSON`. One row family is new:
+  `tool schemas: sanitized for the gemini wire`, followed by one line per
+  registered tool listing the JSON Schema key PATHS the sanitizer removes
+  (`"fs_read": stripped "additionalProperties"`) or `no keys stripped`. A run
+  prints the same fact as one `warning:` line on stderr (suppressed by `-q`).
+  SECURITY: schema **values are never printed** - a tool schema can carry
+  operator text, and remote text when it came from an MCP server.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
   ✗ MISSING), every executable the config needs on `PATH` (✓ found /

@@ -108,8 +108,9 @@ run" whenever they see it.
 ### 5 - provider error
 
 Any `llm.ErrProvider`: transport failures, non-2xx API responses, undecodable
-replies - after the HTTP client's own retries are exhausted. Applies to both
-the OpenAI-compatible and the native Anthropic client.
+replies - after the HTTP client's own retries are exhausted. Applies to all
+three clients: the OpenAI-compatible one, the native Anthropic one and the
+native Gemini one.
 
 ### 6 - output schema unmet
 

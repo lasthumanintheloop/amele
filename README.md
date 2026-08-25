@@ -21,8 +21,9 @@ no Python · no Node · no platform · no account
   review it in a pull request, share it as a folder. Deleting an agent is
   `rm`.
 - **Build your own.** Your prompt, your tools, your budgets - on any
-  OpenAI-compatible endpoint (OpenAI, OpenRouter, vLLM, Ollama) or the native
-  Anthropic API. With a local model it is yours end to end, offline included.
+  OpenAI-compatible endpoint (OpenAI, OpenRouter, vLLM, Ollama) or a native
+  wire: the Anthropic Messages API and the Google Gemini API. With a local
+  model it is yours end to end, offline included.
 - **A core to build around.** amele owns the loop, the budgets, the sandbox
   and the log; capabilities come from outside, in whatever language you
   like - a tool is any executable, and your own app can drive amele the
@@ -188,7 +189,7 @@ provider:
 Any OpenAI-compatible endpoint works, and `provider.dialect` tells amele which
 variation of it you are talking to, so one config says what it wants -
 reasoning depth, sampling, output cap - and gets it mapped correctly on
-OpenAI, Anthropic, DeepSeek, GLM, Kimi, Groq or OpenRouter, with the reasoning
+OpenAI, Anthropic, Gemini, DeepSeek, GLM, Kimi, Groq or OpenRouter, with the reasoning
 a tool loop needs echoed back instead of dropped:
 [docs/providers.md](docs/providers.md).
 
