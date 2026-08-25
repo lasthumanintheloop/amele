@@ -126,10 +126,8 @@ output:
 }
 
 // TestSchemaProviderTypeGemini pins the published enum against the runtime:
-// `type: gemini` is a valid third wire value in the schema editors consume, a
-// near-miss spelling is not, and the schema does not yet describe anything the
-// runtime cannot accept - the vertex block is a later slice, so mentioning it
-// here would promise a key `amele validate` rejects as unknown.
+// `type: gemini` is a valid third wire value in the schema editors consume, and
+// a near-miss spelling is not.
 func TestSchemaProviderTypeGemini(t *testing.T) {
 	validator, err := schema.Compile(SchemaJSONBytes())
 	if err != nil {
@@ -157,8 +155,47 @@ provider:
 		t.Error("schema accepts provider.type \"Gemini\" although the runtime rejects it")
 	}
 
-	if bytes.Contains(SchemaJSONBytes(), []byte("vertex")) {
-		t.Error("the schema mentions vertex, a key the runtime does not accept yet")
+}
+
+// TestSchemaVertexBlock pins the vertex block on the editor side: the block a
+// Vertex config writes validates, and a misspelled key inside it is caught
+// rather than silently ignored (additionalProperties: false, the house rule for
+// every closed block in this schema).
+//
+// The cross-field rules - project and location required, never together with
+// api_key, gemini only - stay OUT of the schema on purpose: they are relations
+// between keys, and encoding them here would mean maintaining the same
+// conditional in two copies of a frozen contract while `amele validate` already
+// states them in the operator's own words.
+func TestSchemaVertexBlock(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const doc = `
+model: gemini-3-pro
+provider:
+  type: gemini
+  vertex:
+    project: my-project
+    location: europe-west4
+    credentials: /etc/amele/sa.json
+`
+	if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+		t.Errorf("a vertex provider block does not validate:\n%s", feedback)
+	}
+
+	const typo = `
+model: gemini-3-pro
+provider:
+  type: gemini
+  vertex:
+    project: my-project
+    region: europe-west4
+`
+	if _, _, ok := validator.Validate(yamlToJSON(t, []byte(typo))); ok {
+		t.Error("schema accepts provider.vertex.region although the runtime rejects unknown keys")
 	}
 }
 

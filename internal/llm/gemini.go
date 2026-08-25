@@ -26,6 +26,15 @@ const defaultGeminiBaseURL = "https://generativelanguage.googleapis.com"
 // version would then be sent twice - see config.validateProvider).
 const geminiAPIVersion = "v1beta"
 
+// vertexAPIVersion is the pinned path version on the Vertex side, which is a
+// DIFFERENT number from the AI Studio one above.
+//
+// v1 is the GA surface and its GenerateContentRequest is field-for-field
+// identical to v1beta1's (verified by diffing the two discovery documents -
+// docs/superpowers/specs/2026-08-25-vertex-adc-research.md §1.3), so beta buys
+// nothing here that would justify a pre-GA path in an unattended run.
+const vertexAPIVersion = "v1"
+
 // The two roles this wire has. There is no system role: the system prompt is a
 // top-level systemInstruction Content (design doc §"Gemini-specific mechanics"
 // item 6).
@@ -45,17 +54,32 @@ const (
 // Anthropic clients established - typed statusError routing, injected Sleep,
 // capped error snippets.
 //
-// SCOPE: this slice speaks conversations, tool calls, the reasoning and
+// SCOPE: this client speaks conversations, tool calls, the reasoning and
 // structured-output knobs, and round-trips the thought signatures Gemini 3
-// signs its steps with. What it does not speak is Vertex (a later slice): the
-// endpoint, the auth and a handful of body fields differ there.
+// signs its steps with, against EITHER backend of this API - AI Studio by
+// default, Vertex AI when Vertex is set. The two differ in the endpoint and the
+// credential; the request body they receive is byte-identical (see the vertex
+// note on gemRequest).
 type GeminiClient struct {
 	// BaseURL is the API root without a trailing slash and WITHOUT the version
 	// segment, e.g. "https://generativelanguage.googleapis.com". Empty means
 	// the first-party host.
+	//
+	// In vertex mode it means less than that: only its scheme and host are
+	// read, because the rest of the URL is derived from the project and
+	// location (see vertexEndpoint).
 	BaseURL string
-	// APIKey is sent as the x-goog-api-key header when non-empty.
+	// APIKey is sent as the x-goog-api-key header when non-empty. It is the AI
+	// Studio credential and is NEVER sent in vertex mode - that endpoint
+	// refuses API keys outright.
 	APIKey string
+	// Vertex, when non-nil, switches this client to the Vertex AI endpoint:
+	// project- and location-addressed, API version v1, OAuth bearer auth from
+	// TokenSource. nil is AI Studio.
+	Vertex *VertexTarget
+	// TokenSource supplies the OAuth access token for vertex mode. It is
+	// required there and unused otherwise.
+	TokenSource GeminiTokenSource
 	// HTTPClient is injectable for tests; nil means a client bounded by
 	// RequestTimeout.
 	HTTPClient *http.Client
@@ -75,6 +99,48 @@ type GeminiClient struct {
 	Sleep func(ctx context.Context, d time.Duration) error
 }
 
+// VertexTarget names the Vertex AI deployment a request is addressed to: the
+// Google Cloud project that owns the quota, and the location that serves it.
+//
+// It is a value rather than a set of fields on the client because the two
+// coordinates are meaningless apart - neither addresses a model on its own -
+// and because a nil *VertexTarget is how the client says "AI Studio".
+type VertexTarget struct {
+	// Project is the project id or project number. It becomes a URL path
+	// segment.
+	Project string
+	// Location is the Vertex location: a region ("us-central1"), a
+	// jurisdictional multi-region ("us", "eu"), or "global". It selects the
+	// host AND appears in the path.
+	Location string
+}
+
+// Host returns the Vertex API host that serves this target's location, the
+// value a base_url override would replace. It is exported for the report
+// commands: `amele explain` must be able to name the host a run will reach
+// without building a request or duplicating the mapping.
+func (t VertexTarget) Host() string { return vertexHost(t.Location) }
+
+// GeminiTokenSource supplies the OAuth access token a Vertex request
+// authenticates with.
+//
+// The interface is declared here, in the package that CONSUMES it (the house
+// rule, docs/engineering.md §5.1), and it is deliberately the smallest thing
+// this client needs: one method, one string. Everything the credential machine
+// actually involves - the ADC chain, a service-account key file, token caching
+// and refresh - lives behind it, which is what keeps this file free of a
+// dependency on any of it.
+//
+// CONTRACT for implementations: Token returns a token that is valid NOW
+// (caching and refresh are the source's business), respects the context, and is
+// safe for concurrent use. It is called once per HTTP attempt, so a retried
+// request picks up a token refreshed in between rather than replaying an
+// expired one.
+type GeminiTokenSource interface {
+	// Token returns the bearer token to authenticate one request with.
+	Token(ctx context.Context) (string, error)
+}
+
 // Wire types for the generateContent JSON body. Kept unexported: the rest of
 // the codebase only sees the neutral types in llm.go.
 // Every field amele owns is a struct member (not a map entry) so the encoded
@@ -86,6 +152,39 @@ type GeminiClient struct {
 // keep the two in step when a field is added here.
 //
 // The model is NOT a body field on this wire: it lives in the request path.
+//
+// # Vertex body diffs
+//
+// The same struct is sent to BOTH backends, byte for byte
+// (TestVertexBodyIsIdenticalToAIStudio). The AI Studio and Vertex bodies are
+// not identical in general - the research names five differences - but every
+// one of them concerns a field amele does not write, so the diff table is
+// recorded here as a comment rather than implemented as a mode switch. Each row
+// is INERT, and each says what would make it live:
+//
+//   - topK - typed float on Vertex, integer on AI Studio. amele exposes no
+//     topK knob at all; adding one means emitting it as a float in vertex mode.
+//   - responseFormat - an ARRAY of ResponseFormat on Vertex, a single object on
+//     AI Studio; a shared struct would break outright. amele's structured
+//     output travels as generationConfig.responseJsonSchema, which is shared
+//     and identical, and the live smoke settled that it is the right field.
+//   - safetySettings.method - Vertex-only third key on each entry. amele writes
+//     no safetySettings (the key is OWNED, so provider.params cannot supply one
+//     either), so there is nothing for method to attach to.
+//   - labels - Vertex-only, for billing attribution. amele does not own it, so
+//     it is reachable through provider.params exactly like any other extra; on
+//     AI Studio the same key would be a 400, which is the operator's own
+//     trade-off to make.
+//   - serviceTier - AI Studio-only request field, likewise not owned and
+//     likewise reachable through params, where it would 400 on Vertex.
+//
+// On the response side the pair is usageMetadata.trafficType (Vertex) vs
+// serviceTier (AI Studio); this client decodes neither - it reads only the
+// token counts, which carry the same names on both.
+//
+// Source: docs/superpowers/specs/2026-08-25-vertex-adc-research.md §2 and §6.
+// TestGeminiWireFieldsPinTheVertexDiffTable fails when a field is added to
+// either struct, so the next knob cannot skip this table.
 type gemRequest struct {
 	Contents []gemContent `json:"contents"`
 	// SystemInstruction is a pointer so the key vanishes when no system prompt
@@ -498,18 +597,22 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 // absent). The model is a parameter rather than a body field because this wire
 // puts it in the URL.
 func (c *GeminiClient) doOnce(ctx context.Context, model string, body []byte) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(model), bytes.NewReader(body))
+	endpoint, err := c.endpoint(model)
+	if err != nil {
+		// A target that cannot be addressed will not become addressable on the
+		// next attempt, so this is not retryable.
+		return nil, false, 0, err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, 0, fmt.Errorf("%w: building request: %v", ErrProvider, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if c.APIKey != "" {
-		// SECURITY: the Gemini API authenticates through this header, not a
-		// Bearer token; sending the key in the wrong header would leak it to
-		// intermediaries expecting no credential there. The documented query
-		// parameter form (?key=) is refused on purpose - a URL is logged by
-		// every proxy on the path.
-		httpReq.Header.Set("x-goog-api-key", c.APIKey)
+	if err := c.authorize(ctx, httpReq); err != nil {
+		// Same reasoning: a missing or unobtainable credential is a wiring
+		// problem, not a transient one. Failing here also means the prompt is
+		// never spent on a request the endpoint would refuse.
+		return nil, false, 0, err
 	}
 
 	httpResp, err := c.httpClient().Do(httpReq)
@@ -543,6 +646,41 @@ func (c *GeminiClient) doOnce(ctx context.Context, model string, body []byte) (r
 		return nil, false, 0, err
 	}
 	return resp, false, 0, nil
+}
+
+// authorize sets the credential header for one request. Which credential that
+// is follows from the backend, and the two are mutually exclusive.
+//
+// SECURITY: the AI Studio key never travels to Vertex and the bearer token
+// never travels to AI Studio. The two backends authenticate differently and
+// each rejects the other's credential, so sending the wrong one would leak it
+// to a service that has no business seeing it - which is also why config
+// refuses a config naming both (exit 2), and why this reads the mode rather
+// than "whatever is set".
+//
+// The documented ?key= query-parameter form is refused on both paths: a URL is
+// logged by every proxy between here and the API.
+func (c *GeminiClient) authorize(ctx context.Context, req *http.Request) error {
+	if c.Vertex == nil {
+		if c.APIKey != "" {
+			req.Header.Set("x-goog-api-key", c.APIKey)
+		}
+		return nil
+	}
+	if c.TokenSource == nil {
+		return fmt.Errorf("%w: vertex needs google credentials but no token source is configured", ErrProvider)
+	}
+	token, err := c.TokenSource.Token(ctx)
+	if err != nil {
+		return fmt.Errorf("%w: obtaining a google access token: %v", ErrProvider, err)
+	}
+	if token == "" {
+		// An empty token would go out as a bare "Bearer " and come back a 401
+		// that describes the endpoint rather than the credential source.
+		return fmt.Errorf("%w: the google credential source returned an empty access token", ErrProvider)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	return nil
 }
 
 // failure turns a non-200 reply into the typed provider error, adding the one
@@ -1131,13 +1269,125 @@ func geminiThinkingLevel(effort string) string {
 	}
 }
 
-// endpoint builds the versioned generateContent URL for one model.
-func (c *GeminiClient) endpoint(model string) string {
+// endpoint builds the versioned generateContent URL for one model, on whichever
+// backend this client is pointed at.
+//
+// It returns an error only in vertex mode, where the URL is assembled from
+// operator-supplied coordinates that must be checked before they become a
+// hostname; the AI Studio path cannot fail.
+func (c *GeminiClient) endpoint(model string) (string, error) {
+	if c.Vertex != nil {
+		return vertexEndpoint(c.BaseURL, *c.Vertex, model)
+	}
 	base := c.BaseURL
 	if base == "" {
 		base = defaultGeminiBaseURL
 	}
-	return strings.TrimSuffix(base, "/") + "/" + geminiAPIVersion + "/models/" + geminiModelPath(model) + ":generateContent"
+	return strings.TrimSuffix(base, "/") + "/" + geminiAPIVersion + "/models/" + geminiModelPath(model) + ":generateContent", nil
+}
+
+// vertexEndpoint builds the Vertex AI generateContent URL:
+//
+//	https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent
+//
+// Three host shapes exist and the location picks between them (research §1.1):
+// the regional prefix above, the un-prefixed aiplatform.googleapis.com for
+// "global", and aiplatform.{us|eu}.rep.googleapis.com for the two
+// jurisdictional multi-regions. The path segment stays locations/{location} in
+// all three - the host and the path are not alternatives, they travel together.
+//
+// SECURITY: the configured location is NEVER rewritten. Not to "global" when a
+// region cannot serve the requested model, not to a default when it looks
+// unfamiliar, not when base_url moves the host. The location decides where the
+// prompt is PROCESSED, which is a data-residency commitment an operator makes
+// deliberately (research §7); silently substituting another one is a compliance
+// break rather than a convenience, and it is exactly the bug filed against
+// gemini-cli as google-gemini/gemini-cli#27984 ("Vertex AI with API key ignores
+// GOOGLE_CLOUD_LOCATION and uses the global endpoint"). A location that cannot
+// serve the model must surface as the API's own loud error.
+//
+// SECURITY: baseURL overrides the HOST and nothing else - scheme, host and port
+// are taken from it, and the resource path is still built here. That is what a
+// VPC-SC deployment needs (a restricted VIP or a Private Service Connect DNS
+// name in front of the same API, research §7) and it is all it gets: a path
+// written in base_url cannot move the request, and config refuses that shape
+// outright rather than dropping it quietly.
+func vertexEndpoint(baseURL string, target VertexTarget, model string) (string, error) {
+	if err := checkVertexID("project", target.Project); err != nil {
+		return "", err
+	}
+	if err := checkVertexID("location", target.Location); err != nil {
+		return "", err
+	}
+
+	scheme, host := "https", vertexHost(target.Location)
+	if baseURL != "" {
+		u, err := url.Parse(baseURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+			return "", fmt.Errorf("%w: provider base_url %q is not an absolute http(s) URL; in vertex mode it names the host to reach instead of %s", ErrProvider, baseURL, vertexHost(target.Location))
+		}
+		scheme, host = u.Scheme, u.Host
+	}
+
+	// The ids are not percent-escaped: checkVertexID above is the stronger
+	// gate. Escaping would turn a hostile value into one odd-looking segment,
+	// while the charset check refuses it - and the location has to survive that
+	// check anyway, since it also lands in the hostname, where escaping means
+	// nothing at all.
+	return scheme + "://" + host +
+		"/" + vertexAPIVersion +
+		"/projects/" + target.Project +
+		"/locations/" + target.Location +
+		"/publishers/google/models/" + geminiModelPath(model) + ":generateContent", nil
+}
+
+// vertexHost maps a location onto the host that serves it.
+//
+// The two special cases are documented endpoint shapes, not shortcuts: "global"
+// is served by the un-prefixed host, and the "us"/"eu" multi-regions by their
+// own .rep. names (research §1.1, all three live-probed). Building
+// "eu-aiplatform.googleapis.com" for the EU multi-region would be a DNS failure
+// on the one location an EU-residency deployment must be able to name.
+//
+// Anything else is treated as a region and gets the regional prefix. Vertex has
+// 45 of them and the list moves; validating against a snapshot here would age
+// into refusing a region Google had already launched, while an unknown one
+// fails immediately and unmistakably at DNS.
+func vertexHost(location string) string {
+	switch location {
+	case "global":
+		return "aiplatform.googleapis.com"
+	case "us", "eu":
+		return "aiplatform." + location + ".rep.googleapis.com"
+	default:
+		return location + "-aiplatform.googleapis.com"
+	}
+}
+
+// checkVertexID refuses a project or location that could address something
+// other than what it names.
+//
+// SECURITY: the location is interpolated into the HOSTNAME, so a value carrying
+// a dot, a slash or an @ could send the whole request - prompt included - to a
+// server nobody configured; both values are also path segments. Config
+// validation applies the same charset (config.vertexIDPattern), so reaching
+// this error means a caller constructed the client directly; it stays because
+// the alternative failure is silent misrouting, and because the check is what
+// lets the URL be assembled by concatenation above.
+func checkVertexID(kind, value string) error {
+	if value == "" {
+		return fmt.Errorf("%w: vertex %s is empty: a vertex request is addressed by project AND location", ErrProvider, kind)
+	}
+	for i, r := range value {
+		alnum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		// A leading hyphen is refused with the rest: it cannot start a DNS
+		// label, and the same rule is what config enforces.
+		if alnum || (r == '-' && i > 0) {
+			continue
+		}
+		return fmt.Errorf("%w: vertex %s %q is not addressable: lowercase letters, digits and hyphens only", ErrProvider, kind, value)
+	}
+	return nil
 }
 
 // geminiModelPath renders a model name as ONE URL path segment.

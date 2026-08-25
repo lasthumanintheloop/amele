@@ -871,6 +871,14 @@ func geminiWire(cfg *config.Config) bool {
 // refuses.
 func defaultHostNote(cfg *config.Config) string {
 	if geminiWire(cfg) {
+		if v := cfg.Provider.Vertex; v != nil {
+			// The gemini wire has two backends and the vertex one is addressed
+			// by location, so naming the AI Studio host here would describe a
+			// request this config will never send. The full vertex reporting
+			// (the resolved path, the auth mode) is a later slice; this row only
+			// has to stop being wrong.
+			return "(default: " + llm.VertexTarget{Location: v.Location}.Host() + ")"
+		}
 		return "(default: generativelanguage.googleapis.com)"
 	}
 	return "(default: api.anthropic.com)"

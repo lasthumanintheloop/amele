@@ -129,10 +129,9 @@ func TestBuildProviderGeminiWiresRetry(t *testing.T) {
 	}
 }
 
-// TestGeminiWithoutAPIKeyIsExit2: slice 1 speaks only the AI Studio key, so a
-// keyless config must fail at validate - naming Vertex, the auth path an
-// operator who wrote one was probably reaching for - instead of buying a 401
-// from an unattended run.
+// TestGeminiWithoutAPIKeyIsExit2: this wire has two credentials and a config
+// must name one of them, so a config naming neither fails at validate - listing
+// both paths - instead of buying a 401 from an unattended run.
 func TestGeminiWithoutAPIKeyIsExit2(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "agent.yaml")
@@ -154,9 +153,49 @@ system_prompt: "You are a test agent."
 		if code != ExitConfigError {
 			t.Errorf("%s: exit %d, want %d (stderr: %s)", cmd, code, ExitConfigError, stderr)
 		}
-		if !strings.Contains(stderr, "gemini needs api_key (Vertex support lands with the vertex block)") {
+		if !strings.Contains(stderr, "gemini needs api_key (AI Studio) or a vertex block (Vertex AI)") {
 			t.Errorf("%s: stderr does not name the missing key: %s", cmd, stderr)
 		}
+	}
+}
+
+// TestVertexConfigReachesTheVertexEndpoint is the wiring proof: a vertex block
+// in the YAML becomes the client's target, so the request is addressed by
+// project and location instead of to the AI Studio host.
+//
+// It stops at the client rather than running the agent because the CREDENTIAL
+// is the next slice: a run would fail at the token source, which is the honest
+// intermediate state (the request never leaves for the wrong endpoint) but says
+// nothing about the endpoint itself.
+func TestVertexConfigReachesTheVertexEndpoint(t *testing.T) {
+	cfg := &config.Config{Provider: config.ProviderConfig{
+		Type: config.ProviderTypeGemini,
+		//nolint:gosec // G101: a service-account key PATH, not a credential.
+		Vertex: &config.VertexConfig{Project: "my-project", Location: "europe-west4", Credentials: "/etc/amele/sa.json"},
+	}}
+	provider, err := buildProvider(cfg)
+	if err != nil {
+		t.Fatalf("buildProvider: %v", err)
+	}
+	client, ok := provider.(*llm.GeminiClient)
+	if !ok {
+		t.Fatalf("buildProvider returned %T, want *llm.GeminiClient", provider)
+	}
+	if client.Vertex == nil {
+		t.Fatal("the vertex block did not reach the client")
+	}
+	if got := *client.Vertex; got != (llm.VertexTarget{Project: "my-project", Location: "europe-west4"}) {
+		t.Errorf("vertex target = %+v", got)
+	}
+
+	// A config without the block keeps the AI Studio backend.
+	plain := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}}
+	provider, err = buildProvider(plain)
+	if err != nil {
+		t.Fatalf("buildProvider: %v", err)
+	}
+	if c := provider.(*llm.GeminiClient); c.Vertex != nil {
+		t.Errorf("a keyed gemini config became a vertex client: %+v", c.Vertex)
 	}
 }
 

@@ -410,7 +410,11 @@ func TestGeminiEndpoint(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &GeminiClient{BaseURL: tt.base}
-			if got := client.endpoint(tt.model); got != tt.want {
+			got, err := client.endpoint(tt.model)
+			if err != nil {
+				t.Fatalf("endpoint: %v", err)
+			}
+			if got != tt.want {
 				t.Errorf("endpoint: got %q, want %q", got, tt.want)
 			}
 		})

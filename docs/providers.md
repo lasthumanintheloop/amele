@@ -204,11 +204,36 @@ family rather than a variation: a `dialect:` next to it is a **config error**
 and strictness costs no working config while buying you the certainty that no
 knob is quietly dropped.
 
-Today amele speaks the AI Studio half of this API: `api_key` is the
-`x-goog-api-key` header and is **required** (`gemini needs api_key` at exit 2).
-Vertex AI - Google credentials, a project and a region - is a later slice and
-arrives as a `vertex:` block; until then there is no way to reach it, which the
-validate message says out loud rather than leaving you to read a 401.
+This API has two backends and a config must name one of them, or validate
+refuses it at exit 2 (`gemini needs api_key (AI Studio) or a vertex block
+(Vertex AI)`) rather than letting an unattended run buy a 401. On the AI Studio
+half, `api_key` is the `x-goog-api-key` header. On the Vertex half, a `vertex:`
+block names the Google Cloud project and location and the credential is a Google
+OAuth token - so `api_key` beside `vertex` is also exit 2: Vertex refuses API
+keys outright.
+
+```yaml
+provider:
+  type: gemini
+  vertex:
+    project: my-project        # required
+    location: europe-west4     # required; a region, "us"/"eu", or "global"
+    credentials: /path/sa.json # optional; omitted means application default credentials
+```
+
+The request then goes to
+`https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent`
+(`aiplatform.googleapis.com` for `global`, `aiplatform.{us,eu}.rep.googleapis.com`
+for the two multi-regions). The location you configure is **never** rewritten -
+not to `global`, not when a model is unavailable there, not when `base_url`
+moves the host: where a prompt is processed is a data-residency decision, so a
+location that cannot serve your model fails loudly instead of being rerouted. In
+vertex mode `base_url` overrides the **host only** (a VPC-SC restricted VIP or a
+Private Service Connect name); a path written next to it is exit 2 rather than a
+prefix that silently disappears.
+
+The token source itself lands in the next slice; until it does, a `vertex:` run
+stops at the credential.
 
 `base_url` is optional (the client knows `generativelanguage.googleapis.com`)
 and must **not** carry the version segment: amele appends

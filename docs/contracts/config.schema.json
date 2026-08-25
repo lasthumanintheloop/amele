@@ -89,6 +89,25 @@
             }
           }
         },
+        "vertex": {
+          "type": "object",
+          "description": "Points the gemini wire at Vertex AI instead of the AI Studio host: the request goes to https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent (host without the region prefix when location is \"global\"), authenticated with Google credentials rather than an API key. Valid only with type \"gemini\", and never together with api_key - Vertex refuses API keys outright. An absent block means AI Studio.",
+          "additionalProperties": false,
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "Google Cloud project id (or project number) that owns the quota and billing for the request. Required. Lowercase letters, digits and hyphens: it travels as a path segment of the endpoint."
+            },
+            "location": {
+              "type": "string",
+              "description": "Vertex location: a region id (\"us-central1\", \"europe-west4\"), a jurisdictional multi-region (\"us\", \"eu\"), or \"global\". Required, and never defaulted or rewritten - it decides where the prompt is processed, which is a data-residency commitment. Lowercase letters, digits and hyphens: it becomes part of the endpoint host. Model availability is per-location, so a model absent from the chosen location fails loudly instead of being rerouted."
+            },
+            "credentials": {
+              "type": "string",
+              "description": "Path to a service-account key file. Omitted means Application Default Credentials: the GOOGLE_APPLICATION_CREDENTIALS variable, then gcloud's user credentials, then the metadata server."
+            }
+          }
+        },
         "params": {
           "type": "object",
           "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself ON THE ACTIVE TARGET are rejected at load time - model, messages, tools, response_format, temperature, top_p, the dialect's cap and reasoning spellings, thinking/output_config/system on the anthropic wire, and contents/systemInstruction/tools/toolConfig/generationConfig/safetySettings/cachedContent (in either spelling) on the gemini wire - so params can extend a request but never rewrite one. stream and tool_choice are refused everywhere: amele's transport reads a single JSON body and its loop owns the tool protocol. A key the active target never writes (thinking on kimi) stays available. Values must be JSON-serializable."

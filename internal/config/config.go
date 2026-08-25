@@ -172,6 +172,13 @@ type ProviderConfig struct {
 	// connection) is retried. A nil block means the client defaults, which is
 	// what every config written before the block existed gets.
 	Retry *RetryConfig `yaml:"retry"`
+	// Vertex, when present, points the gemini wire at Vertex AI instead of the
+	// AI Studio host: a different endpoint (project- and location-addressed), a
+	// different credential (Google OAuth rather than an API key) and a
+	// different API version. A nil block means AI Studio, which is what every
+	// gemini config written before this block carries. It is refused with any
+	// other provider.type - the block describes ONE wire's endpoint.
+	Vertex *VertexConfig `yaml:"vertex"`
 	// Params is the escape hatch: arbitrary keys merged verbatim into the
 	// request body root, for provider extras amele has no neutral field for.
 	// Keys amele writes itself ON THE ACTIVE TARGET are rejected at validation
@@ -198,6 +205,31 @@ type ReasoningConfig struct {
 	// than a silently dropped field. On the Gemini wire it is an ALTERNATIVE
 	// to Effort, never a companion: the API refuses a request carrying both.
 	BudgetTokens int `yaml:"budget_tokens"`
+}
+
+// VertexConfig points the gemini wire at a Vertex AI deployment: a Google
+// Cloud project and the location whose regional endpoint serves it.
+//
+// Project and Location are both required, and neither is ever guessed: the
+// location decides where the prompt is PROCESSED, which is a data-residency
+// commitment rather than a routing convenience (see internal/llm's
+// vertexEndpoint). amele has no default for either, so an operator can only
+// get the endpoint they wrote.
+type VertexConfig struct {
+	// Project is the Google Cloud project id (or project number) that owns the
+	// quota and the billing for the request. It travels as a URL path segment.
+	Project string `yaml:"project"`
+	// Location is the Vertex location: a region id ("us-central1",
+	// "europe-west4"), a jurisdictional multi-region ("us", "eu"), or "global".
+	// It selects BOTH the endpoint host and the locations/ path segment, and
+	// amele never rewrites it - see the SECURITY note on vertexEndpoint.
+	Location string `yaml:"location"`
+	// Credentials optionally names a service-account key file. Empty means
+	// Application Default Credentials (the GOOGLE_APPLICATION_CREDENTIALS
+	// variable, then gcloud's user credentials, then the metadata server).
+	// The path is resolved by the auth layer, not here: this block only
+	// carries the operator's answer to "which identity".
+	Credentials string `yaml:"credentials"`
 }
 
 // RetryConfig tunes the transient-failure retry loop both provider clients
@@ -1014,22 +1046,24 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 		}
 	} else if problem := baseURLProblem(c.Provider.BaseURL); problem != "" {
 		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
-	} else if problem := versionedBaseURLProblem(c.Provider.Type, c.Provider.BaseURL); problem != "" {
+	} else if problem := c.hostOrVersionProblem(); problem != "" {
 		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
 	}
 
-	if c.Provider.Type == ProviderTypeGemini && c.Provider.APIKey == "" {
-		// The Gemini API has two auth paths and amele speaks one of them today:
-		// the AI Studio key. Vertex (Google credentials, a project and a region)
-		// arrives with the `vertex` block, and until it does a keyless config
-		// would reach the wire unauthenticated and come back a 401 from a run
-		// nobody was watching - so the successor is NAMED here rather than left
-		// for the operator to infer from the endpoint's refusal.
+	if c.Provider.Type == ProviderTypeGemini && c.Provider.APIKey == "" && c.Provider.Vertex == nil {
+		// The Gemini API has two auth paths and this wire speaks both: the AI
+		// Studio key, and Vertex's Google credentials (named by the vertex
+		// block, which carries the project and location rather than a secret).
+		// With neither, the request would reach the wire unauthenticated and
+		// come back a 401 from a run nobody was watching - so both successors
+		// are NAMED here rather than left for the operator to infer from the
+		// endpoint's refusal.
 		//
 		// Scoped to this wire: a keyless openai-compatible config is a local
 		// Ollama server, which is a supported deployment.
-		add("provider.api_key: gemini needs api_key (Vertex support lands with the vertex block)")
+		add("provider.api_key: gemini needs api_key (AI Studio) or a vertex block (Vertex AI)")
 	}
+	c.validateVertex(add)
 
 	if c.Provider.RequestTimeout < 0 {
 		add("provider.request_timeout must not be negative")
@@ -1039,6 +1073,55 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 	}
 	c.validateRetry(add)
 	c.validateProviderTuning(add)
+}
+
+// vertexIDPattern is the charset every vertex path segment must fit: lowercase
+// letters, digits and hyphens.
+//
+// SECURITY: the location is interpolated into the endpoint HOST
+// ("{location}-aiplatform.googleapis.com") and both values become URL path
+// segments, so an unconstrained value could name a different host altogether or
+// climb out of the path amele chose. Escaping in the client defends the path;
+// this rule defends the host, where escaping has no meaning. The charset costs
+// nothing real: Google project ids and locations are lowercase-alphanumeric
+// with hyphens by construction, and a project NUMBER is digits.
+var vertexIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
+// validateVertex checks the Vertex AI block: presence relative to the wire, the
+// two required coordinates, and the charset that keeps them addressable.
+func (c *Config) validateVertex(add func(format string, args ...any)) {
+	v := c.Provider.Vertex
+	if v == nil {
+		return
+	}
+	if c.Provider.Type != ProviderTypeGemini {
+		// Refused rather than ignored: a config carrying a vertex block reads as
+		// a Vertex deployment to everyone who opens it, and running it against
+		// another wire would honor the file's letter while breaking its intent.
+		add("provider.vertex is only valid with provider.type: gemini")
+		return
+	}
+	if c.Provider.APIKey != "" {
+		// The two credentials are alternatives, and not merely redundant
+		// together: Vertex REFUSES API keys outright (live-verified - see
+		// docs/superpowers/specs/2026-08-25-vertex-adc-research.md §3.3), so a
+		// config naming both would look authenticated and fail at the endpoint.
+		add("provider.vertex must not be combined with provider.api_key: vertex authenticates with google credentials (application default credentials, or vertex.credentials), and the AI Studio key is not accepted there")
+	}
+	if v.Project == "" {
+		add("provider.vertex.project is required (the google cloud project id or number that owns the quota)")
+	} else if !vertexIDPattern.MatchString(v.Project) {
+		add("provider.vertex.project %q must be a lowercase project id or project number (letters, digits and hyphens): it becomes a path segment of the endpoint", v.Project)
+	}
+	if v.Location == "" {
+		// No default: the location decides where the prompt is processed, so
+		// guessing one (us-central1, the historical habit) would be a residency
+		// decision amele made on the operator's behalf - and it does not even
+		// serve the current Gemini models.
+		add("provider.vertex.location is required (e.g. us-central1, europe-west4, or global)")
+	} else if !vertexIDPattern.MatchString(v.Location) {
+		add("provider.vertex.location %q must be a lowercase region id like us-central1 or global (letters, digits and hyphens): it becomes part of the endpoint host", v.Location)
+	}
 }
 
 // validateRetry checks the retry policy bounds. Zero is "omitted" for both
@@ -1334,6 +1417,30 @@ func baseURLProblem(raw string) string {
 		return "must not contain a query string or fragment: the client appends request paths to it"
 	}
 	return ""
+}
+
+// hostOrVersionProblem reports what is wrong with a non-empty base_url beyond
+// its URL syntax, phrased to follow the quoted value in an error message.
+//
+// The vertex endpoint reads base_url as a HOST override and nothing more (see
+// internal/llm's vertexEndpoint): the request path is built from the project
+// and location, so any path written here would be dropped. It is refused
+// instead of dropped - a proxy prefix that silently disappears is a request
+// sent somewhere other than where the config says.
+func (c *Config) hostOrVersionProblem() string {
+	// The type is consulted too: a vertex block outside the gemini wire is
+	// already an error of its own, and the endpoint it describes is not the one
+	// this base_url would serve, so the version rule stays the right complaint.
+	if c.Provider.Vertex == nil || c.Provider.Type != ProviderTypeGemini {
+		return versionedBaseURLProblem(c.Provider.Type, c.Provider.BaseURL)
+	}
+	u, err := url.Parse(c.Provider.BaseURL)
+	if err != nil || strings.Trim(u.Path, "/") == "" {
+		// A parse failure is already reported by baseURLProblem, which runs
+		// first; there is nothing to add here.
+		return ""
+	}
+	return "must not include a path when provider.vertex is set: only the scheme and host are taken from base_url, and the client appends /v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent itself"
 }
 
 // versionedBaseURLProblem reports the "the API version is still in base_url"

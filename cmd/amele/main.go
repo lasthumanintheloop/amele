@@ -2667,8 +2667,15 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 		// the openai wire. Only the Messages API needs its cap on the client,
 		// because it requires the field on every request.
 		return &llm.GeminiClient{
-			BaseURL:        cfg.Provider.BaseURL,
-			APIKey:         cfg.Provider.APIKey,
+			BaseURL: cfg.Provider.BaseURL,
+			APIKey:  cfg.Provider.APIKey,
+			// The vertex block travels as the client's target so the request is
+			// addressed to the endpoint the config names. The TOKEN source that
+			// authenticates it is the next slice; until it is wired, a vertex
+			// config fails at the credential rather than silently talking to
+			// the AI Studio host with the wrong (or no) key - which would be a
+			// data-residency break dressed as a 401.
+			Vertex:         vertexTarget(cfg.Provider.Vertex),
 			RequestTimeout: cfg.Provider.RequestTimeout.Std(),
 			MaxAttempts:    maxAttempts,
 			InitialBackoff: initialBackoff,
@@ -2686,6 +2693,20 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 		MaxAttempts:    maxAttempts,
 		InitialBackoff: initialBackoff,
 	}, nil
+}
+
+// vertexTarget translates the optional provider.vertex block into the client's
+// target. A nil block means the AI Studio backend, which is what every gemini
+// config written before the block carries.
+//
+// The two types are separate on purpose: the config block is the operator's
+// YAML surface (and carries the credentials PATH, which the auth layer reads),
+// while the target is the pair of coordinates the endpoint is built from.
+func vertexTarget(v *config.VertexConfig) *llm.VertexTarget {
+	if v == nil {
+		return nil
+	}
+	return &llm.VertexTarget{Project: v.Project, Location: v.Location}
 }
 
 // retryPolicy unpacks the optional provider.retry block for both clients. An

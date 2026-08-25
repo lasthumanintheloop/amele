@@ -528,3 +528,31 @@ func TestGeminiBaseURLDefaultRow(t *testing.T) {
 		t.Errorf("report names the anthropic host on the gemini wire:\n%s", got)
 	}
 }
+
+// TestVertexBaseURLDefaultRow: the same row on the other backend of the same
+// wire. A vertex config never reaches the AI Studio host, so naming it here
+// would describe a request that is not going to happen - and the host is
+// derived from the LOCATION, which is the one thing an operator reading this
+// row wants confirmed before a residency-sensitive run.
+func TestVertexBaseURLDefaultRow(t *testing.T) {
+	for _, tt := range []struct{ location, host string }{
+		{"europe-west4", "europe-west4-aiplatform.googleapis.com"},
+		{"global", "aiplatform.googleapis.com"},
+		{"eu", "aiplatform.eu.rep.googleapis.com"},
+	} {
+		t.Run(tt.location, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.Provider.Type = config.ProviderTypeGemini
+			cfg.Provider.BaseURL = ""
+			cfg.Provider.Vertex = &config.VertexConfig{Project: "my-project", Location: tt.location}
+			got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
+
+			if !strings.Contains(got, "base_url:        (default: "+tt.host+")") {
+				t.Errorf("report does not name the vertex host %q:\n%s", tt.host, got)
+			}
+			if strings.Contains(got, "generativelanguage.googleapis.com") {
+				t.Errorf("report names the AI Studio host on a vertex config:\n%s", got)
+			}
+		})
+	}
+}

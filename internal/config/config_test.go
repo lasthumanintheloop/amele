@@ -1246,16 +1246,14 @@ func TestGeminiWireRejectsDialect(t *testing.T) {
 	}
 }
 
-// TestGeminiRequiresAPIKey pins slice 1's one auth path: the AI Studio key.
-// The Gemini API has a second one - Vertex, with Google credentials - and it is
-// not built yet, so a `type: gemini` config with no key would otherwise reach
-// the wire as an unauthenticated request and come back a 401 from a run nobody
-// was watching. The message names the successor explicitly: an operator who
-// wanted Vertex must learn that here, not from a 401.
+// TestGeminiRequiresAPIKey pins the gemini wire's auth rule: one of the two
+// paths the API has must be named. Without either, a `type: gemini` config
+// would reach the wire as an unauthenticated request and come back a 401 from a
+// run nobody was watching, so both successors are named here rather than left
+// for the operator to infer from the refusal.
 //
-// The rule is deliberately NOT in the JSON Schema: it is a cross-field relation
-// (and Task 7 relaxes it to "api_key or vertex"), which the schema copies would
-// have to re-encode identically in three places.
+// The rule is deliberately NOT in the JSON Schema: it is a cross-field relation,
+// which the schema copies would have to re-encode identically in three places.
 func TestGeminiRequiresAPIKey(t *testing.T) {
 	base := func() *Config {
 		cfg := tuningBase(t.TempDir())
@@ -1267,9 +1265,9 @@ func TestGeminiRequiresAPIKey(t *testing.T) {
 	cfg := base()
 	err := cfg.Validate()
 	if err == nil {
-		t.Fatal("type gemini without api_key must be a config error")
+		t.Fatal("type gemini without api_key or vertex must be a config error")
 	}
-	const want = "gemini needs api_key (Vertex support lands with the vertex block)"
+	const want = "gemini needs api_key (AI Studio) or a vertex block (Vertex AI)"
 	if !strings.Contains(err.Error(), want) {
 		t.Errorf("error %q does not carry %q", err, want)
 	}
@@ -1278,6 +1276,14 @@ func TestGeminiRequiresAPIKey(t *testing.T) {
 	withKey.Provider.APIKey = "k"
 	if err := withKey.Validate(); err != nil {
 		t.Errorf("type gemini with an api_key must validate: %v", err)
+	}
+
+	// The relaxation this rule grew: a vertex block is the OTHER credential,
+	// so it satisfies the same requirement without an api_key.
+	withVertex := base()
+	withVertex.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+	if err := withVertex.Validate(); err != nil {
+		t.Errorf("type gemini with a vertex block must validate: %v", err)
 	}
 
 	// The rule is scoped to the gemini wire: a keyless openai-compatible config
@@ -1292,6 +1298,181 @@ func TestGeminiRequiresAPIKey(t *testing.T) {
 		if err := other.Validate(); err != nil {
 			t.Errorf("type %q without api_key must still validate: %v", typ, err)
 		}
+	}
+}
+
+// TestVertexValidation is the vertex block's whole rule set in one table.
+//
+// Every rule here exists because the alternative is a request that goes
+// somewhere the operator did not ask for: a missing project or location cannot
+// address a model at all, an api_key beside vertex names a credential that
+// endpoint refuses outright, and project/location are interpolated into the
+// URL - the location into the HOST - so their charset is a security boundary,
+// not a style preference.
+func TestVertexValidation(t *testing.T) {
+	tests := []struct {
+		name string
+		mut  func(*Config)
+		want string // "" means the config must validate
+	}{
+		{
+			name: "project and location are enough",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"} },
+		},
+		{
+			name: "global is a location like any other",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p", Location: "global"} },
+		},
+		{
+			name: "a credentials file may be named",
+			mut: func(c *Config) {
+				c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1", Credentials: "sa.json"}
+			},
+		},
+		{
+			name: "project is required",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Location: "us-central1"} },
+			want: "provider.vertex.project is required",
+		},
+		{
+			name: "location is required",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p"} },
+			want: "provider.vertex.location is required",
+		},
+		{
+			name: "an empty block names both missing fields",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{} },
+			want: "provider.vertex.project is required",
+		},
+		{
+			name: "api_key and vertex are alternatives, never companions",
+			mut: func(c *Config) {
+				c.Provider.APIKey = "k"
+				c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+			},
+			want: "provider.vertex must not be combined with provider.api_key",
+		},
+		{
+			name: "a location that could rewrite the host is refused",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p", Location: "evil.example.com/x"} },
+			want: "provider.vertex.location \"evil.example.com/x\" must be a lowercase region id",
+		},
+		{
+			name: "an upper-case location is refused",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p", Location: "US-CENTRAL1"} },
+			want: "must be a lowercase region id",
+		},
+		{
+			name: "a project that could climb the path is refused",
+			mut:  func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "../other", Location: "us-central1"} },
+			want: "provider.vertex.project \"../other\" must be a lowercase project id",
+		},
+		{
+			name: "base_url may override the host",
+			mut: func(c *Config) {
+				c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+				c.Provider.BaseURL = "https://vertex.restricted.example.com"
+			},
+		},
+		{
+			name: "base_url must not carry a path in vertex mode",
+			mut: func(c *Config) {
+				c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+				c.Provider.BaseURL = "https://proxy.example.com/vertex"
+			},
+			want: "must not include a path when provider.vertex is set",
+		},
+		{
+			name: "the /v1 habit is caught in vertex mode too",
+			mut: func(c *Config) {
+				c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+				c.Provider.BaseURL = "https://proxy.example.com/v1"
+			},
+			want: "must not include a path when provider.vertex is set",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tuningBase(t.TempDir())
+			cfg.Provider.Type = ProviderTypeGemini
+			cfg.Provider.BaseURL = ""
+			tt.mut(cfg)
+			err := cfg.Validate()
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("config must validate: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("want error containing %q, got none", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error %q does not carry %q", err, tt.want)
+			}
+		})
+	}
+}
+
+// TestVertexRequiresGeminiType: the block describes ONE wire's endpoint, so it
+// is refused rather than ignored anywhere else. An ignored block would be a
+// config that reads as a Vertex deployment and runs against OpenAI.
+func TestVertexRequiresGeminiType(t *testing.T) {
+	for _, typ := range []string{"", ProviderTypeOpenAI, ProviderTypeAnthropic} {
+		t.Run("type="+typ, func(t *testing.T) {
+			cfg := tuningBase(t.TempDir())
+			cfg.Provider.Type = typ
+			if typ == ProviderTypeAnthropic {
+				cfg.Provider.BaseURL = ""
+			}
+			cfg.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("a vertex block outside the gemini wire must be a config error")
+			}
+			const want = "provider.vertex is only valid with provider.type: gemini"
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not carry %q", err, want)
+			}
+		})
+	}
+}
+
+// TestLoadVertexBlock pins the YAML surface end to end: the block parses from
+// a file, ${VAR} interpolation reaches every field (project ids and locations
+// are per-environment values, which is exactly what the env indirection is
+// for), and the resulting config validates.
+func TestLoadVertexBlock(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, `
+model: gemini-3-pro
+provider:
+  type: gemini
+  vertex:
+    project: ${GCP_PROJECT}
+    location: ${GCP_LOCATION}
+    credentials: /etc/amele/sa.json
+workspace: `+dir+`
+`)
+	cfg, err := Load(path, envMap(map[string]string{
+		"GCP_PROJECT":  "my-project",
+		"GCP_LOCATION": "europe-west4",
+	}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.Vertex == nil {
+		t.Fatal("vertex block did not parse")
+	}
+	got := *cfg.Provider.Vertex
+	//nolint:gosec // G101: a service-account key PATH, not a credential.
+	want := VertexConfig{Project: "my-project", Location: "europe-west4", Credentials: "/etc/amele/sa.json"}
+	if got != want {
+		t.Errorf("vertex block = %+v, want %+v", got, want)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("loaded vertex config must validate: %v", err)
 	}
 }
 
