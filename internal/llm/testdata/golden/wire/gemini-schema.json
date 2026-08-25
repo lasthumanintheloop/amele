@@ -1,0 +1,1 @@
+{"contents":[{"role":"user","parts":[{"text":"scan today's log"}]}],"systemInstruction":{"parts":[{"text":"you are a log sentry"}]},"generationConfig":{"responseMimeType":"application/json","responseJsonSchema":{"type":"object","properties":{"ok":{"type":"boolean"}},"additionalProperties":false}}}

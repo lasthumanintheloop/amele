@@ -70,6 +70,71 @@ func SamplingNote(d Dialect, spec ReasoningSpec) string {
 	return "temperature/top_p: sent but ignored by deepseek in thinking mode (thinking is on by default)"
 }
 
+// GeminiSamplingNote is SamplingNote for the gemini wire: the caveat that
+// applies to a temperature the API will ACCEPT and honor but Google recommends
+// against, or "" when the value is the recommended one (or unset).
+//
+// It takes the VALUE rather than a Dialect because that is the thing it must
+// test - a dialect-keyed answer could not see whether the config named the
+// recommended default - and because gemini is a WIRE, not a dialect: setting
+// provider.dialect with type gemini is a validate error, so the dialect table
+// is never consulted on this path (the AnthropicReasoningNotes precedent).
+//
+// CONTRACT: the value is still SENT. Google's recommendation is guidance, not a
+// rejection, so amele does not second-guess a config that names a temperature;
+// the note is what keeps the trade-off visible in `amele explain` instead of
+// leaving a degraded run to be discovered from its output.
+func GeminiSamplingNote(temperature *float64) string {
+	if temperature == nil || *temperature == geminiRecommendedTemperature {
+		return ""
+	}
+	return "google recommends the default 1.0 on gemini 3 models; non-default may degrade output"
+}
+
+// geminiRecommendedTemperature is the value Google documents as the default for
+// the Gemini 3 family and recommends leaving alone.
+const geminiRecommendedTemperature = 1.0
+
+// GeminiReasoningNotes describes what the gemini wire makes of the neutral
+// reasoning knob, in the config's vocabulary, one line per decision. It is the
+// gemini-wire counterpart of ReasoningMapping.Notes.
+//
+// CONTRACT: the lines are derived from mapGeminiThinking's OWN return value,
+// never from a second reading of the spec. That is what makes the rounding of
+// an effort above high - and the dropped effort of a budget+effort config -
+// reportable: the client's mapping lives in one place, and this function only
+// puts words to its result.
+func GeminiReasoningNotes(spec ReasoningSpec) []string {
+	thinking := mapGeminiThinking(spec)
+	if thinking == nil {
+		// The config said nothing about reasoning; the model's own default
+		// stands and there is nothing to report.
+		return nil
+	}
+
+	var m ReasoningMapping
+	switch {
+	case thinking.ThinkingLevel != "" && thinking.ThinkingLevel == spec.Effort:
+		m.note("reasoning.effort: %s -> thinkingConfig.thinkingLevel: %s", spec.Effort, thinking.ThinkingLevel)
+	case thinking.ThinkingLevel != "":
+		// Rounded down, because this wire has nothing above high. Silence here
+		// would be exactly the "silently dropped" failure the design forbids.
+		m.note("reasoning.effort: %s -> thinkingConfig.thinkingLevel: %s (gemini has no level above high)", spec.Effort, thinking.ThinkingLevel)
+	case spec.BudgetTokens > 0:
+		m.note("reasoning.budget_tokens: %d -> thinkingConfig.thinkingBudget: %d", spec.BudgetTokens, *thinking.ThinkingBudget)
+		if spec.Effort != "" {
+			// The client dropped the effort (the budget won); the two fields
+			// cannot travel together on this wire.
+			m.note("reasoning.effort: %s not sent: the gemini wire takes a thinking level or a budget, not both", spec.Effort)
+		}
+	default:
+		// The only remaining mapping is effort: none, which is a zero budget
+		// here - and a 400 on Gemini 3, whose generation validate cannot know.
+		m.note("reasoning.effort: none -> thinkingConfig.thinkingBudget: 0 (gemini 3 models cannot disable thinking; this 400s there)")
+	}
+	return m.Notes
+}
+
 // AnthropicUnknownFieldPolicy is UnknownFieldPolicy for the Anthropic Messages
 // API, which is a WIRE rather than a dialect: the dialect is not consulted at
 // all on that path, so the report needs its own answer. The Messages API is

@@ -230,18 +230,75 @@ func gemWireCases() []gemWireCase {
 			},
 		},
 		{
-			// CONTRACT for the task boundary: the reasoning knob and the
-			// response format are NOT on this wire yet (Task 4 maps
-			// thinkingConfig/responseJsonSchema). A request carrying them must
-			// encode byte-identically to the baseline, so an accidental early
-			// emission breaks this golden.
-			name:   "task 4 knobs are not emitted yet",
-			golden: "gemini-baseline.json",
+			// The reasoning knob: an effort this wire HAS travels as a
+			// thinkingLevel of the same word, inside generationConfig.
+			name:   "reasoning effort becomes a thinking level",
+			golden: "gemini-thinking-high.json",
+			req: Request{
+				Model:     "gemini-3-pro",
+				Messages:  baseMessages(),
+				Reasoning: &ReasoningSpec{Effort: "high"},
+			},
+		},
+		{
+			// xhigh has no counterpart here - high is the deepest level this
+			// wire knows - so the request is byte-identical to the high case
+			// and the rounding is reported in the notes instead.
+			name:   "an effort above high rounds to high",
+			golden: "gemini-thinking-high.json",
+			req: Request{
+				Model:     "gemini-3-pro",
+				Messages:  baseMessages(),
+				Reasoning: &ReasoningSpec{Effort: "xhigh"},
+			},
+		},
+		{
+			// A budget passes through as thinkingBudget and sends NO level:
+			// the two fields together are a 400 on this wire.
+			name:   "reasoning budget becomes a thinking budget",
+			golden: "gemini-thinking-budget.json",
+			req: Request{
+				Model:     "gemini-3-pro",
+				Messages:  baseMessages(),
+				Reasoning: &ReasoningSpec{BudgetTokens: 2048},
+			},
+		},
+		{
+			// effort: none is the 2.5-era "thinking off" instruction, which
+			// this wire spells as a budget of zero. The pointer is what keeps
+			// the key on the wire: omitempty would drop the whole instruction.
+			name:   "reasoning effort none sends a zero budget",
+			golden: "gemini-thinking-off.json",
+			req: Request{
+				Model:     "gemini-3-pro",
+				Messages:  baseMessages(),
+				Reasoning: &ReasoningSpec{Effort: "none"},
+			},
+		},
+		{
+			// Structured output is a PAIR: the schema verbatim plus the JSON
+			// mime type. The schema is not sanitized (response schemas tolerate
+			// the keywords FunctionDeclaration.parameters rejects) and the
+			// format's Name has no field on this wire.
+			name:   "output schema and its mime type",
+			golden: "gemini-schema.json",
+			req: Request{
+				Model:    "gemini-3-pro",
+				Messages: baseMessages(),
+				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(
+					`{"type":"object","properties":{"ok":{"type":"boolean"}},"additionalProperties":false}`)},
+			},
+		},
+		{
+			// A format with no schema is plain JSON mode: the mime type alone,
+			// never an empty responseJsonSchema (a shape this API rejects).
+			// The validate+retry layer above is then what enforces the schema.
+			name:   "a schemaless format is plain json mode",
+			golden: "gemini-json-mode.json",
 			req: Request{
 				Model:          "gemini-3-pro",
 				Messages:       baseMessages(),
-				Reasoning:      &ReasoningSpec{Effort: "high"},
-				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
+				ResponseFormat: &ResponseFormat{Name: "amele_output"},
 			},
 		},
 	}

@@ -45,10 +45,10 @@ const (
 // Anthropic clients established - typed statusError routing, injected Sleep,
 // capped error snippets.
 //
-// SCOPE: this slice speaks conversations and tool calls, and round-trips the
-// thought signatures Gemini 3 signs its steps with. The
-// thinkingConfig/responseJsonSchema knobs declare their wire fields here but
-// are not emitted yet (Task 4); toWire says so at its site.
+// SCOPE: this slice speaks conversations, tool calls, the reasoning and
+// structured-output knobs, and round-trips the thought signatures Gemini 3
+// signs its steps with. What it does not speak is Vertex (a later slice): the
+// endpoint, the auth and a handful of body fields differ there.
 type GeminiClient struct {
 	// BaseURL is the API root without a trailing slash and WITHOUT the version
 	// segment, e.g. "https://generativelanguage.googleapis.com". Empty means
@@ -213,9 +213,10 @@ type gemGenerationConfig struct {
 	// it belongs to the object amele owns: were it left out, a params key could
 	// not be refused for it (GeminiOwnedWireFields owns generationConfig whole).
 	StopSequences []string `json:"stopSequences,omitempty"`
-	// ResponseMimeType and ResponseJSONSchema are the structured-output pair
-	// (Task 4); ThinkingConfig is the reasoning knob (Task 4). Declared here so
-	// the object's key order - and therefore every golden - is fixed once.
+	// ResponseMimeType and ResponseJSONSchema are the structured-output pair -
+	// the schema alone does nothing without the JSON mime type - and
+	// ThinkingConfig is the reasoning knob. Their declaration order fixes the
+	// object's key order, and therefore every golden.
 	ResponseMimeType   string          `json:"responseMimeType,omitempty"`
 	ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
 	ThinkingConfig     *gemThinking    `json:"thinkingConfig,omitempty"`
@@ -230,9 +231,13 @@ func (g gemGenerationConfig) empty() bool {
 		len(g.ResponseJSONSchema) == 0 && g.ThinkingConfig == nil
 }
 
-// gemThinking is the reasoning control object (Task 4 maps the neutral knob
-// onto it). ThinkingBudget is a pointer because 0 is the meaningful "turn
-// thinking off" value on the 2.5-era models, which omitempty would drop.
+// gemThinking is the reasoning control object (mapGeminiThinking maps the
+// neutral knob onto it). ThinkingBudget is a pointer because 0 is the
+// meaningful "turn thinking off" value on the 2.5-era models, which omitempty
+// would drop.
+//
+// CONTRACT: never both fields at once - the API answers a request carrying a
+// level AND a budget with a 400 (the signature table explains that one too).
 type gemThinking struct {
 	ThinkingLevel  string `json:"thinkingLevel,omitempty"`
 	ThinkingBudget *int   `json:"thinkingBudget,omitempty"`
@@ -302,27 +307,146 @@ type gemErrorEnvelope struct {
 // on the generateContent wire, the counterpart of errorSignatures on the OpenAI
 // wire and anthropicErrorSignatures on the Messages API.
 //
-// It is EMPTY in this slice, and deliberately so: every signature the design
-// names (a missing thought_signature, a thinkingLevel/thinkingBudget conflict,
-// "thinking cannot be disabled" on Gemini 3, an unknown responseJsonSchema
-// field) is advice about the REASONING knobs, which Task 4 owns. The parameter
-// is threaded through now so that task adds a table entry and nothing else.
-var geminiErrorSignatures []errorSignature
+// CONTRACT: these are STRING HEURISTICS by necessity (design doc §"Error-
+// signature detection") and the fixtures in gemini_reasoning_test.go are what
+// pin them. They are safe in a way a general string match is not, because they
+// change NOTHING but the human-facing text: no retry, no downgrade, no request
+// rewrite. A signature that stops matching (Google reworded its 400) costs a
+// hint, never correctness.
+//
+// Order matters - first match wins - so the generic unknown-field entry comes
+// last: the specific failures below it are all unknown-field or invalid-value
+// 400s too, and a generic "remove it from provider.params" would be the wrong
+// door for a key amele itself wrote.
+var geminiErrorSignatures = []errorSignature{
+	{
+		// A signed step reached the API without its signature. amele echoes
+		// the raw parts array precisely so this cannot happen
+		// (gemContent.MarshalJSON), which makes this 400 evidence of a bug
+		// HERE rather than a config mistake - so the advice asks for a report
+		// instead of naming a knob the operator could turn.
+		//
+		// The backticks are part of the match: they are how the API quotes the
+		// field, and requiring them keeps the entry off a 400 that merely
+		// mentions signatures in prose.
+		match:  func(e *statusError) bool { return strings.Contains(e.snippet, "missing a `thought_signature`") },
+		advice: "amele must echo signatures automatically - this is a bug, please report it with the session log",
+	},
+	{
+		// Both thinking fields in one request. Unreachable through validate,
+		// which refuses effort+budget (exit 2), but reachable when the second
+		// field came from provider.params - so the advice names the config
+		// pair rather than the wire fields.
+		match: func(e *statusError) bool {
+			return strings.Contains(e.snippet, "thinkingLevel") && strings.Contains(e.snippet, "thinkingBudget")
+		},
+		advice: "set only one of provider.reasoning.effort or budget_tokens",
+	},
+	{
+		// The Gemini 3 half of the effort: none mapping. Thinking cannot be
+		// switched off on that generation, and validate cannot know the model
+		// generation from the name (docs/engineering.md's no-model-name-tables
+		// rule), so the runtime 400 is where this becomes explainable.
+		match:  func(e *statusError) bool { return matchesGeminiCannotDisableThinking(e.snippet) },
+		advice: "this model cannot disable thinking; remove reasoning.effort: none",
+	},
+	{
+		// The catch-all for protobuf-JSON strictness: this API rejects any key
+		// it does not know, and the only key amele sends that it did not
+		// choose itself is a provider.params entry. The advice says "if",
+		// because the same 400 also names a field a future API version
+		// dropped.
+		match:  func(e *statusError) bool { return strings.Contains(e.snippet, "Unknown name") },
+		advice: "the gemini API rejects unknown fields; if this key came from provider.params, remove it",
+	},
+}
+
+// matchesGeminiCannotDisableThinking reports whether body is a "this model
+// always thinks" 400, in either wording the API uses: the numeric complaint
+// about a zero budget, and the prose form.
+//
+// The match is case-folded because the two phrasings differ in exactly that
+// (a sentence-initial "Thinking" versus "cannot disable thinking" mid-message),
+// and the prose form additionally requires the word "thinking" so an unrelated
+// "cannot be disabled" cannot claim the hint.
+func matchesGeminiCannotDisableThinking(body string) bool {
+	lower := strings.ToLower(body)
+	if strings.Contains(lower, "budget 0 is invalid") {
+		return true
+	}
+	if strings.Contains(lower, "cannot disable thinking") {
+		return true
+	}
+	return strings.Contains(lower, "thinking") && strings.Contains(lower, "cannot be disabled")
+}
+
+// rejectsResponseJSONSchema reports whether this failure looks like "I do not
+// support responseJsonSchema".
+//
+// The gemini counterpart of rejectsResponseFormat, and a heuristic for a
+// sharper reason than the OpenAI one: the design doc records an OPEN QUESTION
+// about this very field - the SDK documents responseJsonSchema while a newer
+// nested responseFormat shape appears elsewhere - and the live smoke (Task 6)
+// is what decides it. Until then the client sends the documented form and
+// treats a 400 naming it as capability discovery, so a wrong guess degrades to
+// validate+retry instead of failing every structured-output run.
+//
+// Both spellings are matched: the wire is camelCase, but this API's error text
+// echoes the protobuf field name in snake_case ("Unknown name
+// \"response_json_schema\"") depending on which form the request used.
+func (e *statusError) rejectsResponseJSONSchema() bool {
+	return e.code == http.StatusBadRequest &&
+		(strings.Contains(e.snippet, "responseJsonSchema") || strings.Contains(e.snippet, "response_json_schema"))
+}
 
 // Chat implements Provider. It retries 429 and 5xx with exponential backoff,
 // honoring the retry delay this API carries in the error BODY rather than in a
 // Retry-After header (design doc §"Gemini-specific mechanics" item 3).
 //
+// When the request carries a ResponseFormat and the API rejects the schema
+// field, Chat repeats the call once without it; see the fallback comment below.
+//
 // The retry loop mirrors the other two clients' rather than sharing a helper:
 // they evolve independently - each carries its own capability fallback for the
 // field its wire spells differently - and extracting the ~20 shared lines would
 // couple their futures for no robustness gain. What IS shared is the machinery
-// underneath: backoffDelay, statusFailure and encodeBody.
+// underneath: backoffDelay, statusFailure, shouldFallback and encodeBody.
 func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error) {
 	wire, fields := c.toWire(req)
 	body, err := encodeBody(wire, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encoding request: %v", ErrProvider, err)
+	}
+
+	// fallbackBody is the same request with the schema stripped, built up-front
+	// only when one was actually requested. Capability is rediscovered per Chat
+	// call rather than cached on the client (no global mutable state,
+	// docs/engineering.md §5.1); the cost - one extra 400 round-trip - is paid
+	// only by the combination of a schema and an endpoint that cannot honor it.
+	//
+	// The JSON mime type deliberately SURVIVES the strip: JSON mode alone still
+	// gets an answer the validate+retry layer above can check, and the 400 this
+	// fallback reacts to names the schema field, not the mime type.
+	//
+	// dropped remembers that every response produced after this point was
+	// generated without provider-native schema enforcement
+	// (Response.SchemaEnforcementDropped). A format that carried no schema is
+	// known to be in that state before the first request - plain JSON mode
+	// constrains nothing - so it is flagged immediately and there is nothing to
+	// probe for, the same reading the OpenAI client applies to its json_object
+	// dialects.
+	var fallbackBody []byte
+	dropped := false
+	if req.ResponseFormat != nil {
+		dropped = wire.GenerationConfig == nil || len(wire.GenerationConfig.ResponseJSONSchema) == 0
+		if !dropped {
+			// Mutating the already-encoded struct is safe: body holds its bytes.
+			wire.GenerationConfig.ResponseJSONSchema = nil
+			fallbackBody, err = encodeBody(wire, fields)
+			if err != nil {
+				return nil, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
+			}
+		}
 	}
 
 	attempts := c.MaxAttempts
@@ -344,7 +468,20 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 		}
 
 		resp, retryable, ra, err := c.doOnce(ctx, req.Model, body)
+		if shouldFallback(err, fallbackBody, (*statusError).rejectsResponseJSONSchema) {
+			// Capability discovery, not a transient failure: the API will
+			// reject the field just as firmly on the next attempt, so the
+			// schema-less repeat happens immediately, inside this same attempt.
+			// It therefore consumes no MaxAttempts budget (reserved for rate
+			// limits and 5xx) and no backoff sleep. Clearing fallbackBody bounds
+			// it to exactly one extra round-trip per Chat call; the stripped
+			// body is then used for any remaining retries too.
+			body, fallbackBody = fallbackBody, nil
+			dropped = true
+			resp, retryable, ra, err = c.doOnce(ctx, req.Model, body)
+		}
 		if err == nil {
+			resp.SchemaEnforcementDropped = dropped
 			return resp, nil
 		}
 		lastErr = err
@@ -567,10 +704,10 @@ func gemParts(raw json.RawMessage) ([]gemPart, error) {
 // reasons defensively, and inventing a translation here would hide new provider
 // states.
 //
-// MALFORMED_FUNCTION_CALL is the one reason that becomes an ERROR. The API
-// answers 200 with it, so nothing below this client would notice the turn
-// failed; the model produced a function call that cannot be parsed, and the
-// loop would see an empty answer and stop as if the task were done.
+// Two reasons become ERRORS instead. The API answers 200 with them, so nothing
+// below this client would notice the turn failed: the loop would take whatever
+// text arrived - or an empty answer - and stop as if the task were done, which
+// in an unattended cron run means exit 0 on a broken turn.
 func mapGeminiFinishReason(reason string) (string, error) {
 	switch reason {
 	case "STOP":
@@ -585,6 +722,14 @@ func mapGeminiFinishReason(reason string) (string, error) {
 		return "content_filter", nil
 	case "MALFORMED_FUNCTION_CALL":
 		return "", fmt.Errorf("%w: the model emitted a malformed function call (finish reason MALFORMED_FUNCTION_CALL); simplify the tool's parameter schema or retry the run", ErrProvider)
+	case "MISSING_THOUGHT_SIGNATURE":
+		// CONTRACT: this is the 200-shaped form of the failure the signature
+		// table explains on the 4xx path - the API can report it EITHER way, and
+		// only the error table would see the 4xx one. amele echoes the raw parts
+		// array precisely so neither can happen (gemContent.MarshalJSON), which
+		// makes this amele's bug rather than the operator's; and a turn that
+		// carried a plausible-looking answer alongside it would otherwise exit 0.
+		return "", fmt.Errorf("%w: the model's step is missing a thought signature (finish reason MISSING_THOUGHT_SIGNATURE); amele echoes thought signatures automatically - this is a bug; please report it with the session log", ErrProvider)
 	default:
 		return strings.ToLower(reason), nil
 	}
@@ -637,12 +782,6 @@ func parseGoogleRetryDelay(details []json.RawMessage) time.Duration {
 // CONTRACT: params keys cannot collide with the fields amele owns - config
 // validation rejects that at exit 2 (GeminiOwnedWireFields) - so merging them
 // needs no further defense here.
-//
-// SCOPE: req.Reasoning and req.ResponseFormat are deliberately NOT read. They
-// need the thinkingConfig/responseJsonSchema mapping (Task 4); emitting a
-// half-mapped field would be a 400 in production rather than a missing feature.
-// No config can reach this client before that task lands, because the cmd
-// wiring is Task 5.
 func (c *GeminiClient) toWire(req Request) (gemRequest, map[string]json.RawMessage) {
 	var b gemBuilder
 	for _, m := range req.Messages {
@@ -887,21 +1026,109 @@ func (out *gemRequest) applyTools(defs []ToolDef) {
 	out.Tools = []gemTool{{FunctionDeclarations: decls}}
 }
 
-// applyKnobs maps the cap and sampling knobs into generationConfig, which is
-// sent only when it would carry something.
+// geminiJSONMimeType is the responseMimeType that turns on JSON mode. The
+// schema field does nothing without it: the pair is what constrains decoding.
+const geminiJSONMimeType = "application/json"
+
+// applyKnobs maps the cap, sampling, structured-output and reasoning knobs into
+// generationConfig, which is sent only when it would carry something.
 func (out *gemRequest) applyKnobs(req Request) {
 	config := gemGenerationConfig{
 		MaxOutputTokens: max(req.MaxOutputTokens, 0),
 		// Sampling is passed through as given. Google recommends the default
 		// 1.0 on Gemini 3 but does not reject other values, so amele sends what
-		// the config asked for and `explain` carries the warning.
+		// the config asked for and `explain` carries the warning
+		// (GeminiSamplingNote).
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
+	}
+	if req.ResponseFormat != nil {
+		config.applyResponseFormat(*req.ResponseFormat)
+	}
+	if req.Reasoning != nil {
+		config.ThinkingConfig = mapGeminiThinking(*req.Reasoning)
 	}
 	if config.empty() {
 		return
 	}
 	out.GenerationConfig = &config
+}
+
+// applyResponseFormat turns on JSON mode and hands the schema to the API
+// verbatim.
+//
+// CONTRACT: the schema is NOT sanitized, unlike a tool's parameters. Those are
+// an OpenAPI-3.0 subset that 400s on an unknown keyword; a RESPONSE schema is
+// read as JSON Schema and tolerates the keywords amele's own output.schema
+// carries, so stripping them here would weaken the constraint the operator
+// asked for. The format's Name has no field on this wire at all - only the
+// OpenAI-compatible response_format names its schema.
+//
+// An empty schema sends the mime type alone: that is plain JSON mode, which the
+// validate+retry layer above can still work with, whereas an empty
+// responseJsonSchema would be a shape this API rejects.
+//
+// TODO(#17): the design doc records an OPEN QUESTION here - the SDK documents
+// responseJsonSchema while a newer nested responseFormat shape appears
+// elsewhere. The documented form is what ships; the live smoke (plan task 6) is
+// the decider, and until then a 400 naming the field degrades through the
+// fallback in Chat rather than failing the run.
+func (g *gemGenerationConfig) applyResponseFormat(format ResponseFormat) {
+	g.ResponseMimeType = geminiJSONMimeType
+	if len(bytes.TrimSpace(format.Schema)) == 0 {
+		return
+	}
+	g.ResponseJSONSchema = format.Schema
+}
+
+// mapGeminiThinking translates the neutral reasoning knob into this wire's
+// thinkingConfig object, or nil when the config asked for nothing (the model's
+// own default then stands). It is a pure function - the same spec always yields
+// the same object - which is what lets GeminiReasoningNotes describe a request
+// before it is sent without reading the spec a second time.
+//
+// The level vocabulary here is low/medium/high, a SUBSET of the neutral union,
+// so xhigh and max round DOWN to high - the opposite direction from the
+// openai-wire dialects, which round up. There is nothing above high on this
+// wire to round to, and the rounding is reported in the notes rather than
+// hidden.
+//
+// CONTRACT: a BudgetTokens wins over an Effort, and the two never travel
+// together - the API rejects a request carrying both fields. The combination is
+// already a validate error (exit 2), so this precedence is a defense against an
+// impossible spec, not a reachable policy; the dropped effort is reported by
+// GeminiReasoningNotes so it can never be silent.
+func mapGeminiThinking(spec ReasoningSpec) *gemThinking {
+	if spec.BudgetTokens > 0 {
+		budget := spec.BudgetTokens
+		return &gemThinking{ThinkingBudget: &budget}
+	}
+	switch spec.Effort {
+	case "":
+		return nil
+	case effortNone:
+		// "Thinking off" is spelled as a zero budget on this wire. It works on
+		// the 2.5-era models and 400s on Gemini 3, which cannot disable
+		// thinking - a difference validate cannot see (it would have to key on
+		// the model NAME), so the error-signature table explains it at runtime.
+		zero := 0
+		return &gemThinking{ThinkingBudget: &zero}
+	default:
+		return &gemThinking{ThinkingLevel: geminiThinkingLevel(spec.Effort)}
+	}
+}
+
+// geminiThinkingLevel rounds the neutral effort onto the low/medium/high levels
+// this wire knows. Unknown values pass through untouched: the vocabulary is
+// validated in config, and inventing a level for an unrecognized one would hide
+// a typo the API's own 400 names precisely.
+func geminiThinkingLevel(effort string) string {
+	switch effort {
+	case "xhigh", "max":
+		return "high"
+	default:
+		return effort
+	}
 }
 
 // endpoint builds the versioned generateContent URL for one model.
