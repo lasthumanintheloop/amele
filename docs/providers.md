@@ -232,13 +232,73 @@ vertex mode `base_url` overrides the **host only** (a VPC-SC restricted VIP or a
 Private Service Connect name); a path written next to it is exit 2 rather than a
 prefix that silently disappears.
 
-The token source itself lands in the next slice; until it does, a `vertex:` run
-stops at the credential.
+**The credential.** With `credentials:` set, amele signs a JWT with that
+service-account key file and exchanges it for an access token at the `token_uri`
+**the file itself names** - not a hardcoded endpoint. With `credentials:`
+omitted, amele walks the standard Application Default Credentials chain, in this
+order:
 
-`base_url` is optional (the client knows `generativelanguage.googleapis.com`)
-and must **not** carry the version segment: amele appends
-`/v1beta/models/{model}:generateContent` itself, so a `base_url` ending in
-`/v1beta` or `/v1` is exit 2 rather than a 404 at 03:00.
+1. the `GOOGLE_APPLICATION_CREDENTIALS` environment variable,
+2. the file `gcloud auth application-default login` writes
+   (`~/.config/gcloud/application_default_credentials.json`),
+3. the attached service account, from the metadata server (GCE, GKE, Cloud Run).
+
+`credentials:` is the only knob amele adds; the rest of that chain is Google's
+own contract, which is also where workload identity federation lives - a WIF or
+impersonation file is a valid `GOOGLE_APPLICATION_CREDENTIALS` target, while
+`credentials:` accepts a `service_account` key file and nothing else, so that a
+key file cannot smuggle in an `external_account` that runs an executable. Access
+tokens are registered as run secrets before they are used, so a token cannot
+reach a session log; `amele explain` prints which mode a config resolves to and
+the path it will read, never a token and never a byte of the file.
+
+**IAM prerequisites.** The principal needs `roles/aiplatform.user` on the
+project, and `aiplatform.googleapis.com` must be enabled on it. gcloud **user**
+credentials additionally need `serviceusage.services.use` (Service Usage
+Consumer), because amele sends `x-goog-user-project` with those - the header
+Google requires when a user-credential call has to name the project that is
+billed and quota-tracked. If a 401 or 403 comes back, amele appends exactly this
+vocabulary to the error: the role, the API, the project, the location and the
+credential sources it searched.
+
+That header is amele's own contract, so it is worth stating plainly: it is sent
+**only** for `authorized_user`-family credentials, and its value is always
+`provider.vertex.project` - the project the URL already addresses and the one
+being billed. Google's libraries prefer the credential file's
+`quota_project_id` when it carries one; amele does not, so that your YAML stays
+the single answer to "which project pays for this run". Sending it
+unconditionally would be worse than either: a service account holding only
+`roles/aiplatform.user` does not have `serviceusage.services.use`, and the
+header would turn a working deployment into a 403. (The deviation is deliberate;
+it has not yet been confirmed against a gcloud ADC whose `quota_project_id`
+differs from the configured project.)
+
+**Express-mode API keys do not work here.** Google documents an API-key form of
+the Vertex endpoint; the live service answers it with
+`401 "API keys are not supported by this API."` for both `:generateContent` and
+`:streamGenerateContent`. That was reproduced twice against the real service
+while this was designed, and it is corroborated by public reports - it is the
+generic "this method has no API-key auth" reply, not "bad key". So amele refuses
+`api_key` next to `vertex` at validate (exit 2), and if you aim the AI Studio
+half at a Vertex host instead, that 401 comes back with the advice attached.
+
+**Project and location are held to a strict charset** - lowercase letters,
+digits and hyphens - because they become a hostname and URL path segments. That
+refuses the legacy domain-scoped project ids (`google.com:my-project`) that some
+pre-2015 projects still carry; use the project **number** there, which addresses
+the same project and is a valid segment. The trade is deliberate: the value that
+decides which host your prompt is sent to does not get a permissive gate.
+
+Skipping the token exchange entirely with a self-signed JWT would save a round
+trip per refresh, but whether Vertex accepts a *regional* audience for one is
+unverified, so amele parks it as a spike rather than guessing.
+
+On the AI Studio half, `base_url` is optional (the client knows
+`generativelanguage.googleapis.com`) and must **not** carry the version segment:
+amele appends `/v1beta/models/{model}:generateContent` itself, so a `base_url`
+ending in `/v1beta` or `/v1` is exit 2 rather than a 404 at 03:00. In vertex mode
+that same field means the host and only the host, as above, and the version there
+is `v1`.
 
 | config | request |
 | --- | --- |
@@ -363,6 +423,45 @@ first-party host and appends the version itself. Swap `effort` for
 agent has tools, run `amele explain` once and read the `tool schemas:` rows:
 they list every JSON Schema keyword this API cannot carry, per tool, before the
 first request pays for the discovery.
+
+### Gemini (Vertex AI)
+
+```yaml
+model: gemini-3.5-flash
+provider:
+  type: gemini                    # native generateContent; Vertex needs no api_key
+  vertex:
+    project: my-project           # the project id, or its NUMBER
+    location: europe-west2        # never rewritten: this is where the prompt is processed
+  max_output_tokens: 8192         # leave room: thinking is billed here too
+  reasoning: {effort: medium}
+```
+
+There is no key on this half: authenticate with `gcloud auth
+application-default login`, or `GOOGLE_APPLICATION_CREDENTIALS`, or
+`vertex.credentials: /path/sa-key.json`. Grant the principal
+`roles/aiplatform.user`, enable `aiplatform.googleapis.com`, then run
+`amele explain` and read the two rows that answer the questions the YAML cannot:
+
+```
+  vertex endpoint: https://europe-west2-aiplatform.googleapis.com/v1/projects/my-project/locations/europe-west2/publishers/google/models/gemini-3.5-flash:generateContent
+  vertex auth:     application default credentials (GOOGLE_APPLICATION_CREDENTIALS, then gcloud user credentials, then the metadata server)
+```
+
+Pick the location deliberately. Model availability is **per model** and much
+narrower than the list of Vertex regions - `gemini-3.5-flash` is not served in
+`us-central1` at all, and some models are served only on `global` - so take the
+locations from your model's own page. `global` improves availability and reduces
+429s, but it gives up any control over where the prompt is processed; the `us`
+and `eu` multi-regions keep processing inside that jurisdiction. Whatever you
+put here is what amele sends: a location that cannot serve the model surfaces as
+the API's own loud error, never as a silent reroute - and a 404 from this
+endpoint carries advice naming both candidates, the model id and the location.
+
+Behind a VPC Service Controls perimeter, point `base_url` at the restricted VIP
+or Private Service Connect name; it replaces the host and nothing else, and the
+project/location path is still built from the `vertex:` block. Note that Private
+Google Access does not work with the `us`/`eu` multi-region hostnames.
 
 ### DeepSeek (native)
 
