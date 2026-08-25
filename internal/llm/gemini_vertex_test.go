@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -417,6 +418,35 @@ func TestVertexTokenFailureIsNotRetried(t *testing.T) {
 	}
 	if source.calls != 1 {
 		t.Errorf("the failing token source was called %d times, want 1", source.calls)
+	}
+}
+
+// TestVertexCredentialErrorIsNotDoubleWrapped: GoogleTokenSource already
+// returns fully-formed ErrProvider messages naming the credential source, so
+// authorize wrapping them again produced "provider error: obtaining a google
+// access token: provider error: obtaining a google access token from ...".
+//
+// The pass-through is conditional on the sentinel: a THIRD-party token source
+// (the interface is exported) returns a bare error, and that one still has to
+// be wrapped or it would not be an ErrProvider at all - the case
+// TestVertexTokenFailureIsNotRetried above covers.
+func TestVertexCredentialErrorIsNotDoubleWrapped(t *testing.T) {
+	source := &fakeTokenSource{err: fmt.Errorf("%w: obtaining a google access token from application default credentials: expired", ErrProvider)}
+	client := &GeminiClient{
+		BaseURL:     "https://example.invalid",
+		Vertex:      &VertexTarget{Project: "p", Location: "us-central1"},
+		TokenSource: source,
+		Sleep:       failingSleep(t),
+	}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if !errors.Is(err, ErrProvider) {
+		t.Fatalf("err: got %v, want a provider error", err)
+	}
+	if got := strings.Count(err.Error(), "provider error"); got != 1 {
+		t.Errorf("error is wrapped %d times, want 1:\n%s", got, err)
+	}
+	if got := strings.Count(err.Error(), "obtaining a google access token"); got != 1 {
+		t.Errorf("the token-acquisition prefix appears %d times, want 1:\n%s", got, err)
 	}
 }
 

@@ -689,6 +689,20 @@ func TestParseGoogleRetryDelay(t *testing.T) {
 			"detail is not an object", `"oops"`, 0,
 		},
 		{"negative duration", `{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "-3s"}`, 0},
+		{
+			// CONTRACT: an unusable detail is skipped, not an answer about the
+			// ones behind it. Returning 0 here discarded a well-formed wish.
+			"a good retry info behind a bad one",
+			`{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "soon"},` +
+				`{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "5s"}`,
+			5 * time.Second,
+		},
+		{
+			"a good retry info behind a non-positive one",
+			`{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "0s"},` +
+				`{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "2s"}`,
+			2 * time.Second,
+		},
 		{"no details", ``, 0},
 	}
 	for _, tt := range tests {
@@ -759,6 +773,137 @@ func TestGeminiRetryDelayHonored(t *testing.T) {
 				t.Errorf("delays: got %v want %v", delays, tt.want)
 			}
 		})
+	}
+}
+
+// TestGeminiRefusesRedirects is the credential-leak guard on this wire.
+//
+// SECURITY: Go's redirect follower drops the Authorization header across hosts
+// but preserves every CUSTOM header, so an x-goog-api-key would follow a 302 to
+// wherever it pointed. generateContent never redirects, so nothing legitimate
+// is lost by refusing: the 3xx surfaces as the status failure it is, and the
+// key stays on the host the config named. (The MCP transport refuses redirects
+// for the same reason.)
+func TestGeminiRefusesRedirects(t *testing.T) {
+	var elsewhereHits int
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhereHits++
+		if r.Header.Get("x-goog-api-key") != "" {
+			t.Errorf("the api key followed a redirect to another host")
+		}
+		_, _ = w.Write([]byte(gemOKBody("stolen")))
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+r.URL.Path, http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &GeminiClient{BaseURL: srv.URL, APIKey: "k", Sleep: failingSleep(t)}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if !errors.Is(err, ErrProvider) {
+		t.Fatalf("err: got %v, want a provider error", err)
+	}
+	var se *statusError
+	if !errors.As(err, &se) {
+		t.Fatalf("err %v is not a statusError", err)
+	}
+	if se.code != http.StatusFound {
+		t.Errorf("code: got %d, want 302 (the redirect itself is the answer)", se.code)
+	}
+	if elsewhereHits != 0 {
+		t.Errorf("the redirect was followed %d times", elsewhereHits)
+	}
+}
+
+// TestGeminiRetryInfoBeyondTheDisplaySnippet: the retry wish lives in the same
+// body as the error text, but the two are read with DIFFERENT bounds. A 429
+// from this API carries its quota violations first and the RetryInfo detail
+// last, so a body cut at the 2 KiB display snippet no longer parsed as JSON and
+// the endpoint's own wish was lost - silently, since the exponential ladder
+// then stood in for it.
+func TestGeminiRetryInfoBeyondTheDisplaySnippet(t *testing.T) {
+	// Comfortably past maxErrorBody, and shaped like the real thing: the quota
+	// violations come first.
+	violations := strings.Repeat(`{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+		"violations": [{"subject": "`+strings.Repeat("q", 200)+`", "description": "quota exceeded"}]},`, 20)
+	details := violations + `{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "7s"}`
+
+	var calls int
+	srv := geminiServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			body := gemErrorBody(429, "RESOURCE_EXHAUSTED", "quota exceeded", details)
+			if len(body) <= maxErrorBody {
+				t.Fatalf("fixture is only %d bytes: it must exceed the %d-byte display snippet", len(body), maxErrorBody)
+			}
+			_, _ = w.Write([]byte(body))
+			return
+		}
+		_, _ = w.Write([]byte(gemOKBody("ok")))
+	})
+
+	var delays []time.Duration
+	client := &GeminiClient{BaseURL: srv.URL, InitialBackoff: 200 * time.Millisecond, Sleep: recordDelays(&delays)}
+	resp, err := client.Chat(context.Background(), gemUserRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Message.Content != "ok" {
+		t.Errorf("content: got %q", resp.Message.Content)
+	}
+	if !slices.Equal(delays, []time.Duration{7 * time.Second}) {
+		t.Errorf("delays: got %v, want [7s] (the RetryInfo past the snippet)", delays)
+	}
+}
+
+// TestGeminiRetryInfoAfterAnUnreadableDetail: one detail that cannot be read is
+// not an answer about the others. The scan used to return 0 - "no wish" - the
+// moment a RetryInfo carried an unparseable duration, so a second, well-formed
+// one behind it was never reached.
+func TestGeminiRetryInfoAfterAnUnreadableDetail(t *testing.T) {
+	details := `{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "soon"},` +
+		`{"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "5s"}`
+
+	var calls int
+	srv := geminiServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(gemErrorBody(429, "RESOURCE_EXHAUSTED", "quota exceeded", details)))
+			return
+		}
+		_, _ = w.Write([]byte(gemOKBody("ok")))
+	})
+
+	var delays []time.Duration
+	client := &GeminiClient{BaseURL: srv.URL, InitialBackoff: 200 * time.Millisecond, Sleep: recordDelays(&delays)}
+	if _, err := client.Chat(context.Background(), gemUserRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(delays, []time.Duration{5 * time.Second}) {
+		t.Errorf("delays: got %v, want [5s] (the second detail is still an answer)", delays)
+	}
+}
+
+// TestGeminiErrorSnippetStaysBounded: reading further for the RetryInfo must
+// not widen what a misbehaving endpoint can print into the operator's logs.
+func TestGeminiErrorSnippetStaysBounded(t *testing.T) {
+	srv := geminiServer(t, func(w http.ResponseWriter, _ map[string]any) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(strings.Repeat("x", 4*maxErrorBody)))
+	})
+
+	client := &GeminiClient{BaseURL: srv.URL, Sleep: failingSleep(t)}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	var se *statusError
+	if !errors.As(err, &se) {
+		t.Fatalf("err %v is not a statusError", err)
+	}
+	if len(se.snippet) > maxErrorBody {
+		t.Errorf("snippet is %d bytes, want at most %d", len(se.snippet), maxErrorBody)
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"net/http"
@@ -439,6 +440,18 @@ type gemCandidate struct {
 	FinishReason string `json:"finishReason"`
 }
 
+// maxGeminiErrorBody bounds how much of an error body this client reads to look
+// for the google.rpc.RetryInfo detail.
+//
+// It is deliberately larger than maxErrorBody, the DISPLAY bound: a real 429
+// from this API lists its quota violations before the retry delay, so the one
+// field worth machine-reading routinely sits past the 2 KiB an operator is
+// shown. The two bounds answer different questions - how much may be printed,
+// and how far the parser may look - and 64 KiB is small enough that a
+// misbehaving endpoint still cannot make this client hold a body it did not ask
+// for.
+const maxGeminiErrorBody = 64 << 10 // 64 KiB
+
 // gemErrorEnvelope is the google.rpc error body every non-2xx reply carries.
 // Details are kept raw: only the RetryInfo entry is read (parseGoogleRetryDelay)
 // and the rest are shapes this client has no reason to model.
@@ -721,6 +734,15 @@ func (c *GeminiClient) authorize(ctx context.Context, req *http.Request) error {
 	}
 	token, err := c.TokenSource.Token(ctx)
 	if err != nil {
+		// amele's own source (GoogleTokenSource) already returns a
+		// fully-formed ErrProvider naming the credential it tried and what
+		// failed, so wrapping it again produced the prefix twice. A THIRD-party
+		// source - the interface is exported - returns a bare error that still
+		// has to be typed, or the failure would not read as a provider error at
+		// all.
+		if errors.Is(err, ErrProvider) {
+			return err
+		}
 		return fmt.Errorf("%w: obtaining a google access token: %v", ErrProvider, err)
 	}
 	if token == "" {
@@ -857,14 +879,18 @@ func geminiBackendAdvice(code int, body string, vertex *VertexTarget) string {
 // the BODY as a google.rpc.RetryInfo detail rather than in a Retry-After
 // header.
 func (c *GeminiClient) failure(httpResp *http.Response) (*Response, bool, time.Duration, error) {
+	// The body is read HERE, under the larger of the two bounds, because the
+	// two consumers want different amounts of it and the reader can only be
+	// drained once. statusFailure then takes its display snippet from a copy,
+	// so what an operator sees is still capped at maxErrorBody.
+	body, _ := io.ReadAll(io.LimitReader(httpResp.Body, maxGeminiErrorBody))
+	snippetSource := *httpResp
+	snippetSource.Body = io.NopCloser(bytes.NewReader(body))
+
 	// Shared with the other clients: same retry band (429 and every 5xx), same
 	// typed statusError, same header reading - only the error-signature table
 	// and the body-borne delay below differ.
-	retryable, retryAfter, err := statusFailure(httpResp, geminiErrorSignatures)
-	// One errors.As for both gemini-specific steps. The snippet statusFailure
-	// already read is the ONLY copy of the body - it consumed the reader - so
-	// everything below reads it from the typed error rather than from the
-	// response.
+	retryable, retryAfter, err := statusFailure(&snippetSource, geminiErrorSignatures)
 	var se *statusError
 	if errors.As(err, &se) {
 		// The backend-aware advice is appended here rather than through the
@@ -873,16 +899,19 @@ func (c *GeminiClient) failure(httpResp *http.Response) (*Response, bool, time.D
 		if advice := geminiBackendAdvice(se.code, se.snippet, c.Vertex); advice != "" {
 			err = fmt.Errorf("%w — %s", err, advice)
 		}
-		if retryable && retryAfter == 0 {
-			// This wire carries the retry delay in the BODY as a
-			// google.rpc.RetryInfo detail, not in a Retry-After header. A body
-			// truncated at maxErrorBody no longer parses as JSON and simply
-			// yields no wish - the exponential ladder then stands, which is the
-			// same outcome as an endpoint that sent no RetryInfo at all.
-			var env gemErrorEnvelope
-			if json.Unmarshal([]byte(se.snippet), &env) == nil {
-				retryAfter = parseGoogleRetryDelay(env.Error.Details)
-			}
+	}
+	if retryable && retryAfter == 0 {
+		// This wire carries the retry delay in the BODY as a
+		// google.rpc.RetryInfo detail, not in a Retry-After header - and this
+		// API puts its quota violations FIRST, so on a real 429 the RetryInfo
+		// detail sits past the 2 KiB display snippet. Parsing that snippet meant
+		// parsing truncated JSON, which failed and silently discarded the
+		// endpoint's own wish in favour of the exponential ladder. A body longer
+		// than maxGeminiErrorBody still yields no wish, which is the same
+		// outcome as an endpoint that sent no RetryInfo at all.
+		var env gemErrorEnvelope
+		if json.Unmarshal(body, &env) == nil {
+			retryAfter = parseGoogleRetryDelay(env.Error.Details)
 		}
 	}
 	return nil, retryable, retryAfter, err
@@ -1094,9 +1123,12 @@ const googleRetryInfoType = "google.rpc.RetryInfo"
 // Retry-After header, and the delay arrives in the error body instead (design
 // doc §"Gemini-specific mechanics" item 3). The value is a protobuf Duration in
 // its JSON form - seconds with an optional fraction and a trailing "s" ("3s",
-// "3.5s") - which time.ParseDuration reads directly. Anything unparseable,
-// zero or negative yields 0 so the exponential ladder stands; the caller caps
-// whatever comes back (maxRetryAfter).
+// "3.5s") - which time.ParseDuration reads directly. A detail that is
+// unparseable, zero or negative is SKIPPED rather than ending the scan: one
+// unreadable entry says nothing about the ones behind it, and treating it as
+// the answer discarded a well-formed RetryInfo that followed. Details that
+// carry no usable wish at all yield 0, so the exponential ladder stands; the
+// caller caps whatever comes back (maxRetryAfter).
 //
 // The type URL is matched by SUFFIX because the prefix is a registry host
 // ("type.googleapis.com/") that is not part of the identity of the message.
@@ -1114,7 +1146,7 @@ func parseGoogleRetryDelay(details []json.RawMessage) time.Duration {
 		}
 		delay, err := time.ParseDuration(strings.TrimSpace(detail.RetryDelay))
 		if err != nil || delay <= 0 {
-			return 0
+			continue
 		}
 		return delay
 	}
@@ -1648,7 +1680,19 @@ func (c *GeminiClient) httpClient() *http.Client {
 	}
 	// A fresh Client per call is cheap: it shares http.DefaultTransport, so
 	// connection pooling is preserved.
-	return &http.Client{Timeout: c.requestTimeout()}
+	return &http.Client{
+		Timeout: c.requestTimeout(),
+		// SECURITY: redirects are never followed. Go's follower strips the
+		// Authorization header when the host changes, but it PRESERVES custom
+		// headers - and this wire's AI Studio credential is the custom header
+		// x-goog-api-key, so a 302 from a compromised or misconfigured proxy
+		// would hand the key to whatever host it named. Nothing legitimate is
+		// lost: generateContent answers a POST directly on both backends, so a
+		// 3xx here is already an anomaly, and returning it makes it a visible
+		// status failure instead of a silent hop. The MCP HTTP transport
+		// refuses redirects for the same reason.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // requestTimeout returns the effective per-request ceiling, for both the client
