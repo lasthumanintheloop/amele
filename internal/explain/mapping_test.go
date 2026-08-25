@@ -206,14 +206,23 @@ func TestProviderMappingRows(t *testing.T) {
 				c.Provider.MaxOutputTokens = 4096
 				c.Provider.Reasoning = &config.ReasoningConfig{Effort: "xhigh"}
 				c.Provider.Temperature = ptrFloat(0.2)
+				c.Provider.TopP = ptrFloat(0.9)
 			},
 			want: []string{
 				"max_output_tokens: 4096 -> generationConfig.maxOutputTokens: 4096",
-				"reasoning.effort: xhigh -> thinkingConfig.thinkingLevel: high (gemini has no level above high)",
-				"temperature: 0.2 -> temperature: 0.2",
+				"reasoning.effort: xhigh -> generationConfig.thinkingConfig.thinkingLevel: high (gemini has no level above high)",
+				// The sampling knobs live under generationConfig here too, and
+				// `top_p` is not a spelling this API accepts ANYWHERE: a report
+				// that printed it would hand the operator a params key worth a
+				// 400 - the very 400 the next row warns about.
+				"temperature: 0.2 -> generationConfig.temperature: 0.2",
+				"top_p: 0.9 -> generationConfig.topP: 0.9",
 				"google recommends the default 1.0 on gemini 3 models; non-default may degrade output",
 			},
-			notWant: []string{"max_completion_tokens", "reasoning_effort", "dialect:"},
+			notWant: []string{
+				"max_completion_tokens", "reasoning_effort", "dialect:",
+				"-> temperature:", "-> top_p:",
+			},
 		},
 		{
 			// The note is about the VALUE, not about the wire: the recommended
@@ -224,7 +233,7 @@ func TestProviderMappingRows(t *testing.T) {
 				c.Provider.Type = config.ProviderTypeGemini
 				c.Provider.Temperature = ptrFloat(1)
 			},
-			want:    []string{"temperature: 1 -> temperature: 1"},
+			want:    []string{"temperature: 1 -> generationConfig.temperature: 1"},
 			notWant: []string{"google recommends"},
 		},
 		{
@@ -264,7 +273,7 @@ func TestProviderMappingRows(t *testing.T) {
 				c.Provider.Type = config.ProviderTypeGemini
 				c.Provider.Reasoning = &config.ReasoningConfig{BudgetTokens: 8192}
 			},
-			want: []string{"reasoning.budget_tokens: 8192 -> thinkingConfig.thinkingBudget: 8192"},
+			want: []string{"reasoning.budget_tokens: 8192 -> generationConfig.thinkingConfig.thinkingBudget: 8192"},
 		},
 		{
 			// An empty reasoning block is what `--set provider.reasoning.effort=`

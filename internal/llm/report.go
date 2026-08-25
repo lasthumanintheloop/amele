@@ -110,6 +110,13 @@ const geminiRecommendedTemperature = 1.0
 // an effort above high - and the dropped effort of a budget+effort config -
 // reportable: the client's mapping lives in one place, and this function only
 // puts words to its result.
+//
+// The wire fields are named FULLY QUALIFIED from the body root
+// ("generationConfig.thinkingConfig.thinkingLevel"), which is the convention
+// every gemini-wire row in the report follows. A bare "thinkingConfig..." would
+// read as a top-level key, and a reader who copied it into provider.params -
+// which merges at the ROOT on this wire - would buy the strict-protobuf 400 the
+// params row warns about.
 func GeminiReasoningNotes(spec ReasoningSpec) []string {
 	thinking := mapGeminiThinking(spec)
 	if thinking == nil {
@@ -121,13 +128,13 @@ func GeminiReasoningNotes(spec ReasoningSpec) []string {
 	var m ReasoningMapping
 	switch {
 	case thinking.ThinkingLevel != "" && thinking.ThinkingLevel == spec.Effort:
-		m.note("reasoning.effort: %s -> thinkingConfig.thinkingLevel: %s", spec.Effort, thinking.ThinkingLevel)
+		m.note("reasoning.effort: %s -> generationConfig.thinkingConfig.thinkingLevel: %s", spec.Effort, thinking.ThinkingLevel)
 	case thinking.ThinkingLevel != "":
 		// Rounded down, because this wire has nothing above high. Silence here
 		// would be exactly the "silently dropped" failure the design forbids.
-		m.note("reasoning.effort: %s -> thinkingConfig.thinkingLevel: %s (gemini has no level above high)", spec.Effort, thinking.ThinkingLevel)
+		m.note("reasoning.effort: %s -> generationConfig.thinkingConfig.thinkingLevel: %s (gemini has no level above high)", spec.Effort, thinking.ThinkingLevel)
 	case spec.BudgetTokens > 0:
-		m.note("reasoning.budget_tokens: %d -> thinkingConfig.thinkingBudget: %d", spec.BudgetTokens, *thinking.ThinkingBudget)
+		m.note("reasoning.budget_tokens: %d -> generationConfig.thinkingConfig.thinkingBudget: %d", spec.BudgetTokens, *thinking.ThinkingBudget)
 		if spec.Effort != "" {
 			// The client dropped the effort (the budget won); the two fields
 			// cannot travel together on this wire.
@@ -136,7 +143,7 @@ func GeminiReasoningNotes(spec ReasoningSpec) []string {
 	default:
 		// The only remaining mapping is effort: none, which is a zero budget
 		// here - and a 400 on Gemini 3, whose generation validate cannot know.
-		m.note("reasoning.effort: none -> thinkingConfig.thinkingBudget: 0 (gemini 3 models cannot disable thinking; this 400s there)")
+		m.note("reasoning.effort: none -> generationConfig.thinkingConfig.thinkingBudget: 0 (gemini 3 models cannot disable thinking; this 400s there)")
 	}
 	return m.Notes
 }

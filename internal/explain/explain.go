@@ -991,17 +991,21 @@ func providerMappingLines(cfg *config.Config, reg *tools.Registry, set overrides
 	if known {
 		lines = append(lines, reasoningMappingLines(cfg, dialect, set)...)
 	}
-	// Sampling is dialect-independent: both wires spell it temperature/top_p
-	// and pass the value through, so these rows survive an unknown dialect.
+	// Sampling is dialect-INdependent (every openai-wire dialect spells it
+	// temperature/top_p and passes the value through), so these rows survive an
+	// unknown dialect - but it is not WIRE-independent: the gemini fields live
+	// under generationConfig and topP is not spelled top_p there at all.
 	sampling := false
 	if t := cfg.Provider.Temperature; t != nil {
-		lines = append(lines, fmt.Sprintf("temperature: %g -> temperature: %g%s",
-			*t, *t, set.mark("provider.temperature")))
+		lines = append(lines, fmt.Sprintf("temperature: %g -> %s: %g%s",
+			*t, samplingFieldFor(cfg, "temperature", "generationConfig.temperature"),
+			*t, set.mark("provider.temperature")))
 		sampling = true
 	}
 	if p := cfg.Provider.TopP; p != nil {
-		lines = append(lines, fmt.Sprintf("top_p: %g -> top_p: %g%s",
-			*p, *p, set.mark("provider.top_p")))
+		lines = append(lines, fmt.Sprintf("top_p: %g -> %s: %g%s",
+			*p, samplingFieldFor(cfg, "top_p", "generationConfig.topP"),
+			*p, set.mark("provider.top_p")))
 		sampling = true
 	}
 	// What the TARGET does with those values is not dialect-independent: a
@@ -1022,6 +1026,23 @@ func providerMappingLines(cfg *config.Config, reg *tools.Registry, set overrides
 		}
 	}
 	return append(lines, geminiSchemaLines(cfg, reg)...)
+}
+
+// samplingFieldFor names the request field that will carry one sampling knob:
+// openai on every dialect and on the Messages API, gemini on the third wire.
+//
+// It exists for the same reason capFieldFor does - the row must print the field
+// the request will actually carry, not the config's own key. On this wire that
+// is not cosmetic: `top_p` is not a spelling the Gemini API accepts anywhere,
+// and the fields sit inside generationConfig rather than at the body root where
+// provider.params merges. A report that echoed the config spelling would hand
+// an operator a params key worth a 400 - which is exactly the failure the
+// unknown-request-fields row two lines below warns about.
+func samplingFieldFor(cfg *config.Config, openai, gemini string) string {
+	if geminiWire(cfg) {
+		return gemini
+	}
+	return openai
 }
 
 // samplingNote returns the caveat that belongs next to the temperature/top_p

@@ -7,9 +7,9 @@ MODEL & PROVIDER
   max_output_tokens: 4096
   provider mapping (the wire fields this config will send):
     max_output_tokens: 4096 -> generationConfig.maxOutputTokens: 4096
-    reasoning.effort: xhigh -> thinkingConfig.thinkingLevel: high (gemini has no level above high)
-    temperature: 0.2 -> temperature: 0.2
-    top_p: 0.9 -> top_p: 0.9
+    reasoning.effort: xhigh -> generationConfig.thinkingConfig.thinkingLevel: high (gemini has no level above high)
+    temperature: 0.2 -> generationConfig.temperature: 0.2
+    top_p: 0.9 -> generationConfig.topP: 0.9
     google recommends the default 1.0 on gemini 3 models; non-default may degrade output
     params keys (merged verbatim, values not shown): "labels"
     unknown request fields: rejected (400) - strict protobuf JSON

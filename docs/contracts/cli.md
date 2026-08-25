@@ -387,9 +387,12 @@ up yet.
   `generativelanguage.googleapis.com`, there is **no dialect row** (a dialect
   is a config error there), the cap row names
   `generationConfig.maxOutputTokens`, the reasoning rows name
-  `thinkingConfig.thinkingLevel`/`thinkingBudget`, a non-default `temperature`
-  earns Google's own recommendation as a note, and the unknown-field policy
-  reads `rejected (400) - strict protobuf JSON`. One row family is new:
+  `generationConfig.thinkingConfig.thinkingLevel`/`.thinkingBudget` and the
+  sampling rows `generationConfig.temperature`/`.topP` (every gemini row names
+  the field FULLY QUALIFIED from the body root, and `top_p` is not a spelling
+  this API has at all), a non-default `temperature` earns Google's own
+  recommendation as a note, and the unknown-field policy reads
+  `rejected (400) - strict protobuf JSON`. One row family is new:
   `tool schemas: sanitized for the gemini wire`, followed by one line per
   registered tool listing the JSON Schema key PATHS the sanitizer removes
   (`"fs_read": stripped "additionalProperties"`) or `no keys stripped`. A run

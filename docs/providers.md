@@ -218,12 +218,12 @@ and must **not** carry the version segment: amele appends
 | config | request |
 | --- | --- |
 | `reasoning.effort: low\|medium\|high` | `generationConfig.thinkingConfig.thinkingLevel` with the same word |
-| `reasoning.effort: xhigh\|max` | `thinkingLevel: high` - this wire has nothing above it, and `explain` prints the rounding |
-| `reasoning.effort: none` | `thinkingConfig.thinkingBudget: 0`. Gemini 3 models **cannot** stop thinking and answer this with a 400; amele does not guess a model generation from its name, so that stays a runtime error with advice |
-| `reasoning.budget_tokens: 8192` | `thinkingConfig.thinkingBudget: 8192` (the 2.5-era spelling). A level and a budget are **alternatives** - both together is exit 2, because the API refuses the pair |
+| `reasoning.effort: xhigh\|max` | `generationConfig.thinkingConfig.thinkingLevel: high` - this wire has nothing above it, and `explain` prints the rounding |
+| `reasoning.effort: none` | `generationConfig.thinkingConfig.thinkingBudget: 0`. Gemini 3 models **cannot** stop thinking and answer this with a 400; amele does not guess a model generation from its name, so that stays a runtime error with advice |
+| `reasoning.budget_tokens: 8192` | `generationConfig.thinkingConfig.thinkingBudget: 8192` (the 2.5-era spelling). A level and a budget are **alternatives** - both together is exit 2, because the API refuses the pair |
 | `max_output_tokens: 4096` | `generationConfig.maxOutputTokens` |
-| `temperature` / `top_p` | `generationConfig.temperature` / `topP`, sent as given |
-| `output.schema` | `generationConfig.responseJsonSchema` + `responseMimeType: application/json` |
+| `temperature` / `top_p` | `generationConfig.temperature` / `generationConfig.topP`, sent as given - note that `top_p` is not a spelling this API accepts anywhere |
+| `output.schema` | `generationConfig.responseJsonSchema` + `generationConfig.responseMimeType: application/json` |
 | `params` | merged into the body **root**, never into `generationConfig` |
 
 Five things behave differently enough here to state on their own.
@@ -322,7 +322,7 @@ provider:
   type: gemini                    # native generateContent; no version in base_url
   api_key: ${GEMINI_API_KEY}      # required today - Vertex needs the vertex block
   max_output_tokens: 8192         # leave room: thinking is billed here too
-  reasoning: {effort: medium}     # -> thinkingConfig.thinkingLevel: medium
+  reasoning: {effort: medium}     # generationConfig.thinkingConfig.thinkingLevel
 ```
 
 `api_key` is not optional on this wire, and `base_url` is: the client knows the

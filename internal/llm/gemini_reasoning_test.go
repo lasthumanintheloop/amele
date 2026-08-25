@@ -32,19 +32,19 @@ func TestGeminiThinkingMapping(t *testing.T) {
 			name:      "low",
 			spec:      ReasoningSpec{Effort: "low"},
 			wantWire:  `{"thinkingLevel":"low"}`,
-			wantNotes: []string{"reasoning.effort: low -> thinkingConfig.thinkingLevel: low"},
+			wantNotes: []string{"reasoning.effort: low -> generationConfig.thinkingConfig.thinkingLevel: low"},
 		},
 		{
 			name:      "medium",
 			spec:      ReasoningSpec{Effort: "medium"},
 			wantWire:  `{"thinkingLevel":"medium"}`,
-			wantNotes: []string{"reasoning.effort: medium -> thinkingConfig.thinkingLevel: medium"},
+			wantNotes: []string{"reasoning.effort: medium -> generationConfig.thinkingConfig.thinkingLevel: medium"},
 		},
 		{
 			name:      "high",
 			spec:      ReasoningSpec{Effort: "high"},
 			wantWire:  `{"thinkingLevel":"high"}`,
-			wantNotes: []string{"reasoning.effort: high -> thinkingConfig.thinkingLevel: high"},
+			wantNotes: []string{"reasoning.effort: high -> generationConfig.thinkingConfig.thinkingLevel: high"},
 		},
 		{
 			// The rounding is DOWNWARD here, unlike the openai-wire dialects
@@ -54,13 +54,13 @@ func TestGeminiThinkingMapping(t *testing.T) {
 			name:      "xhigh rounds to high",
 			spec:      ReasoningSpec{Effort: "xhigh"},
 			wantWire:  `{"thinkingLevel":"high"}`,
-			wantNotes: []string{"reasoning.effort: xhigh -> thinkingConfig.thinkingLevel: high (gemini has no level above high)"},
+			wantNotes: []string{"reasoning.effort: xhigh -> generationConfig.thinkingConfig.thinkingLevel: high (gemini has no level above high)"},
 		},
 		{
 			name:      "max rounds to high",
 			spec:      ReasoningSpec{Effort: "max"},
 			wantWire:  `{"thinkingLevel":"high"}`,
-			wantNotes: []string{"reasoning.effort: max -> thinkingConfig.thinkingLevel: high (gemini has no level above high)"},
+			wantNotes: []string{"reasoning.effort: max -> generationConfig.thinkingConfig.thinkingLevel: high (gemini has no level above high)"},
 		},
 		{
 			// none is a real instruction, not the absence of one, and this wire
@@ -69,13 +69,13 @@ func TestGeminiThinkingMapping(t *testing.T) {
 			name:      "none sends a zero budget",
 			spec:      ReasoningSpec{Effort: "none"},
 			wantWire:  `{"thinkingBudget":0}`,
-			wantNotes: []string{"reasoning.effort: none -> thinkingConfig.thinkingBudget: 0 (gemini 3 models cannot disable thinking; this 400s there)"},
+			wantNotes: []string{"reasoning.effort: none -> generationConfig.thinkingConfig.thinkingBudget: 0 (gemini 3 models cannot disable thinking; this 400s there)"},
 		},
 		{
 			name:      "budget passthrough",
 			spec:      ReasoningSpec{BudgetTokens: 2048},
 			wantWire:  `{"thinkingBudget":2048}`,
-			wantNotes: []string{"reasoning.budget_tokens: 2048 -> thinkingConfig.thinkingBudget: 2048"},
+			wantNotes: []string{"reasoning.budget_tokens: 2048 -> generationConfig.thinkingConfig.thinkingBudget: 2048"},
 		},
 		{
 			// Unreachable through validate (config refuses the pair), but the
@@ -86,7 +86,7 @@ func TestGeminiThinkingMapping(t *testing.T) {
 			spec:     ReasoningSpec{Effort: "high", BudgetTokens: 512},
 			wantWire: `{"thinkingBudget":512}`,
 			wantNotes: []string{
-				"reasoning.budget_tokens: 512 -> thinkingConfig.thinkingBudget: 512",
+				"reasoning.budget_tokens: 512 -> generationConfig.thinkingConfig.thinkingBudget: 512",
 				"reasoning.effort: high not sent: the gemini wire takes a thinking level or a budget, not both",
 			},
 		},
@@ -96,7 +96,7 @@ func TestGeminiThinkingMapping(t *testing.T) {
 			name:      "an unknown level passes through",
 			spec:      ReasoningSpec{Effort: "ultra"},
 			wantWire:  `{"thinkingLevel":"ultra"}`,
-			wantNotes: []string{"reasoning.effort: ultra -> thinkingConfig.thinkingLevel: ultra"},
+			wantNotes: []string{"reasoning.effort: ultra -> generationConfig.thinkingConfig.thinkingLevel: ultra"},
 		},
 	}
 
