@@ -597,3 +597,136 @@ func gemTunedRequest() Request {
 		TopP:            &top,
 	}
 }
+
+// quotaTokenSource is a token source that also names a quota project - the
+// optional half of the auth seam, implemented by the ADC leg that needs it.
+type quotaTokenSource struct {
+	fakeTokenSource
+	project string
+}
+
+func (q *quotaTokenSource) QuotaProject() string { return q.project }
+
+// TestVertexQuotaProjectHeader pins the x-goog-user-project behavior in both
+// directions: the header travels only when the CREDENTIAL asks for it.
+//
+// It is not sent unconditionally on purpose. The header names the project
+// billed for quota and requires serviceusage.services.use on it; a service
+// account that legitimately holds only roles/aiplatform.user would start
+// getting 403s from a header it never needed (research §3.1, "Quota project").
+func TestVertexQuotaProjectHeader(t *testing.T) {
+	tests := []struct {
+		name   string
+		source GeminiTokenSource
+		want   string
+	}{
+		{
+			name:   "a source that names a quota project sends the header",
+			source: &quotaTokenSource{fakeTokenSource: fakeTokenSource{token: "t"}, project: "my-project"},
+			want:   "my-project",
+		},
+		{
+			name:   "a source with an empty quota project sends nothing",
+			source: &quotaTokenSource{fakeTokenSource: fakeTokenSource{token: "t"}},
+			want:   "",
+		},
+		{
+			name:   "a source that does not know about quota projects sends nothing",
+			source: &fakeTokenSource{token: "t"},
+			want:   "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				got = r.Header.Get("x-goog-user-project")
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}]}`))
+			}))
+			defer srv.Close()
+
+			client := &GeminiClient{
+				BaseURL:     srv.URL,
+				Vertex:      &VertexTarget{Project: "my-project", Location: "us-central1"},
+				TokenSource: tc.source,
+			}
+			if _, err := client.Chat(context.Background(), gemUserRequest()); err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("x-goog-user-project = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVertexAuthFailureAdvice: a 401 or 403 from the Vertex endpoint says
+// nothing an operator can act on ("Request is missing required authentication
+// credential" - research §2.10), so amele appends the IAM vocabulary the fix
+// actually lives in: the role, the project and the location.
+//
+// The advice is mode-dependent, which is why it is not an entry in
+// geminiErrorSignatures: the same status on the AI Studio backend is about an
+// api_key, and that table is consulted for 400s on both backends alike.
+func TestVertexAuthFailureAdvice(t *testing.T) {
+	tests := []struct {
+		name string
+		code int
+		want []string
+	}{
+		{
+			name: "401 names the credential sources and the role",
+			code: http.StatusUnauthorized,
+			want: []string{"roles/aiplatform.user", "my-project", "provider.vertex.credentials"},
+		},
+		{
+			name: "403 names the role, the location and the quota header",
+			code: http.StatusForbidden,
+			want: []string{"roles/aiplatform.user", "my-project", "europe-west4", "serviceusage.services.use"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(`{"error":{"code":401,"status":"UNAUTHENTICATED"}}`))
+			}))
+			defer srv.Close()
+
+			client := &GeminiClient{
+				BaseURL:     srv.URL,
+				Vertex:      &VertexTarget{Project: "my-project", Location: "europe-west4"},
+				TokenSource: &fakeTokenSource{token: "t"},
+			}
+			_, err := client.Chat(context.Background(), gemUserRequest())
+			if err == nil {
+				t.Fatal("expected an error")
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		})
+	}
+}
+
+// TestAIStudioAuthFailureKeepsItsOwnMessage is the other half of the pin above:
+// the vertex IAM advice must not attach to an AI Studio 401, where the answer
+// is an api_key and no Google Cloud project exists to name.
+func TestAIStudioAuthFailureKeepsItsOwnMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer srv.Close()
+
+	client := &GeminiClient{BaseURL: srv.URL, APIKey: "k"}
+	_, err := client.Chat(context.Background(), gemUserRequest())
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if strings.Contains(err.Error(), "roles/aiplatform.user") {
+		t.Errorf("the vertex IAM advice reached an AI Studio failure: %v", err)
+	}
+}

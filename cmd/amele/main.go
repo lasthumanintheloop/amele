@@ -2567,7 +2567,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		}
 	}
 
-	provider, err := buildProvider(cfg)
+	provider, err := buildProvider(cfg, secrets.Add)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2639,7 +2639,13 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 // a validated config, which is why it is WRAPPED and returned rather than
 // panicked on or ignored - falling back to the openai mapping would silently
 // reshape every request of the run.
-func buildProvider(cfg *config.Config) (llm.Provider, error) {
+//
+// registerSecret is the run's live redactor sink (secrets.Add). It is a
+// parameter rather than a package-level hook because only ONE set exists per
+// invocation (runSecrets) and a client that minted credentials into a second
+// one would be writing them into a registry no sink reads. nil is allowed for
+// callers that keep no log; only the Vertex credential path uses it today.
+func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Provider, error) {
 	maxAttempts, initialBackoff := retryPolicy(cfg.Provider.Retry)
 	if cfg.Provider.Type == config.ProviderTypeAnthropic {
 		// The dialect names a variation of the OpenAI-compatible wire and is
@@ -2670,12 +2676,11 @@ func buildProvider(cfg *config.Config) (llm.Provider, error) {
 			BaseURL: cfg.Provider.BaseURL,
 			APIKey:  cfg.Provider.APIKey,
 			// The vertex block travels as the client's target so the request is
-			// addressed to the endpoint the config names. The TOKEN source that
-			// authenticates it is the next slice; until it is wired, a vertex
-			// config fails at the credential rather than silently talking to
-			// the AI Studio host with the wrong (or no) key - which would be a
-			// data-residency break dressed as a 401.
+			// addressed to the endpoint the config names, and as the credential
+			// source that authenticates it. Both are nil without the block,
+			// which is what keeps the AI Studio path a keyed one.
 			Vertex:         vertexTarget(cfg.Provider.Vertex),
+			TokenSource:    vertexTokenSource(cfg.Provider.Vertex, registerSecret),
 			RequestTimeout: cfg.Provider.RequestTimeout.Std(),
 			MaxAttempts:    maxAttempts,
 			InitialBackoff: initialBackoff,
@@ -2707,6 +2712,31 @@ func vertexTarget(v *config.VertexConfig) *llm.VertexTarget {
 		return nil
 	}
 	return &llm.VertexTarget{Project: v.Project, Location: v.Location}
+}
+
+// vertexTokenSource builds the credential source for a vertex config: the
+// service-account key file when provider.vertex.credentials names one, the
+// Application Default Credentials chain otherwise.
+//
+// The return type is the INTERFACE and the nil case returns a literal nil, not
+// a typed nil pointer: assigning a (*llm.GoogleTokenSource)(nil) to the
+// client's field would produce a non-nil interface holding a nil pointer, and
+// the AI Studio path - which checks that field for nil - would then call
+// through it.
+//
+// SECURITY: registerSecret is the run's live SecretSet.Add, so a token minted
+// during turn seven is scrubbed from the session log, the -v feed and the error
+// lines from the moment it exists. This is the same wiring the MCP OAuth
+// handler uses (mcp.Deps.RegisterSecret).
+func vertexTokenSource(v *config.VertexConfig, registerSecret func(...string)) llm.GeminiTokenSource {
+	if v == nil {
+		return nil
+	}
+	return &llm.GoogleTokenSource{
+		CredentialsFile: v.Credentials,
+		Project:         v.Project,
+		Register:        registerSecret,
+	}
 }
 
 // retryPolicy unpacks the optional provider.retry block for both clients. An

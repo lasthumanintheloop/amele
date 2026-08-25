@@ -135,7 +135,7 @@ func TestBuildProviderDialect(t *testing.T) {
 	cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
 		BaseURL: "https://api.deepseek.com", Dialect: "deepseek",
 	}}
-	provider, err := buildProvider(cfg)
+	provider, err := buildProvider(cfg, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -155,7 +155,7 @@ func TestBuildProviderRejectsUnknownDialect(t *testing.T) {
 	cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
 		BaseURL: "https://example.test/v1", Dialect: "gemini",
 	}}
-	if _, err := buildProvider(cfg); err == nil {
+	if _, err := buildProvider(cfg, nil); err == nil {
 		t.Fatal("an unknown dialect must be an error, not a silent openai fallback")
 	}
 }

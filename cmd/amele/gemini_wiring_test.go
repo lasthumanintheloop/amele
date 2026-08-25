@@ -13,6 +13,7 @@ import (
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
+	"github.com/lasthumanintheloop/amele/internal/session"
 )
 
 // geminiTextBody is a minimal successful generateContent response: one model
@@ -91,7 +92,7 @@ func TestBuildProviderSelectsGemini(t *testing.T) {
 		MaxOutputTokens: 256,
 	}
 
-	provider, err := buildProvider(&config.Config{Model: "m", Provider: pc})
+	provider, err := buildProvider(&config.Config{Model: "m", Provider: pc}, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -110,7 +111,7 @@ func TestBuildProviderSelectsGemini(t *testing.T) {
 func TestBuildProviderGeminiWiresRetry(t *testing.T) {
 	base := config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}
 
-	provider, err := buildProvider(&config.Config{Provider: base})
+	provider, err := buildProvider(&config.Config{Provider: base}, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -120,7 +121,7 @@ func TestBuildProviderGeminiWiresRetry(t *testing.T) {
 
 	tuned := base
 	tuned.Retry = &config.RetryConfig{MaxAttempts: 5, InitialBackoff: config.Duration(250 * time.Millisecond)}
-	provider, err = buildProvider(&config.Config{Provider: tuned})
+	provider, err = buildProvider(&config.Config{Provider: tuned}, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -173,7 +174,7 @@ func TestVertexConfigReachesTheVertexEndpoint(t *testing.T) {
 		//nolint:gosec // G101: a service-account key PATH, not a credential.
 		Vertex: &config.VertexConfig{Project: "my-project", Location: "europe-west4", Credentials: "/etc/amele/sa.json"},
 	}}
-	provider, err := buildProvider(cfg)
+	provider, err := buildProvider(cfg, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -190,7 +191,7 @@ func TestVertexConfigReachesTheVertexEndpoint(t *testing.T) {
 
 	// A config without the block keeps the AI Studio backend.
 	plain := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}}
-	provider, err = buildProvider(plain)
+	provider, err = buildProvider(plain, nil)
 	if err != nil {
 		t.Fatalf("buildProvider: %v", err)
 	}
@@ -312,5 +313,119 @@ func TestE2ENonGeminiRunHasNoSanitizerWarning(t *testing.T) {
 	}
 	if strings.Contains(stderr, "sanitized") {
 		t.Errorf("an openai-wire run printed a sanitizer warning: %s", stderr)
+	}
+}
+
+// TestVertexTokenSourceIsWiredAndItsTokenRedacted is the credential half of the
+// vertex wiring, proved end to end against the run's own secret registry.
+//
+// SECURITY: the token a run mints is not in the config, so it cannot be part of
+// the redactor's starting list. The whole point of handing the token source the
+// LIVE SecretSet is that the moment a token exists, every sink already scrubs
+// it. This drives a real ADC resolution (the gcloud user-credential shape, so
+// no key generation is needed) against a local token endpoint and then asks the
+// registry what it now knows.
+func TestVertexTokenSourceIsWiredAndItsTokenRedacted(t *testing.T) {
+	const token = "ya29.wiring-test-token" //nolint:gosec // G101: a fixture value minted by the local server below.
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"` + token + `","token_type":"Bearer","expires_in":3600}`))
+	}))
+	defer srv.Close()
+
+	// The gcloud application-default shape: the ADC leg that also asks for the
+	// quota-project header.
+	adc := filepath.Join(t.TempDir(), "application_default_credentials.json")
+	body := `{"type":"authorized_user","client_id":"fake-id","client_secret":"fake-secret",` +
+		`"refresh_token":"fake-refresh","token_uri":"` + srv.URL + `/token"}`
+	if err := os.WriteFile(adc, []byte(body), 0o600); err != nil {
+		t.Fatalf("writing the ADC fixture: %v", err)
+	}
+	t.Setenv("GOOGLE_APPLICATION_CREDENTIALS", adc)
+
+	cfg := &config.Config{Provider: config.ProviderConfig{
+		Type:   config.ProviderTypeGemini,
+		Vertex: &config.VertexConfig{Project: "my-project", Location: "europe-west4"},
+	}}
+	secrets := session.NewSecretSet(agentSecrets(cfg))
+
+	provider, err := buildProvider(cfg, secrets.Add)
+	if err != nil {
+		t.Fatalf("buildProvider: %v", err)
+	}
+	client, ok := provider.(*llm.GeminiClient)
+	if !ok {
+		t.Fatalf("buildProvider returned %T, want *llm.GeminiClient", provider)
+	}
+	if client.TokenSource == nil {
+		t.Fatal("a vertex config produced no token source")
+	}
+
+	got, err := client.TokenSource.Token(t.Context())
+	if err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+	if got != token || hits != 1 {
+		t.Fatalf("token = %q after %d exchanges", got, hits)
+	}
+	// The registry is LIVE: a value it had never seen at startup is scrubbed
+	// the moment the token source registers it.
+	line := "provider error: status 401 with Authorization: Bearer " + token
+	if redacted := secrets.Redact(line); strings.Contains(redacted, token) {
+		t.Errorf("the vertex token survived redaction: %q", redacted)
+	} else if !strings.Contains(redacted, "[REDACTED]") {
+		t.Errorf("redacted line does not carry the marker: %q", redacted)
+	}
+
+	// The gcloud leg is the one that needs the quota header, and the project
+	// it names is the one from the vertex block.
+	quota, ok := client.TokenSource.(llm.GeminiQuotaProject)
+	if !ok {
+		t.Fatal("the wired token source cannot report a quota project")
+	}
+	if p := quota.QuotaProject(); p != "my-project" {
+		t.Errorf("QuotaProject = %q, want %q", p, "my-project")
+	}
+}
+
+// TestAIStudioConfigGetsNoTokenSource: the credential seam stays nil on the
+// keyed backend. A non-nil source there would be a bearer token offered to an
+// endpoint that authenticates with x-goog-api-key.
+func TestAIStudioConfigGetsNoTokenSource(t *testing.T) {
+	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}}
+	provider, err := buildProvider(cfg, nil)
+	if err != nil {
+		t.Fatalf("buildProvider: %v", err)
+	}
+	if ts := provider.(*llm.GeminiClient).TokenSource; ts != nil {
+		t.Errorf("an AI Studio config carries a token source: %#v", ts)
+	}
+}
+
+// TestVertexCredentialsFileReachesTheTokenSource: provider.vertex.credentials
+// is the knob that bypasses the ADC search, so it has to arrive at the source
+// that would otherwise perform it.
+func TestVertexCredentialsFileReachesTheTokenSource(t *testing.T) {
+	// A service-account key PATH, not a credential.
+	const path = "/etc/amele/sa.json"
+	cfg := &config.Config{Provider: config.ProviderConfig{
+		Type:   config.ProviderTypeGemini,
+		Vertex: &config.VertexConfig{Project: "p", Location: "us-central1", Credentials: path},
+	}}
+	provider, err := buildProvider(cfg, nil)
+	if err != nil {
+		t.Fatalf("buildProvider: %v", err)
+	}
+	source, ok := provider.(*llm.GeminiClient).TokenSource.(*llm.GoogleTokenSource)
+	if !ok {
+		t.Fatalf("token source is %T, want *llm.GoogleTokenSource", provider.(*llm.GeminiClient).TokenSource)
+	}
+	if source.CredentialsFile != path {
+		t.Errorf("CredentialsFile = %q, want %q", source.CredentialsFile, path)
+	}
+	if source.Project != "p" {
+		t.Errorf("Project = %q, want %q", source.Project, "p")
 	}
 }

@@ -141,6 +141,28 @@ type GeminiTokenSource interface {
 	Token(ctx context.Context) (string, error)
 }
 
+// GeminiQuotaProject is the OPTIONAL companion to GeminiTokenSource: a token
+// source whose credential needs the quota-project header implements it, and a
+// source that does not simply omits the method.
+//
+// It is a second interface rather than a second method on GeminiTokenSource
+// because the header is a property of the CREDENTIAL, not of the wire: only the
+// `authorized_user` legs of the ADC chain need it, every other credential is
+// harmed by it (it demands serviceusage.services.use on the named project), and
+// a fake token source in a test has no opinion at all. Keeping the required
+// interface at one method is also what lets the simplest possible stub satisfy
+// it.
+//
+// CONTRACT: QuotaProject is consulted AFTER Token on the same request, so a
+// source that resolves its credential lazily has already decided by the time it
+// is asked. It returns "" when no header should be sent, and it must be safe
+// for concurrent use.
+type GeminiQuotaProject interface {
+	// QuotaProject returns the project id for the x-goog-user-project header,
+	// or "" for no header.
+	QuotaProject() string
+}
+
 // Wire types for the generateContent JSON body. Kept unexported: the rest of
 // the codebase only sees the neutral types in llm.go.
 // Every field amele owns is a struct member (not a map entry) so the encoded
@@ -687,7 +709,69 @@ func (c *GeminiClient) authorize(ctx context.Context, req *http.Request) error {
 		return fmt.Errorf("%w: the google credential source returned an empty access token", ErrProvider)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
+	// The quota-project header is asked for AFTER the token, which is the
+	// ordering GeminiQuotaProject's contract promises: a source that resolves
+	// the ADC chain lazily only learns its credential type by producing a
+	// token. Sources that do not implement the interface send no header, which
+	// is the right default - see quotaProjectFor in gemini_auth.go.
+	if quota, ok := c.TokenSource.(GeminiQuotaProject); ok {
+		if project := quota.QuotaProject(); project != "" {
+			req.Header.Set("x-goog-user-project", project)
+		}
+	}
 	return nil
+}
+
+// vertexAuthSignature is the status-code counterpart of errorSignature: an
+// entry keyed on the HTTP status rather than on the body text.
+//
+// The two tables are separate because they answer different questions. The
+// geminiErrorSignatures entries are body heuristics consulted for 400s on BOTH
+// backends; these are about credentials, apply only in vertex mode (a 401 on
+// the AI Studio backend is about an api_key, and there is no Google Cloud
+// project to name), and key on a status code the shared table deliberately does
+// not look at.
+type vertexAuthSignature struct {
+	code   int
+	advice func(VertexTarget) string
+}
+
+// vertexAuthSignatures is the ordered table consulted for an authentication or
+// authorization failure in vertex mode. First match wins.
+//
+// CONTRACT: like every signature table, these entries change NOTHING but the
+// human-facing text - no retry, no rewrite. What they add is the vocabulary the
+// fix lives in: the live 401 body says only "Request is missing required
+// authentication credential" (research §2.10), which names neither the IAM
+// role, nor the project, nor the credential sources amele searched.
+var vertexAuthSignatures = []vertexAuthSignature{
+	{
+		code: http.StatusUnauthorized,
+		advice: func(t VertexTarget) string {
+			return "vertex rejected the credential: check that it resolves (provider.vertex.credentials, " +
+				"GOOGLE_APPLICATION_CREDENTIALS, or `gcloud auth application-default login`) and that its principal " +
+				"has roles/aiplatform.user on project " + t.Project
+		},
+	},
+	{
+		code: http.StatusForbidden,
+		advice: func(t VertexTarget) string {
+			return "vertex authenticated the credential but refused the call: grant roles/aiplatform.user on project " +
+				t.Project + ", confirm the model is served in location " + t.Location +
+				", and - for gcloud user credentials - serviceusage.services.use for the x-goog-user-project header"
+		},
+	},
+}
+
+// vertexAuthAdvice returns the hint for one status code, or "" when the table
+// has no entry for it.
+func vertexAuthAdvice(code int, target VertexTarget) string {
+	for _, sig := range vertexAuthSignatures {
+		if sig.code == code {
+			return sig.advice(target)
+		}
+	}
+	return ""
 }
 
 // failure turns a non-200 reply into the typed provider error, adding the one
@@ -698,6 +782,13 @@ func (c *GeminiClient) failure(httpResp *http.Response) (*Response, bool, time.D
 	// typed statusError, same header reading - only the error-signature table
 	// and the body-borne delay below differ.
 	retryable, retryAfter, err := statusFailure(httpResp, geminiErrorSignatures)
+	// The credential advice is appended here rather than through the shared
+	// table because it depends on the BACKEND, which statusFailure cannot see.
+	if c.Vertex != nil {
+		if advice := vertexAuthAdvice(httpResp.StatusCode, *c.Vertex); advice != "" {
+			err = fmt.Errorf("%w — %s", err, advice)
+		}
+	}
 	if !retryable || retryAfter > 0 {
 		return nil, retryable, retryAfter, err
 	}

@@ -2563,7 +2563,7 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	for _, typ := range []string{"", config.ProviderTypeOpenAI} {
 		cfg := &config.Config{Provider: pc}
 		cfg.Provider.Type = typ
-		provider, err := buildProvider(cfg)
+		provider, err := buildProvider(cfg, nil)
 		if err != nil {
 			t.Fatalf("type %q: buildProvider: %v", typ, err)
 		}
@@ -2580,7 +2580,7 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	cfg.Provider.Type = config.ProviderTypeAnthropic
 	// A dialect is inert on this wire: it must not fail the construction.
 	cfg.Provider.Dialect = "deepseek"
-	provider, err := buildProvider(cfg)
+	provider, err := buildProvider(cfg, nil)
 	if err != nil {
 		t.Fatalf("type anthropic: buildProvider: %v", err)
 	}
@@ -2602,7 +2602,7 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 	base := config.ProviderConfig{BaseURL: "https://x.example.com", APIKey: "k"}
 
 	t.Run("no retry block leaves the client defaults", func(t *testing.T) {
-		openai, err := buildProvider(&config.Config{Provider: base})
+		openai, err := buildProvider(&config.Config{Provider: base}, nil)
 		if err != nil {
 			t.Fatalf("buildProvider: %v", err)
 		}
@@ -2612,7 +2612,7 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 
 		anth := base
 		anth.Type = config.ProviderTypeAnthropic
-		client, err := buildProvider(&config.Config{Provider: anth})
+		client, err := buildProvider(&config.Config{Provider: anth}, nil)
 		if err != nil {
 			t.Fatalf("buildProvider anthropic: %v", err)
 		}
@@ -2626,7 +2626,7 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 
 		oaCfg := base
 		oaCfg.Retry = retry
-		openai, err := buildProvider(&config.Config{Provider: oaCfg})
+		openai, err := buildProvider(&config.Config{Provider: oaCfg}, nil)
 		if err != nil {
 			t.Fatalf("buildProvider: %v", err)
 		}
@@ -2637,7 +2637,7 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 		anCfg := base
 		anCfg.Type = config.ProviderTypeAnthropic
 		anCfg.Retry = retry
-		client, err := buildProvider(&config.Config{Provider: anCfg})
+		client, err := buildProvider(&config.Config{Provider: anCfg}, nil)
 		if err != nil {
 			t.Fatalf("buildProvider anthropic: %v", err)
 		}
