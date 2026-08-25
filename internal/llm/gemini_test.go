@@ -175,30 +175,71 @@ func gemWireCases() []gemWireCase {
 			},
 		},
 		{
-			// A message that would produce no parts is DROPPED: an empty text
-			// part encodes to {}, a shape protobuf-JSON rejects, and a turn
-			// with no parts is a 400. Pinned because Task 3 changes exactly
-			// this branch - an assistant turn that carries only tool calls
-			// stops being empty once functionCall parts exist.
+			// A message that would STILL produce no parts is dropped: an empty
+			// text part encodes to {}, a shape protobuf-JSON rejects, and a
+			// turn with no parts is a 400. An assistant turn with neither text
+			// nor tool calls is the only shape left in that branch now that
+			// tool calls fill parts of their own.
 			name:   "a message with no parts is dropped",
 			golden: "gemini-baseline.json",
 			req: Request{
-				Model:    "gemini-3-pro",
-				Messages: append(baseMessages(), Message{Role: RoleAssistant, ToolCalls: []ToolCall{{ID: "1", Name: "fs_read"}}}),
+				Model: "gemini-3-pro",
+				Messages: append(baseMessages(),
+					Message{Role: RoleAssistant},
+					Message{Role: RoleUser},
+				),
 			},
 		},
 		{
-			// CONTRACT for the task boundary: tools, the reasoning knob and the
-			// response format are NOT on this wire yet (Task 3 sanitizes tool
-			// schemas, Task 4 maps thinkingConfig/responseJsonSchema). A
-			// request carrying them must encode byte-identically to the
-			// baseline, so an accidental early emission breaks this golden.
-			name:   "unmapped knobs are not emitted yet",
+			// The tool loop in one request: the assistant turn becomes text
+			// plus one functionCall part per call, and both results ride back
+			// in a SINGLE user turn of functionResponse parts - a plain output
+			// wrapped under "output", a JSON object passed through.
+			name:   "a tool call and its results",
+			golden: "gemini-tool-loop.json",
+			req: Request{
+				Model: "gemini-3-pro",
+				Messages: []Message{
+					{Role: RoleSystem, Content: "you are a log sentry"},
+					{Role: RoleUser, Content: "scan today's log"},
+					{Role: RoleAssistant, Content: "reading it", ToolCalls: []ToolCall{
+						{ID: "call_a", Name: "fs_read", Arguments: `{"path":"app.log"}`},
+						{ID: "call_b", Name: "fs_list", Arguments: ""},
+					}},
+					{Role: RoleTool, ToolCallID: "call_a", Content: "ERROR disk full"},
+					{Role: RoleTool, ToolCallID: "call_b", Content: `{"entries":["app.log"]}`},
+				},
+			},
+		},
+		{
+			// Tool declarations share one tools entry, and every schema passes
+			// the sanitizer first: additionalProperties and $schema are hard
+			// 400s on this wire.
+			name:   "tools are declared through the sanitizer",
+			golden: "gemini-tools.json",
+			req: Request{
+				Model:    "gemini-3-pro",
+				Messages: baseMessages(),
+				Tools: []ToolDef{
+					{Name: "fs_read", Description: "read a file", Parameters: json.RawMessage(
+						`{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object",` +
+							`"properties":{"path":{"type":"string","description":"Relative file path"}},` +
+							`"required":["path"],"additionalProperties":false}`)},
+					{Name: "ping", Description: "no arguments"},
+				},
+			},
+		},
+		{
+			// CONTRACT for the task boundary: the reasoning knob and the
+			// response format are NOT on this wire yet (Task 4 maps
+			// thinkingConfig/responseJsonSchema). A request carrying them must
+			// encode byte-identically to the baseline, so an accidental early
+			// emission breaks this golden.
+			name:   "task 4 knobs are not emitted yet",
 			golden: "gemini-baseline.json",
 			req: Request{
 				Model:          "gemini-3-pro",
 				Messages:       baseMessages(),
-				Tools:          []ToolDef{{Name: "fs_read", Description: "read", Parameters: json.RawMessage(`{"type":"object"}`)}},
 				Reasoning:      &ReasoningSpec{Effort: "high"},
 				ResponseFormat: &ResponseFormat{Name: "amele_output", Schema: json.RawMessage(`{"type":"object"}`)},
 			},

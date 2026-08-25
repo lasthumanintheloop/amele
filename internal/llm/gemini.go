@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 )
@@ -44,10 +45,10 @@ const (
 // Anthropic clients established - typed statusError routing, injected Sleep,
 // capped error snippets.
 //
-// SCOPE: this slice speaks plain-text conversations. Tool calling and the
-// reasoning carrier (Task 3) and the thinkingConfig/responseJsonSchema knobs
-// (Task 4) declare their wire fields here but are not emitted yet; toWire says
-// so at each site.
+// SCOPE: this slice speaks conversations and tool calls, and round-trips the
+// thought signatures Gemini 3 signs its steps with. The
+// thinkingConfig/responseJsonSchema knobs declare their wire fields here but
+// are not emitted yet (Task 4); toWire says so at its site.
 type GeminiClient struct {
 	// BaseURL is the API root without a trailing slash and WITHOUT the version
 	// segment, e.g. "https://generativelanguage.googleapis.com". Empty means
@@ -91,9 +92,9 @@ type gemRequest struct {
 	// was given: protobuf-JSON is strict about the shapes it accepts, and an
 	// empty Content is not one of them.
 	SystemInstruction *gemContent `json:"systemInstruction,omitempty"`
-	// Tools is declared but never populated in this slice: Gemini rejects
-	// unknown JSON Schema keywords with hard 400s, so tool declarations must
-	// pass the sanitizer Task 3 owns before they may go on this wire.
+	// Tools carries every function declaration in ONE entry (see gemTool).
+	// Gemini rejects unknown JSON Schema keywords with hard 400s, so nothing
+	// reaches this field without passing SanitizeGeminiSchema first.
 	Tools            []gemTool            `json:"tools,omitempty"`
 	GenerationConfig *gemGenerationConfig `json:"generationConfig,omitempty"`
 }
@@ -128,15 +129,46 @@ func GeminiOwnedWireFields() []string {
 type gemContent struct {
 	Role  string    `json:"role,omitempty"`
 	Parts []gemPart `json:"parts"`
+	// PartsRaw, when non-nil, REPLACES Parts: it is the parts array exactly as
+	// the provider sent it, echoed back verbatim (see MarshalJSON and
+	// appendAssistant). It never appears as a field of its own on the wire.
+	PartsRaw json.RawMessage `json:"-"`
+}
+
+// MarshalJSON implements json.Marshaler.
+//
+// CONTRACT: this is the byte-exact echo path. When PartsRaw is set the turn is
+// rendered with those bytes as its parts array instead of re-encoding the
+// decoded parts, because Gemini 3 SIGNS thinking and function-call parts and
+// requires the signature back unmodified - on the first functionCall part of
+// every step - rejecting an altered or reordered array with a 400 (design doc
+// §Rulings 3). Passing the raw region through means nothing here can reorder,
+// re-escape or drop a signature, not even a field this client does not know.
+//
+// The one transformation the payload undergoes is the encoder's own compaction
+// and its JSON-level escaping of <, > and &: value-preserving (the provider
+// decodes the same strings it produced, which is what a signature is computed
+// over), and the same trade-off the Anthropic client documents on its carrier.
+func (c gemContent) MarshalJSON() ([]byte, error) {
+	if c.PartsRaw != nil {
+		return json.Marshal(struct {
+			Role  string          `json:"role,omitempty"`
+			Parts json.RawMessage `json:"parts"`
+		}{Role: c.Role, Parts: c.PartsRaw})
+	}
+	// A defined type without gemContent's methods: marshalling it directly
+	// would recurse into this function forever.
+	type plain gemContent
+	return json.Marshal(plain(c))
 }
 
 // gemPart is one piece of a turn. A single struct covers every part type this
 // wire has; omitempty keeps the irrelevant fields off the wire for each one.
 //
-// FunctionCall, FunctionResponse, Thought and ThoughtSignature are declared
-// here because they are part of the shape this client must DECODE from day one
-// (a thought part must not leak into the answer text - see gemAssistantMessage);
-// emitting them back is Task 3's tool loop and reasoning carrier.
+// A thought part must not leak into the answer text (see gemAssistantMessage),
+// and ThoughtSignature is never read from this struct on the way back: a signed
+// step is echoed from the raw parts array instead (gemContent.MarshalJSON), so
+// the signature cannot be re-encoded by a decode/encode round trip.
 type gemPart struct {
 	Text             string               `json:"text,omitempty"`
 	FunctionCall     *gemFunctionCall     `json:"functionCall,omitempty"`
@@ -273,10 +305,8 @@ type gemErrorEnvelope struct {
 // It is EMPTY in this slice, and deliberately so: every signature the design
 // names (a missing thought_signature, a thinkingLevel/thinkingBudget conflict,
 // "thinking cannot be disabled" on Gemini 3, an unknown responseJsonSchema
-// field) describes a 400 provoked by a field only Tasks 3 and 4 send. Adding
-// advice for a request this client cannot yet make would be untestable text.
-// The parameter is threaded through now so those tasks add a table entry and
-// nothing else.
+// field) is advice about the REASONING knobs, which Task 4 owns. The parameter
+// is threaded through now so that task adds a table entry and nothing else.
 var geminiErrorSignatures []errorSignature
 
 // Chat implements Provider. It retries 429 and 5xx with exponential backoff,
@@ -470,21 +500,47 @@ func geminiOutputTokens(candidates, thoughts int64) int64 {
 // Only text parts contribute to the content, and a part marked thought is
 // skipped: it is the model's thinking summary, and letting it into Content
 // would hand it to the user, to output.schema validation and to the session log
-// as if it were the answer. Function-call parts and the byte-exact carrier the
-// signed parts need are Task 3.
+// as if it were the answer. functionCall parts become tool calls in the order
+// the model produced them, which is the order the loop answers them in.
 func gemAssistantMessage(parts json.RawMessage) (Message, error) {
 	decoded, err := gemParts(parts)
 	if err != nil {
 		return Message{}, err
 	}
 	msg := Message{Role: RoleAssistant}
+	signed := false
 	for _, part := range decoded {
+		// A signature can ride on ANY part, and a thought part implies one is
+		// coming: either means this array must go back untouched.
+		if part.ThoughtSignature != "" || part.Thought {
+			signed = true
+		}
 		if part.Thought {
+			continue
+		}
+		if part.FunctionCall != nil {
+			msg.ToolCalls = append(msg.ToolCalls, ToolCall{
+				// The id is empty on the 2.5-era models, which send none. It is
+				// tolerated rather than invented: the pairing then falls back
+				// to call order (gemBuilder.takeCall).
+				ID:        part.FunctionCall.ID,
+				Name:      part.FunctionCall.Name,
+				Arguments: compactJSONObject(part.FunctionCall.Args),
+			})
 			continue
 		}
 		// Multiple text parts concatenate: the neutral Message carries one text
 		// body, and the API guarantees part order.
 		msg.Content += part.Text
+	}
+	// CONTRACT: the carrier is the ENTIRE raw parts array, not the signed parts
+	// alone. Gemini 3 wants the signature back on the first functionCall part
+	// of the step, interleaved with the text and calls it was produced with, so
+	// the array is the unit that round-trips - which makes signature position
+	// and part order correct by construction rather than by a rule this code
+	// has to remember. Nothing here parses the payload.
+	if signed {
+		msg.Reasoning = parts
 	}
 	return msg, nil
 }
@@ -582,60 +638,243 @@ func parseGoogleRetryDelay(details []json.RawMessage) time.Duration {
 // validation rejects that at exit 2 (GeminiOwnedWireFields) - so merging them
 // needs no further defense here.
 //
-// SCOPE: req.Tools, req.Reasoning and req.ResponseFormat are deliberately NOT
-// read. Tool declarations need the schema sanitizer (Task 3), and the reasoning
-// and structured-output knobs need the thinkingConfig/responseJsonSchema
-// mapping (Task 4); emitting a half-mapped field would be a 400 in production
-// rather than a missing feature. No config can reach this client before those
-// tasks land, because the cmd wiring is Task 5.
+// SCOPE: req.Reasoning and req.ResponseFormat are deliberately NOT read. They
+// need the thinkingConfig/responseJsonSchema mapping (Task 4); emitting a
+// half-mapped field would be a 400 in production rather than a missing feature.
+// No config can reach this client before that task lands, because the cmd
+// wiring is Task 5.
 func (c *GeminiClient) toWire(req Request) (gemRequest, map[string]json.RawMessage) {
-	var out gemRequest
+	var b gemBuilder
 	for _, m := range req.Messages {
-		out.appendMessage(m)
+		b.appendMessage(m)
 	}
-	out.applyKnobs(req)
-	return out, extraFields(req.Extra)
+	b.req.applyTools(req.Tools)
+	b.req.applyKnobs(req)
+	return b.req, extraFields(req.Extra)
+}
+
+// gemBuilder assembles the contents array turn by turn.
+//
+// It exists because this wire needs something the neutral message does not
+// carry: a functionResponse must name the FUNCTION, while a RoleTool message
+// only knows the call id. The builder remembers the calls each assistant turn
+// announced so every result can be paired back to the name it answers.
+type gemBuilder struct {
+	req gemRequest
+	// pending holds the announced calls that have not been answered yet, in
+	// the order the model produced them - which is the order the loop replies
+	// in, and therefore the fallback pairing when no id is available.
+	pending []ToolCall
 }
 
 // appendMessage folds one neutral message into the wire request: system prompts
 // hoist to systemInstruction, everything else becomes a content turn.
-func (out *gemRequest) appendMessage(m Message) {
-	if m.Role == RoleSystem {
+func (b *gemBuilder) appendMessage(m Message) {
+	switch m.Role {
+	case RoleSystem:
 		// This wire has no system role; the prompt belongs in the top-level
 		// systemInstruction Content. A second system message becomes another
 		// PART of it rather than being dropped - parts concatenate on the
 		// provider's side, so the operator's text survives intact and no string
 		// surgery invents a separator.
-		if out.SystemInstruction == nil {
-			out.SystemInstruction = &gemContent{Parts: []gemPart{{Text: m.Content}}}
+		if b.req.SystemInstruction == nil {
+			b.req.SystemInstruction = &gemContent{Parts: []gemPart{{Text: m.Content}}}
 			return
 		}
-		out.SystemInstruction.Parts = append(out.SystemInstruction.Parts, gemPart{Text: m.Content})
-		return
+		b.req.SystemInstruction.Parts = append(b.req.SystemInstruction.Parts, gemPart{Text: m.Content})
+	case RoleAssistant:
+		b.appendAssistant(m)
+	case RoleTool:
+		b.appendToolResult(m)
+	default:
+		// RoleUser and anything unknown are caller-supplied content, which
+		// this wire carries under the user role - the only role left once
+		// system, assistant and tool have been handled above.
+		b.appendUserText(m.Content)
 	}
-	// A turn with no parts is a 400 on this wire, and an empty text part
-	// encodes to {} - a shape protobuf-JSON rejects. An assistant message that
-	// carries only tool calls lands here empty until Task 3 fills its
-	// functionCall parts; dropping it is the honest reading today, since this
-	// slice never asks for tool calls in the first place.
-	if m.Content == "" {
-		return
-	}
-	out.Contents = append(out.Contents, gemContent{
-		Role:  geminiRole(m.Role),
-		Parts: []gemPart{{Text: m.Content}},
-	})
 }
 
-// geminiRole maps a neutral role onto the only two roles this wire has.
-// RoleTool is answered with "user" because that is where tool results belong
-// on this wire (their functionResponse part is Task 3); anything unknown lands
-// there too, which is the role the API accepts for caller-supplied content.
-func geminiRole(role string) string {
-	if role == RoleAssistant {
-		return geminiRoleModel
+// appendAssistant adds one model turn: the carrier echo when the provider
+// signed this step, the rebuilt text and functionCall parts otherwise.
+func (b *gemBuilder) appendAssistant(m Message) {
+	// The calls are recorded from the TYPED fields either way: the results that
+	// follow need their names, and the raw echo path is opaque on purpose.
+	b.pending = append(b.pending, m.ToolCalls...)
+
+	// CONTRACT: a signed step is echoed VERBATIM - the array already holds the
+	// text and functionCall parts in the order the model produced them, so
+	// rebuilding it here would both duplicate those parts and break the
+	// signatures Gemini checks (see gemContent.MarshalJSON).
+	//
+	// The array check is the one guard: a carrier captured from another wire (a
+	// reasoning_content string replayed against this client) cannot be a parts
+	// array, and reconstruction is a well-formed request where sending it would
+	// be a guaranteed 400.
+	if isJSONArray(m.Reasoning) {
+		b.req.Contents = append(b.req.Contents, gemContent{Role: geminiRoleModel, PartsRaw: m.Reasoning})
+		return
 	}
-	return geminiRoleUser
+
+	var parts []gemPart
+	if m.Content != "" {
+		parts = append(parts, gemPart{Text: m.Content})
+	}
+	for _, tc := range m.ToolCalls {
+		parts = append(parts, gemPart{FunctionCall: &gemFunctionCall{
+			ID:   tc.ID,
+			Name: tc.Name,
+			Args: geminiCallArgs(tc.Arguments),
+		}})
+	}
+	// A turn with no parts is a 400 on this wire, and an empty text part
+	// encodes to {} - a shape protobuf-JSON rejects. An assistant message with
+	// neither text nor calls carries nothing to send, so it is dropped.
+	if len(parts) == 0 {
+		return
+	}
+	b.req.Contents = append(b.req.Contents, gemContent{Role: geminiRoleModel, Parts: parts})
+}
+
+// appendToolResult adds one tool output as a functionResponse part.
+//
+// CONTRACT: parallel results share ONE user turn, in call order. The loop emits
+// a RoleTool message per result sequentially; this wire documents the parallel
+// answer as several functionResponse parts of a single content, and keeping the
+// order deterministic is what makes the request bytes reproducible.
+func (b *gemBuilder) appendToolResult(m Message) {
+	name, ok := b.takeCall(m.ToolCallID)
+	if !ok {
+		// An output with no call to answer cannot become a functionResponse:
+		// this wire demands the function name, which only the call carries, and
+		// an empty name is a guaranteed 400. The output still reaches the model
+		// as plain user text - nothing is dropped, and no pairing is invented
+		// that the transcript does not support.
+		b.appendUserText(m.Content)
+		return
+	}
+	part := gemPart{FunctionResponse: &gemFunctionResponse{
+		ID:       m.ToolCallID,
+		Name:     name,
+		Response: geminiToolResponse(m.Content),
+	}}
+	if n := len(b.req.Contents); n > 0 && isGemToolResultContent(b.req.Contents[n-1]) {
+		b.req.Contents[n-1].Parts = append(b.req.Contents[n-1].Parts, part)
+		return
+	}
+	b.req.Contents = append(b.req.Contents, gemContent{Role: geminiRoleUser, Parts: []gemPart{part}})
+}
+
+// appendUserText adds a plain text turn under the user role, dropping an empty
+// one (see appendAssistant on why an empty part cannot be sent).
+func (b *gemBuilder) appendUserText(text string) {
+	if text == "" {
+		return
+	}
+	b.req.Contents = append(b.req.Contents, gemContent{Role: geminiRoleUser, Parts: []gemPart{{Text: text}}})
+}
+
+// takeCall consumes the announced call a result answers and returns its
+// function name.
+//
+// An empty id is the 2.5-era models' normal case - they send none - so the
+// oldest unanswered call is taken, which is the call the loop is replying to. A
+// NON-empty id that matches nothing is not resolved by position: the id is
+// evidence about which call this is, and guessing against it would mislabel the
+// output as another function's result.
+func (b *gemBuilder) takeCall(id string) (string, bool) {
+	if len(b.pending) == 0 {
+		return "", false
+	}
+	index := 0
+	if id != "" {
+		index = slices.IndexFunc(b.pending, func(tc ToolCall) bool { return tc.ID == id })
+		if index < 0 {
+			return "", false
+		}
+	}
+	name := b.pending[index].Name
+	b.pending = slices.Delete(b.pending, index, index+1)
+	return name, true
+}
+
+// isGemToolResultContent reports whether a turn is one this client built from
+// tool results, i.e. one that can absorb the next functionResponse part.
+// Checking the first part suffices: such turns only ever contain those.
+func isGemToolResultContent(content gemContent) bool {
+	return content.Role == geminiRoleUser && len(content.Parts) > 0 &&
+		content.Parts[0].FunctionResponse != nil
+}
+
+// geminiCallArgs renders a tool call's arguments as the args object.
+//
+// Absent arguments stay absent (a zero-parameter call is legitimate and
+// omitempty keeps the key off the wire). Arguments that are not JSON at all -
+// only reachable from a history captured on another wire - travel unchanged so
+// the encoder fails the request loudly, rather than silently sending a call the
+// model never made.
+func geminiCallArgs(args string) json.RawMessage {
+	trimmed := strings.TrimSpace(args)
+	if trimmed == "" || trimmed == "null" {
+		return nil
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, []byte(trimmed)); err != nil {
+		return json.RawMessage(trimmed)
+	}
+	return buf.Bytes()
+}
+
+// gemToolOutput wraps a plain tool result, since functionResponse.response must
+// be an OBJECT on this wire.
+type gemToolOutput struct {
+	Output string `json:"output"`
+}
+
+// geminiToolResponse renders one tool result as the response object.
+//
+// A tool that already answers with a JSON object passes through compacted - its
+// structure is what the model asked for. Everything else (which is what every
+// amele builtin returns: plain text) travels under "output", because a string,
+// an array or a number is not a shape this field accepts.
+func geminiToolResponse(result string) json.RawMessage {
+	trimmed := strings.TrimSpace(result)
+	if len(trimmed) > 0 && trimmed[0] == '{' && json.Valid([]byte(trimmed)) {
+		var buf bytes.Buffer
+		if err := json.Compact(&buf, []byte(trimmed)); err == nil {
+			return buf.Bytes()
+		}
+	}
+	// Marshalling a struct of one string cannot fail, so the error is discarded
+	// deliberately rather than turned into an unreachable branch.
+	wrapped, _ := json.Marshal(gemToolOutput{Output: result})
+	return wrapped
+}
+
+// applyTools declares the offered tools, sanitizing every parameter schema on
+// the way.
+//
+// CONTRACT: no schema reaches this wire unsanitized. Gemini answers an
+// unsupported JSON Schema keyword with a hard 400 that fails the whole request,
+// and amele's own fs builtins ship additionalProperties. The stripped-keyword
+// report is discarded HERE on purpose: surfacing it (explain, and one warning
+// line per run) is Task 5's, and this client prints nothing.
+func (out *gemRequest) applyTools(defs []ToolDef) {
+	if len(defs) == 0 {
+		return
+	}
+	decls := make([]gemFunctionDecl, 0, len(defs))
+	for _, def := range defs {
+		clean, _ := SanitizeGeminiSchema(def.Parameters)
+		decls = append(decls, gemFunctionDecl{
+			Name:        def.Name,
+			Description: def.Description,
+			Parameters:  clean,
+		})
+	}
+	// One tools entry holding every declaration: this wire groups them that
+	// way, unlike the OpenAI-compatible one that lists a tool object per
+	// function.
+	out.Tools = []gemTool{{FunctionDeclarations: decls}}
 }
 
 // applyKnobs maps the cap and sampling knobs into generationConfig, which is
