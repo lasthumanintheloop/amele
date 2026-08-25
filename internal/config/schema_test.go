@@ -162,11 +162,13 @@ provider:
 // rather than silently ignored (additionalProperties: false, the house rule for
 // every closed block in this schema).
 //
-// The cross-field rules - project and location required, never together with
-// api_key, gemini only - stay OUT of the schema on purpose: they are relations
-// between keys, and encoding them here would mean maintaining the same
-// conditional in two copies of a frozen contract while `amele validate` already
-// states them in the operator's own words.
+// Presence IS schema-expressible, so the block requires project and location:
+// an editor can then say "location is required" while the YAML is being typed,
+// which is the whole job of the published schema. What stays OUT are the
+// genuine CROSS-FIELD relations - never together with api_key, gemini only -
+// because encoding those means maintaining the same conditional in two copies
+// of a frozen contract while `amele validate` already states them in the
+// operator's own words.
 func TestSchemaVertexBlock(t *testing.T) {
 	validator, err := schema.Compile(SchemaJSONBytes())
 	if err != nil {
@@ -196,6 +198,19 @@ provider:
 `
 	if _, _, ok := validator.Validate(yamlToJSON(t, []byte(typo))); ok {
 		t.Error("schema accepts provider.vertex.region although the runtime rejects unknown keys")
+	}
+
+	// A vertex request is addressed by project AND location; neither has a
+	// default, and a missing one is exit 2 at run time. The editor may as well
+	// say so while the file is still being typed.
+	for name, incomplete := range map[string]string{
+		"no location": "model: m\nprovider: {type: gemini, vertex: {project: my-project}}\n",
+		"no project":  "model: m\nprovider: {type: gemini, vertex: {location: europe-west4}}\n",
+		"empty block": "model: m\nprovider: {type: gemini, vertex: {}}\n",
+	} {
+		if _, _, ok := validator.Validate(yamlToJSON(t, []byte(incomplete))); ok {
+			t.Errorf("schema accepts a vertex block with %s although the runtime refuses it", name)
+		}
 	}
 }
 

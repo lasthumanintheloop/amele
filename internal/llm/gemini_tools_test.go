@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -57,13 +58,25 @@ func gemContentsOf(t *testing.T, body []byte) []gemSentContent {
 // gemSignedParts is a Gemini 3 candidate's parts array: a signed thinking part,
 // a signed functionCall part and the answer text.
 //
-// It carries the two payloads a re-encoding round trip would damage: non-ASCII
-// text and a backslash escape (\" and \/) inside the signature. If anything
-// between the decoder and the next request re-serialized this array, these
-// bytes would come back different.
-const gemSignedParts = `[{"text":"günlük bakıyorum","thought":true,"thoughtSignature":"Cq4B\/sig\"one\""},` +
+// It carries the payloads a re-encoding round trip would damage: non-ASCII
+// text, a backslash escape (\" and \/) inside the signature, and a "<" - the
+// one character class the echo path does NOT preserve byte for byte. If
+// anything between the decoder and the next request re-serialized this array,
+// these bytes would come back different in some other way too.
+const gemSignedParts = `[{"text":"günlük <app> bakıyorum","thought":true,"thoughtSignature":"Cq4B\/sig\"one\""},` +
 	`{"functionCall":{"id":"call_1","name":"fs_read","args":{"path":"app \"prod\".log"}},"thoughtSignature":"Ep8CtwoB"},` +
 	`{"text":"okuyorum"}]`
+
+// gemSignedPartsOnWire is what those bytes look like in the NEXT request.
+//
+// CONTRACT: the echo is byte-exact but for one documented deviation - Go's
+// encoder escapes <, > and & as \u003c, \u003e and \u0026 when it marshals
+// the raw parts region (gemContent.MarshalJSON says so, and the Anthropic
+// client's carrier makes the same trade). It is value-preserving: the provider
+// decodes the identical strings it produced, which is what a signature is
+// computed over. This constant exists so the deviation is PINNED rather than
+// discovered by a future reader of a failing diff.
+var gemSignedPartsOnWire = strings.NewReplacer("<", "\\u003c", ">", "\\u003e", "&", "\\u0026").Replace(gemSignedParts)
 
 func gemCandidateBody(parts, finish string) string {
 	return `{"candidates":[{"content":{"role":"model","parts":` + parts + `},"finishReason":"` + finish + `"}],
@@ -131,8 +144,13 @@ func TestGeminiThoughtSignatureRoundTrip(t *testing.T) {
 	if contents[1].Role != geminiRoleModel {
 		t.Errorf("echoed role: got %q, want model", contents[1].Role)
 	}
-	if got := string(contents[1].Parts); got != gemSignedParts {
-		t.Errorf("model parts are not byte-identical.\ngot:  %s\nwant: %s", got, gemSignedParts)
+	if got := string(contents[1].Parts); got != gemSignedPartsOnWire {
+		t.Errorf("model parts are not the echoed bytes.\ngot:  %s\nwant: %s", got, gemSignedPartsOnWire)
+	}
+	// The deviation is exactly the HTML escape and nothing else: everything
+	// outside that character class survives byte for byte.
+	if strings.Contains(string(contents[1].Parts), "<") {
+		t.Error("the encoder stopped escaping <; gemContent.MarshalJSON's documented deviation is stale")
 	}
 	// The function NAME is not in the neutral tool-result message; it is
 	// recovered from the call the assistant turn announced - which the raw

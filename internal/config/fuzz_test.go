@@ -26,6 +26,14 @@ func FuzzLoad(f *testing.F) {
 	// branches (no base_url requirement, no dialect, its own owned-params set),
 	// so mutating from here reaches code the other seeds never enter.
 	f.Add([]byte("model: m\nprovider:\n  type: gemini\n  api_key: '${K}'\n  reasoning: {budget_tokens: 8192}\n  params: {labels: {team: ops}}\n"))
+	// The vertex block: another optional pointer struct, and the only strings
+	// in the config that are held to a charset because they become part of a
+	// HOSTNAME. Mutating from here is what walks ValidVertexID.
+	f.Add([]byte("model: m\nprovider:\n  type: gemini\n  vertex: {project: my-project, location: europe-west4, credentials: /etc/amele/sa.json}\n"))
+	// A base_url carrying a PATH, next to a vertex block: the shape validation
+	// refuses (in vertex mode base_url names the host and nothing else), so
+	// this seed enters the rejection branch the other provider seeds never do.
+	f.Add([]byte("model: m\nprovider:\n  type: gemini\n  base_url: 'https://vpc-sc.example.com/v1beta/models'\n  vertex: {project: p, location: global}\n"))
 
 	f.Fuzz(func(t *testing.T, data []byte) {
 		dir := t.TempDir()

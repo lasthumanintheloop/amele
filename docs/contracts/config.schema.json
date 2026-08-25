@@ -93,6 +93,7 @@
           "type": "object",
           "description": "Points the gemini wire at Vertex AI instead of the AI Studio host: the request goes to https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent (host without the region prefix when location is \"global\"), authenticated with Google credentials rather than an API key. Valid only with type \"gemini\", and never together with api_key - Vertex refuses API keys outright. An absent block means AI Studio.",
           "additionalProperties": false,
+          "required": ["project", "location"],
           "properties": {
             "project": {
               "type": "string",

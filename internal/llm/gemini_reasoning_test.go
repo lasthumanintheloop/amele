@@ -257,6 +257,51 @@ func TestGeminiResponseSchemaFallback(t *testing.T) {
 	}
 }
 
+// TestGeminiFallbackBodyReusedOnLaterRetries is the gemini half of the parity
+// this flag needs (openai_test.go's TestChatFallbackBodyReusedOnLaterRetries is
+// the other): once the schema-less body has been adopted, every REMAINING retry
+// must send it too, and the response that finally succeeds must still say the
+// schema never travelled.
+//
+// Both halves ride on `body, fallbackBody = fallbackBody, nil` plus a `dropped`
+// that is never cleared afterwards. Without the swap, a 429 after a successful
+// downgrade would resurrect the rejected schema body and 400 forever; without
+// the sticky flag, the success arriving one retry LATER would look natively
+// enforced, and output.schema would then be enforced by nothing - with no
+// warning printed, because the warning is what the flag drives.
+func TestGeminiFallbackBodyReusedOnLaterRetries(t *testing.T) {
+	srv, recorded := gemStatusServer(t,
+		gemReply{status: http.StatusBadRequest, body: bodyGemSchemaRejectedCamel},
+		gemReply{status: http.StatusTooManyRequests, body: gemErrorBody(429, "RESOURCE_EXHAUSTED", "slow down", "")},
+		gemReply{body: gemOKBody(`{"ok":true}`)},
+	)
+	var sleeps int
+	client := &GeminiClient{BaseURL: srv.URL, Sleep: noSleep(t, &sleeps)}
+
+	resp, err := client.Chat(context.Background(), gemSchemaRequest())
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	if len(*recorded) != 3 {
+		t.Fatalf("requests: got %d, want 3 (schema, fallback, retry after the 429)", len(*recorded))
+	}
+	if !bytes.Contains((*recorded)[0], []byte(`"responseJsonSchema"`)) {
+		t.Errorf("first request must carry the schema: %s", (*recorded)[0])
+	}
+	for i, req := range (*recorded)[1:] {
+		if bytes.Contains(req, []byte(`"responseJsonSchema"`)) {
+			t.Errorf("request %d resurrected the rejected schema body: %s", i+2, req)
+		}
+	}
+	// One sleep only: the 429 backs off, the capability fallback does not.
+	if sleeps != 1 {
+		t.Errorf("sleeps: got %d, want 1 (429 backoff only)", sleeps)
+	}
+	if !resp.SchemaEnforcementDropped {
+		t.Error("a post-fallback retry response must be flagged SchemaEnforcementDropped")
+	}
+}
+
 // TestGeminiNoSchemaProbeOnSuccess: the fallback costs nothing when the
 // endpoint honors the schema - one request, and no false claim that native
 // enforcement was dropped. A request with no schema at all is never flagged

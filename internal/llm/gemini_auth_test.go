@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,9 +31,11 @@ const fakeAccessToken = "ya29.fake-access-token" //nolint:gosec // G101: a fixtu
 // token_uri at one of these.
 type tokenServer struct {
 	*httptest.Server
-	// hits counts exchanges. It is read after the server is closed, so no
-	// synchronization is needed beyond the handler's own happens-before.
-	hits int
+	// hits counts exchanges. Atomic because the handler runs on the server's
+	// own goroutine while the test reads the counter on its own - the server
+	// is still open at that point (t.Cleanup closes it), so the read is not
+	// ordered after the handler by anything but the request itself.
+	hits atomic.Int64
 	// form is the last exchange's POST body, which is what pins the grant type
 	// and the signed assertion.
 	form url.Values
@@ -48,7 +51,7 @@ func newTokenServer(t *testing.T) *tokenServer {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		ts.hits++
+		ts.hits.Add(1)
 		ts.form = r.PostForm
 		life := ts.expiresIn
 		if life == 0 {
@@ -155,8 +158,8 @@ func TestServiceAccountKeyIsExchangedAtTheFilesTokenURI(t *testing.T) {
 	if got != fakeAccessToken {
 		t.Errorf("token = %q, want %q", got, fakeAccessToken)
 	}
-	if srv.hits != 1 {
-		t.Fatalf("token endpoint hit %d times, want 1", srv.hits)
+	if srv.hits.Load() != 1 {
+		t.Fatalf("token endpoint hit %d times, want 1", srv.hits.Load())
 	}
 	if grant := srv.form.Get("grant_type"); grant != "urn:ietf:params:oauth:grant-type:jwt-bearer" {
 		t.Errorf("grant_type = %q", grant)
@@ -197,8 +200,8 @@ func TestTokenIsCachedUntilItNearsExpiry(t *testing.T) {
 			t.Fatalf("Token #%d: %v", i, err)
 		}
 	}
-	if srv.hits != 1 {
-		t.Errorf("token endpoint hit %d times, want 1", srv.hits)
+	if srv.hits.Load() != 1 {
+		t.Errorf("token endpoint hit %d times, want 1", srv.hits.Load())
 	}
 
 	// Inside the refresh margin the cached token is no longer good enough: the
@@ -207,8 +210,8 @@ func TestTokenIsCachedUntilItNearsExpiry(t *testing.T) {
 	if _, err := source.Token(context.Background()); err != nil {
 		t.Fatalf("Token after expiry: %v", err)
 	}
-	if srv.hits != 2 {
-		t.Errorf("token endpoint hit %d times after expiry, want 2", srv.hits)
+	if srv.hits.Load() != 2 {
+		t.Errorf("token endpoint hit %d times after expiry, want 2", srv.hits.Load())
 	}
 }
 
@@ -411,8 +414,8 @@ func TestTokenFetchHonoursContextCancellation(t *testing.T) {
 	if !errors.Is(err, ErrProvider) {
 		t.Errorf("error %v is not an ErrProvider", err)
 	}
-	if srv.hits != 0 {
-		t.Errorf("the token endpoint was reached %d times despite cancellation", srv.hits)
+	if srv.hits.Load() != 0 {
+		t.Errorf("the token endpoint was reached %d times despite cancellation", srv.hits.Load())
 	}
 }
 
