@@ -1886,10 +1886,22 @@ func warnSanitizedToolSchemas(cfg *config.Config, reg *tools.Registry, stderr io
 	if len(stripped) == 0 {
 		return
 	}
+	if len(stripped) > maxSanitizedWarnEntries {
+		rest := len(stripped) - maxSanitizedWarnEntries
+		stripped = append(stripped[:maxSanitizedWarnEntries],
+			fmt.Sprintf("and %d more (run `amele explain` for the full list)", rest))
+	}
 	_, _ = fmt.Fprintln(stderr, secrets.Redact(
 		"warning: tool schemas sanitized for the gemini wire (unsupported JSON Schema keywords and shapes removed): "+
 			strings.Join(stripped, ", ")))
 }
+
+// maxSanitizedWarnEntries caps the tool:key pairs the one-line sanitizer
+// warning lists. A large MCP toolset can strip hundreds of keys, and this
+// line lands in cron mail; `amele explain` already lists every pair, so the
+// warning only has to prove the stripping happened and name where the full
+// list lives.
+const maxSanitizedWarnEntries = 8
 
 // interruptedError renders an interruption of a run that had already started,
 // mapping it onto the exit code contract.

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +16,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/session"
+	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
 // geminiTextBody is a minimal successful generateContent response: one model
@@ -313,6 +316,81 @@ func TestE2ENonGeminiRunHasNoSanitizerWarning(t *testing.T) {
 	}
 	if strings.Contains(stderr, "sanitized") {
 		t.Errorf("an openai-wire run printed a sanitizer warning: %s", stderr)
+	}
+}
+
+// sanitizeStubTool is a minimal tools.Tool whose parameters schema always
+// carries one gemini-unsupported keyword ("additionalProperties" is not in
+// geminiSchemaKeywords), so each registration contributes exactly one
+// stripped tool:key pair to warnSanitizedToolSchemas's line - enough to build
+// a warning of a known size without standing up a real MCP toolset.
+type sanitizeStubTool struct{ name string }
+
+func (s sanitizeStubTool) Def() llm.ToolDef {
+	return llm.ToolDef{Name: s.name, Parameters: json.RawMessage(`{"additionalProperties":false}`)}
+}
+
+func (s sanitizeStubTool) Invoke(context.Context, string) (string, error) { return "", nil }
+
+// sanitizeStubRegistry builds a registry of n stub tools, each stripping
+// exactly one key, so the sanitizer warning lists exactly n tool:key pairs
+// before any cap is applied.
+func sanitizeStubRegistry(t *testing.T, n int) *tools.Registry {
+	t.Helper()
+	reg := tools.NewRegistry()
+	for i := 0; i < n; i++ {
+		if err := reg.Register(sanitizeStubTool{name: fmt.Sprintf("tool%02d", i)}); err != nil {
+			t.Fatalf("registering stub tool %d: %v", i, err)
+		}
+	}
+	return reg
+}
+
+// TestSanitizerWarningIsCapped pins issue #20: a large MCP toolset must not
+// turn the one-line warning into thousands of chars of cron mail. The first
+// maxSanitizedWarnEntries pairs are listed; the rest collapse to a count that
+// points at `amele explain`, which lists everything.
+func TestSanitizerWarningIsCapped(t *testing.T) {
+	reg := sanitizeStubRegistry(t, 12)
+	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini}}
+
+	var buf bytes.Buffer
+	warnSanitizedToolSchemas(cfg, reg, &buf, false, session.NewSecretSet(nil))
+	got := buf.String()
+
+	if want := "and 4 more (run `amele explain` for the full list)"; !strings.Contains(got, want) {
+		t.Errorf("warning not capped: want substring %q in %q", want, got)
+	}
+	if strings.Contains(got, `"tool08"`) {
+		t.Errorf("warning lists more than the cap: %q", got)
+	}
+	if !strings.Contains(got, `"tool07"`) {
+		t.Errorf("warning dropped an entry it should have kept: %q", got)
+	}
+	if n := strings.Count(got, "\n"); n > 1 {
+		t.Errorf("warning must stay one line, got %d newlines: %q", n, got)
+	}
+}
+
+// TestSanitizerWarningUnderCapHasNoSuffix is the companion case: a toolset at
+// or under maxSanitizedWarnEntries is unaffected by the cap - no truncation,
+// no "and N more" suffix, every pair still listed.
+func TestSanitizerWarningUnderCapHasNoSuffix(t *testing.T) {
+	reg := sanitizeStubRegistry(t, 5)
+	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini}}
+
+	var buf bytes.Buffer
+	warnSanitizedToolSchemas(cfg, reg, &buf, false, session.NewSecretSet(nil))
+	got := buf.String()
+
+	if strings.Contains(got, "more (run") {
+		t.Errorf("under-cap warning carries a cap suffix: %q", got)
+	}
+	for i := 0; i < 5; i++ {
+		want := fmt.Sprintf(`"tool%02d"`, i)
+		if !strings.Contains(got, want) {
+			t.Errorf("under-cap warning dropped %q: %q", want, got)
+		}
 	}
 }
 
