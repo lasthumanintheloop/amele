@@ -86,10 +86,13 @@ actually writes it.
 | gemini wire | `contents`, `systemInstruction`, `tools`, `toolConfig`, `generationConfig`, `safetySettings`, `cachedContent` - each in **both** spellings (protobuf JSON accepts the snake_case form too) |
 
 Two more are refused everywhere, for a different reason - not because amele
-writes them, but because its own machinery cannot survive them: `stream` (the
-clients read a single JSON body; an SSE stream is a parse error) and
-`tool_choice` (the loop stops when the model answers without calling a tool, so
-a pinned `required` turns every run into a `max_turns` failure).
+writes them, but because those slots belong to amele's own request machinery
+whatever the value: `stream` and `tool_choice`. `amele validate` refuses the
+key, not a particular value, and this is what goes wrong when the slot is
+claimed: the clients read a single JSON body, so `stream: true` returns an SSE
+stream amele answers with a parse error; and the loop stops when the model
+answers without calling a tool, so a pinned `tool_choice: required` turns every
+run into a `max_turns` failure (exit 3).
 
 Everything else is yours. That is what makes a provider-specific control
 reachable even when amele has no neutral field for it: `thinking` is a config
