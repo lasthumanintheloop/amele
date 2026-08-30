@@ -451,19 +451,40 @@ func (w *Writer) RunStart(model, task string) {
 	w.emit(Event{Type: "run_start", Model: model, Task: w.clip(task)})
 }
 
-// LLMResponse records one provider round-trip: the assistant's text (clipped
-// and redacted), the IDs of any tool calls it requested, the token accounting,
-// and the SIZE of the turn's reasoning payload.
+// LLMResponse is one model turn as the log records it.
 //
-// reasoningBytes is a length, not a payload: the caller passes
-// len(message.Reasoning) and the reasoning itself is never written (see
-// Event.ReasoningBytes). Zero means the turn carried none.
-func (w *Writer) LLMResponse(turn int, content string, toolCallIDs []string, inputTokens, outputTokens int, finishReason string, reasoningBytes int) {
+// It is a struct rather than a parameter list for the same reason ToolResult
+// is: four ints in a row is a call site where a transposition compiles and
+// lies (issue #15).
+type LLMResponse struct {
+	// Turn is the 1-based turn number, offset by the caller's TurnBase so a
+	// multi-call session keeps counting up.
+	Turn int
+	// Content is the assistant text, before clipping and redaction.
+	Content string
+	// ToolCallIDs are the IDs of any tool calls the turn requested.
+	ToolCallIDs []string
+	// InputTokens and OutputTokens are the provider-reported accounting.
+	InputTokens  int
+	OutputTokens int
+	// FinishReason is the provider's stop reason, verbatim.
+	FinishReason string
+	// ReasoningBytes is the SIZE of the turn's reasoning payload - a length,
+	// not a payload: the caller passes len(message.Reasoning) and the
+	// reasoning itself is never written (see Event.ReasoningBytes). Zero
+	// means the turn carried none.
+	ReasoningBytes int
+}
+
+// LLMResponse records a model turn: content (clipped and redacted), the IDs of
+// any tool calls it requested, the token accounting, and the size of the
+// turn's reasoning payload.
+func (w *Writer) LLMResponse(r LLMResponse) {
 	w.emit(Event{
-		Type: "llm_response", Turn: turn,
-		Content: w.clip(content), ToolCallIDs: toolCallIDs,
-		InputTokens: inputTokens, OutputTokens: outputTokens,
-		FinishReason: finishReason, ReasoningBytes: reasoningBytes,
+		Type: "llm_response", Turn: r.Turn,
+		Content: w.clip(r.Content), ToolCallIDs: r.ToolCallIDs,
+		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+		FinishReason: r.FinishReason, ReasoningBytes: r.ReasoningBytes,
 	})
 }
 

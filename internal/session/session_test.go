@@ -36,11 +36,11 @@ func TestWriterGolden(t *testing.T) {
 	w.RunStart("test-model", "scan the logs")
 	// A turn that carried reasoning reports its SIZE only - the log never
 	// carries the thinking itself.
-	w.LLMResponse(1, "let me read the log", []string{"call_1"}, 100, 20, "tool_calls", len(`"the log is where the errors are"`))
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "let me read the log", ToolCallIDs: []string{"call_1"}, InputTokens: 100, OutputTokens: 20, FinishReason: "tool_calls", ReasoningBytes: len(`"the log is where the errors are"`)})
 	w.ToolCall("call_1", "fs_read", `{"path":"app.log"}`)
 	// The secret arrives via tool output and must be redacted by value.
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "fs_read", Result: "line with sk-supersecret token", Outcome: OutcomeOK})
-	w.LLMResponse(2, "all clear", nil, 150, 30, "stop", 0)
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop"})
 	w.RunEnd("success", 0, 2, 1, 300, 1500*time.Millisecond)
 
 	got, err := os.ReadFile(w.Path())
@@ -126,8 +126,8 @@ func TestLLMResponseReasoningBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	reasoning := `{"type":"thinking","thinking":"the answer is 4"}`
-	w.LLMResponse(1, "thinking hard", nil, 10, 5, "stop", len(reasoning))
-	w.LLMResponse(2, "no reasoning here", nil, 10, 5, "stop", 0)
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "thinking hard", InputTokens: 10, OutputTokens: 5, FinishReason: "stop", ReasoningBytes: len(reasoning)})
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "no reasoning here", InputTokens: 10, OutputTokens: 5, FinishReason: "stop"})
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -157,7 +157,7 @@ func TestRedaction(t *testing.T) {
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "t", Result: "key=sk-verysecret and tiny goes too", Outcome: OutcomeOK})
 	// The model may echo a secret in its answer text; that path must be
 	// redacted too now that content is logged.
-	w.LLMResponse(2, "the key is sk-verysecret", nil, 1, 1, "stop", 0)
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "the key is sk-verysecret", InputTokens: 1, OutputTokens: 1, FinishReason: "stop"})
 	w.RunEnd("success", 0, 1, 1, 10, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
@@ -202,7 +202,7 @@ func TestReplaySource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.LLMResponse(1, "reading the log now", []string{"call_9"}, 10, 5, "tool_calls", 0)
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "reading the log now", ToolCallIDs: []string{"call_9"}, InputTokens: 10, OutputTokens: 5, FinishReason: "tool_calls"})
 	w.ToolCall("call_9", "fs_read", `{"path":"x"}`)
 	w.ToolResult(ToolResult{CallID: "call_9", Tool: "fs_read", Result: "data", Outcome: OutcomeOK})
 	w.RunEnd("success", 0, 1, 1, 15, time.Second)
@@ -261,7 +261,7 @@ func TestClipRuneBoundary(t *testing.T) {
 func TestNilWriterIsSafe(t *testing.T) {
 	var w *Writer
 	w.RunStart("m", "t")
-	w.LLMResponse(1, "c", []string{"id"}, 1, 1, "stop", 0)
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "c", ToolCallIDs: []string{"id"}, InputTokens: 1, OutputTokens: 1, FinishReason: "stop"})
 	w.ToolCall("id", "t", "{}")
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: "r", Outcome: OutcomeOK})
 	w.MCPConnect(MCPConnect{Server: "s", Transport: "stdio", OK: true})
@@ -458,7 +458,7 @@ func TestOutcomeFieldsAreToolResultOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.RunStart("m", "task")
-	w.LLMResponse(1, "text", []string{"c1"}, 1, 1, "tool_calls", 0)
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "text", ToolCallIDs: []string{"c1"}, InputTokens: 1, OutputTokens: 1, FinishReason: "tool_calls"})
 	w.ToolCall("c1", "shell", "{}")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: "out", Outcome: OutcomeOK})
 	w.RunEnd("success", 0, 1, 1, 2, time.Second)

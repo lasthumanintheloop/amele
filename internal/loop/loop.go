@@ -359,8 +359,12 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 		// The reasoning payload is logged as a SIZE only (JSONL v1.4): the loop
 		// never parses it, and its content is the one field of a turn that must
 		// not reach the log (session.Event.ReasoningBytes).
-		l.Session.LLMResponse(l.TurnBase+turn, resp.Message.Content, toolCallIDs(resp.Message.ToolCalls),
-			resp.Usage.InputTokens, resp.Usage.OutputTokens, resp.FinishReason, len(resp.Message.Reasoning))
+		l.Session.LLMResponse(session.LLMResponse{
+			Turn: l.TurnBase + turn, Content: resp.Message.Content,
+			ToolCallIDs: toolCallIDs(resp.Message.ToolCalls),
+			InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens,
+			FinishReason: resp.FinishReason, ReasoningBytes: len(resp.Message.Reasoning),
+		})
 
 		if err := l.checkTokenBudget(res, resp); err != nil {
 			return finish(err)
