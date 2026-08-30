@@ -275,14 +275,24 @@ var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
 // though NO target writes them, so they are not "owned" in the sense
 // llm.OwnedWireFields means.
 //
-// CONTRACT: they are refused because amele's own machinery cannot survive them,
-// not because they would clobber a field it writes:
-//   - stream: the clients read a single JSON body. An SSE stream decodes as a
-//     parse error, so the whole run would die on the first turn (streaming is a
-//     later roadmap slice, README §Roadmap).
+// CONTRACT: they are refused because these slots belong to amele's own request
+// machinery, not because they would clobber a field it writes. The values that
+// prove the point are value-SPECIFIC:
+//   - stream: the clients read a single JSON body. `stream: true` returns an
+//     SSE stream, which decodes as a parse error, so the whole run would die on
+//     the first turn (streaming is a later roadmap slice, README §Roadmap).
 //   - tool_choice: the loop owns the tool protocol - it offers the tools and
 //     stops when the model answers without calling one. A pinned "required"
 //     removes that stopping condition and every run ends at max_turns (exit 3).
+//
+// The refusal is nonetheless value-INDEPENDENT, and deliberately so: validate
+// refuses the KEY. A config that claims a slot of the protocol amele owns is a
+// mistake whichever value it sets - `stream: false` and `tool_choice: auto`
+// merely restate what amele already does, and accepting them would promise a
+// control amele does not honor - while the fatal values above are exactly the
+// ones an operator reaches for. Refusing the whole key is one rule to state and
+// one rule to test, and it needs no per-target table of which value is fatal
+// where.
 var reservedWireFields = []string{"stream", "tool_choice"}
 
 // SubprocessTool declares an external executable the model may invoke as a
@@ -1192,8 +1202,8 @@ func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialec
 // what this returns) is passed separately by the validateParams call site, so
 // the two get their own violation wording (issue #16): a key amele writes on
 // this target would be silently overwritten or overwrite a contract, while a
-// reserved key is refused because amele's own machinery cannot survive it at
-// all - neither reason describes the other case.
+// reserved key is refused because that slot belongs to amele's own request
+// machinery on every target - neither reason describes the other case.
 //
 // When the dialect did not parse it returns nil. Which key a dialect writes is
 // a dialect question and is unanswerable then, so the same one-error rule the
@@ -1382,9 +1392,10 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 // be clobbered by it - both silently. The two lists get their own violation
 // wording (issue #16): an owned-key collision would be silently overwritten
 // or overwrite a contract on THIS target, while a reserved key is refused on
-// EVERY target because amele's own machinery cannot survive it - neither
-// reason describes the other case, so one message for both would misdirect
-// the fix for whichever half it does not describe.
+// EVERY target because that slot belongs to amele's request machinery
+// (reservedWireFields) - neither reason describes the other case, so one
+// message for both would misdirect the fix for whichever half it does not
+// describe.
 func validateParams(add func(format string, args ...any), params map[string]any, owned, reserved []string) {
 	if len(params) == 0 {
 		return
@@ -1396,7 +1407,7 @@ func validateParams(add func(format string, args ...any), params map[string]any,
 		case slices.Contains(reserved, key):
 			// Checked first: a key could in principle appear in both lists, and
 			// "refused on every target" is the stronger, always-true claim.
-			add("provider.params key %q is reserved on every target (amele's own request machinery cannot run with it set); remove it", key)
+			add("provider.params key %q is reserved on every target (that slot belongs to amele's own request machinery, whatever the value); remove it", key)
 		case slices.Contains(owned, key):
 			add("provider.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", key)
 		}

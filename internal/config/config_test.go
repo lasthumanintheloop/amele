@@ -1739,12 +1739,13 @@ func TestLoadWithoutProviderTuning(t *testing.T) {
 
 // wantReservedStream is the WHOLE message a reserved provider.params key must
 // produce, rationale included. The rationale is pinned because it has been
-// wrong before (it claimed amele SETS stream, while reservedWireFields' own
-// CONTRACT says no target writes it): the keys are refused because amele's
-// machinery cannot run with them set, and an operator who is told the wrong
-// reason looks for the wrong fix.
+// wrong twice: it claimed amele SETS stream (reservedWireFields' CONTRACT says
+// no target writes it), and then that amele cannot RUN with it set (true of
+// stream: true, not of stream: false). What is true of every value is that the
+// slot belongs to amele's request machinery - the table refuses the KEY, and
+// an operator told the wrong reason looks for the wrong fix.
 const wantReservedStream = `provider.params key "stream" is reserved on every target ` +
-	`(amele's own request machinery cannot run with it set); remove it`
+	`(that slot belongs to amele's own request machinery, whatever the value); remove it`
 
 // TestValidateProviderTuning is the rule-by-rule table for the tuning surface.
 // Every case is a rule an operator can only learn about at exit 2, so each
@@ -2043,11 +2044,12 @@ func TestValidateProviderTuning(t *testing.T) {
 		},
 		{
 			// The reserved keys are refused on EVERY target: amele's transport
-			// reads a single JSON body and its loop owns the tool protocol.
+			// reads a single JSON body and its loop owns the tool protocol,
+			// so those two slots are not the config's to claim.
 			//
 			// The three reserved cases assert the WHOLE message, rationale
-			// included: the reason is the load-bearing half (amele's machinery
-			// cannot survive the key - it does not write it), and a prefix
+			// included: the reason is the load-bearing half (the slot belongs
+			// to amele's machinery, which does NOT write the key), and a prefix
 			// assertion would let a wrong rationale back in unnoticed.
 			"params stream is refused on the gemini wire",
 			func(c *Config) {
@@ -2076,8 +2078,8 @@ func TestValidateProviderTuning(t *testing.T) {
 		{
 			// Reserved keys get their own wording (issue #16): "amele sets it
 			// itself on this target" is wrong for stream/tool_choice, which are
-			// refused on EVERY target because amele's machinery cannot survive
-			// them.
+			// refused on EVERY target because those slots belong to amele's
+			// request machinery, whatever value a config would put in them.
 			"params collides with a reserved key",
 			func(c *Config) { c.Provider.Params = map[string]any{"stream": true} },
 			wantReservedStream,
@@ -2519,9 +2521,9 @@ func TestValidateParamsOwnedKeysAreDialectScoped(t *testing.T) {
 // already decided.
 //
 // The reserved keys are the exception and are reported in the same pass: they
-// are refused on EVERY target - amele's own machinery cannot survive them - so
-// the dialect has no say, and withholding them would cost the operator a second
-// validate round for a violation that was already answerable.
+// are refused on EVERY target - those slots belong to amele's own request
+// machinery - so the dialect has no say, and withholding them would cost the
+// operator a second validate round for a violation that was already answerable.
 func TestValidateParamsSkipsCollisionsOnUnknownDialect(t *testing.T) {
 	cfg := tuningBase(t.TempDir())
 	cfg.Provider.Dialect = "kimi-k3"
