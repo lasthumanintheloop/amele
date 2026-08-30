@@ -537,9 +537,19 @@ var anthropicErrorSignatures = []errorSignature{
 		// "thinking.type" (the path form) keeps this away from the echo-back
 		// 400 family, which complains about thinking BLOCKS in messages, not
 		// about the request's thinking control object.
+		//
+		// Keyed on "enabled" alone, NOT on the broader "Input should be" phrase:
+		// a validation 400 that rejects an unknown union variant on a 4.7+
+		// adaptive model reads "thinking.type: Input should be 'adaptive' or
+		// 'disabled'" - it names "disabled", not "enabled", but still contains
+		// "Input should be". Matching on that phrase alone would fire this entry
+		// for the OPPOSITE direction (legacy budget_tokens sent to an adaptive
+		// model) and hand out reversed advice: telling an operator who is
+		// already using budget_tokens to switch to it. "enabled" only appears
+		// when the server names it as an ACCEPTED value, which happens only on
+		// the <=4.5 direction this entry is meant to cover.
 		match: func(e *statusError) bool {
-			return strings.Contains(e.snippet, "thinking.type") &&
-				(strings.Contains(e.snippet, "enabled") || strings.Contains(e.snippet, "Input should be"))
+			return strings.Contains(e.snippet, "thinking.type") && strings.Contains(e.snippet, "enabled")
 		},
 		advice: "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort",
 	},

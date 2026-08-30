@@ -687,6 +687,15 @@ const (
 	// request's thinking control object. Must match neither shape entry.
 	bodyAnthropicThinkingBlockEcho400 = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"messages.1.content.0: thinking block signature is invalid" + `"}}`
+	// The reversed-direction body a validation layer would send for the
+	// OPPOSITE case of bodyAnthropicAdaptiveOnLegacyModel: legacy
+	// budget_tokens sent to an adaptive (4.7+) model, phrased as an unknown
+	// union variant rather than as an unpermitted extra field. It names
+	// "disabled", not "enabled", but still contains "Input should be" - the
+	// regression fixture for the reversed-advice hazard fixed alongside this
+	// test (whole-branch review finding 1).
+	bodyAnthropicUnknownVariantOnAdaptiveModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"thinking.type: Input should be 'adaptive' or 'disabled'" + `"}}`
 	adviceThinkingBudgetOnAdaptive = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
 	adviceThinkingAdaptiveOnLegacy = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
 )
@@ -704,6 +713,7 @@ func TestAnthropic400AdviceForThinkingShape(t *testing.T) {
 		{"adaptive thinking on a legacy model", bodyAnthropicAdaptiveOnLegacyModel, adviceThinkingAdaptiveOnLegacy},
 		{"legacy budget_tokens on an adaptive model", bodyAnthropicBudgetTokensOnAdaptiveModel, adviceThinkingBudgetOnAdaptive},
 		{"a thinking-block echo 400 does not match the shape entry", bodyAnthropicThinkingBlockEcho400, ""},
+		{"unknown-variant wording on an adaptive model must not reverse the advice", bodyAnthropicUnknownVariantOnAdaptiveModel, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
