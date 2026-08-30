@@ -346,51 +346,56 @@ func sanitizeStubRegistry(t *testing.T, n int) *tools.Registry {
 	return reg
 }
 
-// TestSanitizerWarningIsCapped pins issue #20: a large MCP toolset must not
-// turn the one-line warning into thousands of chars of cron mail. The first
-// maxSanitizedWarnEntries pairs are listed; the rest collapse to a count that
-// points at `amele explain`, which lists everything.
-func TestSanitizerWarningIsCapped(t *testing.T) {
-	reg := sanitizeStubRegistry(t, 12)
-	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini}}
-
-	var buf bytes.Buffer
-	warnSanitizedToolSchemas(cfg, reg, &buf, false, session.NewSecretSet(nil))
-	got := buf.String()
-
-	if want := "and 4 more (run `amele explain` for the full list)"; !strings.Contains(got, want) {
-		t.Errorf("warning not capped: want substring %q in %q", want, got)
+// TestSanitizerWarningCapBoundary pins issue #20's cap across the three
+// cases that matter: under the cap (unaffected), exactly AT the cap (the
+// boundary a `>` vs `>=` off-by-one in warnSanitizedToolSchemas would flip
+// silently, since 8 is both "the last kept pair" and "the count that would
+// trigger a suffix"), and over the cap (truncated with a count pointing at
+// `amele explain`).
+func TestSanitizerWarningCapBoundary(t *testing.T) {
+	cases := []struct {
+		name       string
+		n          int  // stripped tool:key pairs the stub registry produces
+		wantSuffix bool // whether an "and N more" suffix must appear
+		wantPairs  int  // pairs (tool00..tool(wantPairs-1)) that must be listed
+	}{
+		{name: "under cap: 5 pairs, no suffix", n: 5, wantSuffix: false, wantPairs: 5},
+		{name: "exactly at cap: 8 pairs, no suffix", n: 8, wantSuffix: false, wantPairs: 8},
+		{name: "over cap: 12 pairs collapse to 8 plus a count", n: 12, wantSuffix: true, wantPairs: 8},
 	}
-	if strings.Contains(got, `"tool08"`) {
-		t.Errorf("warning lists more than the cap: %q", got)
-	}
-	if !strings.Contains(got, `"tool07"`) {
-		t.Errorf("warning dropped an entry it should have kept: %q", got)
-	}
-	if n := strings.Count(got, "\n"); n > 1 {
-		t.Errorf("warning must stay one line, got %d newlines: %q", n, got)
-	}
-}
 
-// TestSanitizerWarningUnderCapHasNoSuffix is the companion case: a toolset at
-// or under maxSanitizedWarnEntries is unaffected by the cap - no truncation,
-// no "and N more" suffix, every pair still listed.
-func TestSanitizerWarningUnderCapHasNoSuffix(t *testing.T) {
-	reg := sanitizeStubRegistry(t, 5)
-	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := sanitizeStubRegistry(t, tc.n)
+			cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini}}
 
-	var buf bytes.Buffer
-	warnSanitizedToolSchemas(cfg, reg, &buf, false, session.NewSecretSet(nil))
-	got := buf.String()
+			var buf bytes.Buffer
+			warnSanitizedToolSchemas(cfg, reg, &buf, false, session.NewSecretSet(nil))
+			got := buf.String()
 
-	if strings.Contains(got, "more (run") {
-		t.Errorf("under-cap warning carries a cap suffix: %q", got)
-	}
-	for i := 0; i < 5; i++ {
-		want := fmt.Sprintf(`"tool%02d"`, i)
-		if !strings.Contains(got, want) {
-			t.Errorf("under-cap warning dropped %q: %q", want, got)
-		}
+			if tc.wantSuffix {
+				want := fmt.Sprintf("and %d more (run `amele explain` for the full list)", tc.n-maxSanitizedWarnEntries)
+				if !strings.Contains(got, want) {
+					t.Errorf("warning not capped: want substring %q in %q", want, got)
+				}
+			} else if strings.Contains(got, "more (run") {
+				t.Errorf("warning carries a cap suffix it should not (n=%d): %q", tc.n, got)
+			}
+			for i := 0; i < tc.wantPairs; i++ {
+				want := fmt.Sprintf(`"tool%02d"`, i)
+				if !strings.Contains(got, want) {
+					t.Errorf("warning dropped %q it should have kept: %q", want, got)
+				}
+			}
+			if tc.n > maxSanitizedWarnEntries {
+				if absent := fmt.Sprintf(`"tool%02d"`, maxSanitizedWarnEntries); strings.Contains(got, absent) {
+					t.Errorf("warning lists more than the cap: %q", got)
+				}
+			}
+			if n := strings.Count(got, "\n"); n > 1 {
+				t.Errorf("warning must stay one line, got %d newlines: %q", n, got)
+			}
+		})
 	}
 }
 
