@@ -585,17 +585,30 @@ func anthropicSignatures(sent *anThinking) []errorSignature {
 // which rejects thinking BLOCKS at messages.N.content.M and names neither
 // field.
 //
-// It deliberately does NOT try to read a direction out of the wording: both
+// The "Input should be" phrase is accepted ONLY alongside thinking.type,
+// because on budget_tokens the same pydantic phrasing is a RANGE complaint
+// rather than a shape one: Anthropic's documented minimum is 1024 and amele's
+// config does not enforce it (it rejects only a negative budget and checks the
+// upper relation against max_tokens), so `budget_tokens: 512` validates and
+// then earns "thinking.budget_tokens: Input should be greater than or equal to
+// 1024". That is not a wrong-generation error - the 400 already names its own
+// fix, and a shape hint would send the operator to .effort, whose 400 on a
+// legacy model points back at budget_tokens. thinking.type carries no range, so
+// the phrase there can only be a rejected variant.
+//
+// It deliberately does NOT try to read a DIRECTION out of the wording: both
 // directions produce bodies from this same phrasing pool (see the CONTRACT on
 // anthropicErrorSignatures). Direction comes from the request.
 func rejectsThinkingShape(e *statusError) bool {
 	if !strings.Contains(e.snippet, "thinking.type") && !strings.Contains(e.snippet, "budget_tokens") {
 		return false
 	}
-	return strings.Contains(e.snippet, "not permitted") ||
+	if strings.Contains(e.snippet, "not permitted") ||
 		strings.Contains(e.snippet, "not supported") ||
-		strings.Contains(e.snippet, "Extra inputs") ||
-		strings.Contains(e.snippet, "Input should be")
+		strings.Contains(e.snippet, "Extra inputs") {
+		return true
+	}
+	return strings.Contains(e.snippet, "thinking.type") && strings.Contains(e.snippet, "Input should be")
 }
 
 // mapAnthropicThinking translates the neutral reasoning knob into the two

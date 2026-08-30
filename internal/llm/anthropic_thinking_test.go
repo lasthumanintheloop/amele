@@ -707,6 +707,13 @@ const (
 	// nothing about which direction the operator sent.
 	bodyAnthropicUnknownVariantOnAdaptiveModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"thinking.type: Input should be 'adaptive' or 'disabled'" + `"}}`
+	// A budget BELOW Anthropic's documented 1024 minimum. Reachable from a
+	// config that validates cleanly - config.go rejects only a negative budget
+	// and checks the upper relation against max_tokens, never the minimum - and
+	// phrased from the same pydantic pool as the two fixtures above, so it is
+	// the body most likely to be mistaken for a shape rejection.
+	bodyAnthropicBudgetBelowMinimum = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"thinking.budget_tokens: Input should be greater than or equal to 1024" + `"}}`
 	adviceThinkingUseEffort = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
 	adviceThinkingUseBudget = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
 )
@@ -786,6 +793,19 @@ func TestAnthropic400AdviceForThinkingShape(t *testing.T) {
 			reasoning:    &ReasoningSpec{Effort: effortNone},
 			wantThinking: map[string]any{"type": "disabled"},
 			body:         bodyAnthropicAdaptiveOnLegacyModel,
+			want:         "",
+		},
+		{
+			// A budget the server refuses as too SMALL is not a shape
+			// mismatch, and silence is the right answer: the 400 already names
+			// its own fix (raise the budget to 1024), while a shape hint would
+			// send the operator to .effort - which on a legacy model answers
+			// with the opposite 400, whose hint points back at budget_tokens.
+			// A contradictory hint loop is worse than no hint.
+			name:         "budget below the documented minimum is not a shape 400",
+			reasoning:    &ReasoningSpec{BudgetTokens: 512},
+			wantThinking: map[string]any{"type": "enabled", "budget_tokens": float64(512)},
+			body:         bodyAnthropicBudgetBelowMinimum,
 			want:         "",
 		},
 		{
