@@ -1396,7 +1396,7 @@ func validateParams(add func(format string, args ...any), params map[string]any,
 		case slices.Contains(reserved, key):
 			// Checked first: a key could in principle appear in both lists, and
 			// "refused on every target" is the stronger, always-true claim.
-			add("provider.params key %q is reserved on every target (amele's own request machinery sets it); remove it", key)
+			add("provider.params key %q is reserved on every target (amele's own request machinery cannot run with it set); remove it", key)
 		case slices.Contains(owned, key):
 			add("provider.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", key)
 		}

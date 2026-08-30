@@ -201,7 +201,6 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 // resolving, and without HOME/LANG everyday tools (git, locale-aware text
 // utilities) fail in ways that look like tool bugs - an allowlist that breaks
 // `git status` would simply be turned off, defeating its purpose.
-// Nothing runs without PATH - verified by trying.
 var baseEnvVars = []string{"PATH", "HOME", "LANG"}
 
 // buildChildEnv materializes the environment for an allowlisted child: the

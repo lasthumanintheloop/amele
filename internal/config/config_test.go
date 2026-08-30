@@ -1737,6 +1737,15 @@ func TestLoadWithoutProviderTuning(t *testing.T) {
 	}
 }
 
+// wantReservedStream is the WHOLE message a reserved provider.params key must
+// produce, rationale included. The rationale is pinned because it has been
+// wrong before (it claimed amele SETS stream, while reservedWireFields' own
+// CONTRACT says no target writes it): the keys are refused because amele's
+// machinery cannot run with them set, and an operator who is told the wrong
+// reason looks for the wrong fix.
+const wantReservedStream = `provider.params key "stream" is reserved on every target ` +
+	`(amele's own request machinery cannot run with it set); remove it`
+
 // TestValidateProviderTuning is the rule-by-rule table for the tuning surface.
 // Every case is a rule an operator can only learn about at exit 2, so each
 // message must name the field and say what to do instead.
@@ -2035,6 +2044,11 @@ func TestValidateProviderTuning(t *testing.T) {
 		{
 			// The reserved keys are refused on EVERY target: amele's transport
 			// reads a single JSON body and its loop owns the tool protocol.
+			//
+			// The three reserved cases assert the WHOLE message, rationale
+			// included: the reason is the load-bearing half (amele's machinery
+			// cannot survive the key - it does not write it), and a prefix
+			// assertion would let a wrong rationale back in unnoticed.
 			"params stream is refused on the gemini wire",
 			func(c *Config) {
 				c.Provider.Type = ProviderTypeGemini
@@ -2042,7 +2056,7 @@ func TestValidateProviderTuning(t *testing.T) {
 				c.Provider.APIKey = "k"
 				c.Provider.Params = map[string]any{"stream": true}
 			},
-			`provider.params key "stream"`,
+			wantReservedStream,
 		},
 		{
 			// The anthropic branch of ownedParamsKeys returns a non-nil owned
@@ -2057,7 +2071,7 @@ func TestValidateProviderTuning(t *testing.T) {
 				c.Provider.BaseURL = ""
 				c.Provider.Params = map[string]any{"stream": true}
 			},
-			`provider.params key "stream" is reserved on every target`,
+			wantReservedStream,
 		},
 		{
 			// Reserved keys get their own wording (issue #16): "amele sets it
@@ -2066,7 +2080,7 @@ func TestValidateProviderTuning(t *testing.T) {
 			// them.
 			"params collides with a reserved key",
 			func(c *Config) { c.Provider.Params = map[string]any{"stream": true} },
-			`provider.params key "stream" is reserved on every target`,
+			wantReservedStream,
 		},
 
 		// Rule 7: ranges. They are total for the dialect, so they belong in

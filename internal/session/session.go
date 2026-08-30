@@ -454,8 +454,9 @@ func (w *Writer) RunStart(model, task string) {
 // LLMResponse is one model turn as the log records it.
 //
 // It is a struct rather than a parameter list for the same reason ToolResult
-// is: four ints in a row is a call site where a transposition compiles and
-// lies (issue #15).
+// is: the positional form took seven arguments, four of them int and two of
+// those adjacent (inputTokens, outputTokens), so a transposed call site
+// compiles and then lies in the log (issue #15).
 type LLMResponse struct {
 	// Turn is the 1-based turn number, offset by the caller's TurnBase so a
 	// multi-call session keeps counting up.

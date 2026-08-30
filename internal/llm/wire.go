@@ -28,9 +28,10 @@ func decodeResponseBody(body io.Reader, into any) error {
 // shrunk - to the provider's Retry-After wish when one was sent. No single wait
 // exceeds maxRetryAfter, whether it came from the ladder or from the header.
 //
-// Shared by both clients on purpose: a retry rhythm that differed between the
-// OpenAI-compatible and the native Anthropic wire would be a trap for a config
-// that switches wires, and provider.retry configures exactly one behavior.
+// Shared by all three clients on purpose: a retry rhythm that differed between
+// the OpenAI-compatible, the native Anthropic and the native Gemini wire would
+// be a trap for a config that switches wires, and provider.retry configures
+// exactly one behavior.
 func backoffDelay(initial time.Duration, attempt int, retryAfter time.Duration) time.Duration {
 	if initial <= 0 {
 		initial = defaultInitialBackoff
@@ -71,7 +72,7 @@ func (e *statusError) Error() string {
 // The response body is read here (bounded to maxErrorBody) and not by the
 // caller, so the two cannot disagree about who consumed it.
 //
-// signatures is the caller's error-signature table: both clients share the
+// signatures is the caller's error-signature table: all three clients share the
 // retry/Retry-After/typed-error handling and differ only in which 400 bodies
 // they recognize.
 func statusFailure(httpResp *http.Response, signatures []errorSignature) (retryable bool, retryAfter time.Duration, err error) {
@@ -111,8 +112,9 @@ func shouldFallback(err error, fallback []byte, rejected func(*statusError) bool
 
 // encodeBody renders one request body: the struct-encoded fields first, in
 // declaration order, then the merged fragments. wire is any request struct
-// (oaRequest, anRequest) - both wire families need the same two-stage encoding,
-// because the KEY of a merged fragment is data rather than a Go field.
+// (oaRequest, anRequest, gemRequest) - all three wire families need the same
+// two-stage encoding, because the KEY of a merged fragment is data rather than
+// a Go field.
 func encodeBody(wire any, fields map[string]json.RawMessage) ([]byte, error) {
 	body, err := json.Marshal(wire)
 	if err != nil {
