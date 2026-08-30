@@ -2045,6 +2045,21 @@ func TestValidateProviderTuning(t *testing.T) {
 			`provider.params key "stream"`,
 		},
 		{
+			// The anthropic branch of ownedParamsKeys returns a non-nil owned
+			// list without consulting the dialect at all (unlike the
+			// openai/kimi/glm fallthrough), which makes it the arrangement most
+			// likely to shadow the reserved check if the switch in
+			// validateParams is ever reordered, so it gets its own coverage
+			// rather than relying on the gemini case alone.
+			"params stream is refused on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.Params = map[string]any{"stream": true}
+			},
+			`provider.params key "stream" is reserved on every target`,
+		},
+		{
 			// Reserved keys get their own wording (issue #16): "amele sets it
 			// itself on this target" is wrong for stream/tool_choice, which are
 			// refused on EVERY target because amele's machinery cannot survive

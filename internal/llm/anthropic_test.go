@@ -646,11 +646,20 @@ func TestAnthropicChatUsageIsSanitized(t *testing.T) {
 // must surface as a status failure instead of being followed (same posture as
 // the gemini client and the MCP HTTP transport).
 func TestAnthropicRefusesRedirects(t *testing.T) {
-	var elsewhereHits int
+	// atomic: this handler must not run at all (that is the assertion), but if
+	// a regression in CheckRedirect ever makes it run, it runs in its own
+	// goroutine - same hazard as TestAnthropicRequestTimeoutNotRetried above.
+	// Recording into plain ints/bools here and reading them from the test
+	// goroutine below would be a data race the day this posture regresses;
+	// asserting straight from the handler goroutine would risk calling
+	// t.Errorf after the test has already returned. Record atomically instead
+	// and assert once, from the test goroutine, after Chat returns.
+	var elsewhereHits atomic.Int32
+	var elsewhereSawAPIKey atomic.Bool
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		elsewhereHits++
+		elsewhereHits.Add(1)
 		if r.Header.Get("x-api-key") != "" {
-			t.Errorf("the api key followed a redirect to another host")
+			elsewhereSawAPIKey.Store(true)
 		}
 		_, _ = w.Write([]byte(anOKBody("stolen")))
 	}))
@@ -679,7 +688,10 @@ func TestAnthropicRefusesRedirects(t *testing.T) {
 	if se.code != http.StatusFound {
 		t.Errorf("code: got %d, want 302 (the redirect itself is the answer)", se.code)
 	}
-	if elsewhereHits != 0 {
-		t.Errorf("the redirect was followed %d times", elsewhereHits)
+	if hits := elsewhereHits.Load(); hits != 0 {
+		t.Errorf("the redirect was followed %d times", hits)
+	}
+	if elsewhereSawAPIKey.Load() {
+		t.Error("the api key followed a redirect to another host")
 	}
 }

@@ -1371,6 +1371,12 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 // a key amele reserves on every target (reserved), and nothing JSON cannot
 // express.
 //
+// reserved is read-only: the call site hands it the package-level
+// reservedWireFields slice directly (no defensive copy), which is safe only
+// because this function does no more than slices.Contains on it. Do not
+// mutate, sort, or otherwise write through reserved - doing so would corrupt
+// the shared package var for every future caller.
+//
 // CONTRACT: params is merged verbatim into the request body root, so a
 // collision would either clobber an amele contract (tools, response_format) or
 // be clobbered by it - both silently. The two lists get their own violation
