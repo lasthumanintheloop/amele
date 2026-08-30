@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -672,61 +673,159 @@ func TestAnthropic400AdviceForSampling(t *testing.T) {
 	}
 }
 
-// The two thinking-shape 400s the dialect layer is most likely to produce
+// The thinking-shape 400s the dialect layer is most likely to produce
 // (research §3, "reasoning knob" row): `thinking: {type: adaptive}` against a
 // model that predates it (<=4.5, so the server complains about
 // thinking.type's vocabulary), and the legacy `enabled` + budget_tokens shape
 // against an adaptive-generation model (4.7+, so the server rejects
-// budget_tokens as an extra input). Not captured live - see issue #17.
+// budget_tokens as an extra input, or rejects the "enabled" variant by name).
+//
+// All of these are synthesized from the research notes' shape rules EXCEPT
+// bodyAnthropicLegacyVariantRejected, which is a CAPTURED first-party 400
+// (reported in anthropics/claude-code-action#1225) - see issue #17 for the
+// live-capture ledger of the rest.
 const (
 	bodyAnthropicAdaptiveOnLegacyModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"thinking.type: Input should be 'enabled' or 'disabled'" + `"}}`
 	bodyAnthropicBudgetTokensOnAdaptiveModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"thinking.budget_tokens: Extra inputs are not permitted; this model does not support budget_tokens" + `"}}`
 	// The echo-back family: a thinking BLOCK rejected inside messages, not the
-	// request's thinking control object. Must match neither shape entry.
+	// request's thinking control object. Must match no shape entry, whatever
+	// shape the request carried.
 	bodyAnthropicThinkingBlockEcho400 = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"messages.1.content.0: thinking block signature is invalid" + `"}}`
-	// The reversed-direction body a validation layer would send for the
-	// OPPOSITE case of bodyAnthropicAdaptiveOnLegacyModel: legacy
-	// budget_tokens sent to an adaptive (4.7+) model, phrased as an unknown
-	// union variant rather than as an unpermitted extra field. It names
-	// "disabled", not "enabled", but still contains "Input should be" - the
-	// regression fixture for the reversed-advice hazard fixed alongside this
-	// test (whole-branch review finding 1).
+	// CAPTURED first-party 400 (anthropics/claude-code-action#1225): a 4.7+
+	// adaptive model rejecting the legacy shape by NAMING it. "enabled" here is
+	// a JSON-path component naming the REJECTED value, which is what made the
+	// old string-direction heuristic hand out reversed advice - this is the
+	// regression fixture for that failure.
+	bodyAnthropicLegacyVariantRejected = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		`\"thinking.type.enabled\" is not supported` + `"}}`
+	// The unknown-union-variant phrasing for the same direction: legacy
+	// budget_tokens sent to an adaptive (4.7+) model. It names "disabled", not
+	// "enabled", and contains "Input should be" - a body whose wording says
+	// nothing about which direction the operator sent.
 	bodyAnthropicUnknownVariantOnAdaptiveModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
 		"thinking.type: Input should be 'adaptive' or 'disabled'" + `"}}`
-	adviceThinkingBudgetOnAdaptive = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
-	adviceThinkingAdaptiveOnLegacy = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
+	adviceThinkingUseEffort = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
+	adviceThinkingUseBudget = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
 )
 
-// TestAnthropic400AdviceForThinkingShape (issue #14): the recognized
-// thinking-shape 400 gains the hint naming the reasoning knob to use instead,
-// same message, same single final call. The echo-back 400 (a thinking block
-// rejected in messages) must carry no advice.
+// TestAnthropic400AdviceForThinkingShape (issue #14, whole-branch review
+// findings 1-2): the hint on a thinking-shape 400 names the OPPOSITE spelling
+// of the shape amele SENT, and is derived from the request rather than from the
+// server's phrasing - two of these bodies are direction-ambiguous strings that
+// no heuristic could route correctly.
+//
+// Each case therefore sets a real reasoning spec, asserts the wire request
+// actually carried that shape, and pins the resulting message. Same message,
+// same single final call as before.
 func TestAnthropic400AdviceForThinkingShape(t *testing.T) {
 	tests := []struct {
-		name string
-		body string
-		want string
+		name      string
+		reasoning *ReasoningSpec
+		// wantThinking is the thinking object the request must carry, as
+		// decoded JSON; nil means the key must be absent.
+		wantThinking map[string]any
+		body         string
+		want         string
 	}{
-		{"adaptive thinking on a legacy model", bodyAnthropicAdaptiveOnLegacyModel, adviceThinkingAdaptiveOnLegacy},
-		{"legacy budget_tokens on an adaptive model", bodyAnthropicBudgetTokensOnAdaptiveModel, adviceThinkingBudgetOnAdaptive},
-		{"a thinking-block echo 400 does not match the shape entry", bodyAnthropicThinkingBlockEcho400, ""},
-		{"unknown-variant wording on an adaptive model must not reverse the advice", bodyAnthropicUnknownVariantOnAdaptiveModel, ""},
+		{
+			// The captured 400 that broke the old design: the operator is
+			// already on budget_tokens, so the advice must send them to
+			// effort - never back to the spelling they just used.
+			name:         "legacy budget_tokens sent, adaptive-model wording",
+			reasoning:    &ReasoningSpec{BudgetTokens: 4096},
+			wantThinking: map[string]any{"type": "enabled", "budget_tokens": float64(4096)},
+			body:         bodyAnthropicLegacyVariantRejected,
+			want:         adviceThinkingUseEffort,
+		},
+		{
+			name:         "legacy budget_tokens sent, unknown-variant wording",
+			reasoning:    &ReasoningSpec{BudgetTokens: 4096},
+			wantThinking: map[string]any{"type": "enabled", "budget_tokens": float64(4096)},
+			body:         bodyAnthropicUnknownVariantOnAdaptiveModel,
+			want:         adviceThinkingUseEffort,
+		},
+		{
+			name:         "legacy budget_tokens sent, extra-input wording",
+			reasoning:    &ReasoningSpec{BudgetTokens: 4096},
+			wantThinking: map[string]any{"type": "enabled", "budget_tokens": float64(4096)},
+			body:         bodyAnthropicBudgetTokensOnAdaptiveModel,
+			want:         adviceThinkingUseEffort,
+		},
+		{
+			name:         "adaptive effort sent, legacy-model wording",
+			reasoning:    &ReasoningSpec{Effort: "high"},
+			wantThinking: map[string]any{"type": "adaptive"},
+			body:         bodyAnthropicAdaptiveOnLegacyModel,
+			want:         adviceThinkingUseBudget,
+		},
+		{
+			// The same ambiguous string as the second case, sent from the
+			// other direction: the advice flips because the REQUEST did.
+			name:         "adaptive effort sent, unknown-variant wording",
+			reasoning:    &ReasoningSpec{Effort: "high"},
+			wantThinking: map[string]any{"type": "adaptive"},
+			body:         bodyAnthropicUnknownVariantOnAdaptiveModel,
+			want:         adviceThinkingUseBudget,
+		},
+		{
+			// Nothing was configured, so a thinking-shape 400 is not amele's
+			// doing and there is no grounded hint to give.
+			name:         "no reasoning configured, thinking-shape 400",
+			reasoning:    nil,
+			wantThinking: nil,
+			body:         bodyAnthropicUnknownVariantOnAdaptiveModel,
+			want:         "",
+		},
+		{
+			// thinking: {type: disabled} is not a shape that can be "wrong for
+			// the model generation" either.
+			name:         "thinking turned off, thinking-shape 400",
+			reasoning:    &ReasoningSpec{Effort: effortNone},
+			wantThinking: map[string]any{"type": "disabled"},
+			body:         bodyAnthropicAdaptiveOnLegacyModel,
+			want:         "",
+		},
+		{
+			name:         "echo-back 400 carries no advice, budget sent",
+			reasoning:    &ReasoningSpec{BudgetTokens: 4096},
+			wantThinking: map[string]any{"type": "enabled", "budget_tokens": float64(4096)},
+			body:         bodyAnthropicThinkingBlockEcho400,
+			want:         "",
+		},
+		{
+			name:         "echo-back 400 carries no advice, effort sent",
+			reasoning:    &ReasoningSpec{Effort: "high"},
+			wantThinking: map[string]any{"type": "adaptive"},
+			body:         bodyAnthropicThinkingBlockEcho400,
+			want:         "",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls int
-			srv := anthropicServer(t, func(w http.ResponseWriter, _ map[string]any) {
+			srv := anthropicServer(t, func(w http.ResponseWriter, req map[string]any) {
 				calls++
+				// The advice is only meaningful if the request really carried
+				// the shape the case claims it did.
+				got, present := req["thinking"]
+				if tt.wantThinking == nil {
+					if present {
+						t.Errorf("thinking must be absent, got %v", got)
+					}
+				} else if !reflect.DeepEqual(got, map[string]any(tt.wantThinking)) {
+					t.Errorf("thinking sent:\n got %v\nwant %v", got, tt.wantThinking)
+				}
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(tt.body))
 			})
 			client := &AnthropicClient{BaseURL: srv.URL}
 			_, err := client.Chat(context.Background(), Request{
-				Model:    "claude-opus-5",
-				Messages: []Message{{Role: RoleUser, Content: "x"}},
+				Model:     "claude-opus-5",
+				Messages:  []Message{{Role: RoleUser, Content: "x"}},
+				Reasoning: tt.reasoning,
 			})
 			if err == nil {
 				t.Fatal("expected error")

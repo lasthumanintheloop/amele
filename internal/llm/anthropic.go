@@ -263,6 +263,12 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 	if err != nil {
 		return nil, fmt.Errorf("%w: encoding request: %v", ErrProvider, err)
 	}
+	// The error-signature table is built HERE, where the thinking shape amele
+	// is about to send is still visible: the thinking-shape hint is derived
+	// from the request, not from the server's wording (see
+	// anthropicSignatures). The output_config fallback below never touches
+	// wire.Thinking, so this table stays right for every attempt in this call.
+	signatures := anthropicSignatures(wire.Thinking)
 
 	// fallbackBody is the same request with output_config stripped, built
 	// up-front only when a schema was actually requested. Capability is
@@ -308,7 +314,7 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 			}
 		}
 
-		resp, retryable, ra, err := c.doOnce(ctx, body)
+		resp, retryable, ra, err := c.doOnce(ctx, body, signatures)
 		if shouldFallback(err, fallbackBody, (*statusError).rejectsOutputConfig) {
 			// Capability discovery, not a transient failure: the endpoint will
 			// reject the field just as firmly on the next attempt, so the
@@ -319,7 +325,7 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 			// is then used for any remaining retries too.
 			body, fallbackBody = fallbackBody, nil
 			dropped = true
-			resp, retryable, ra, err = c.doOnce(ctx, body)
+			resp, retryable, ra, err = c.doOnce(ctx, body, signatures)
 		}
 		if err == nil {
 			resp.SchemaEnforcementDropped = dropped
@@ -337,7 +343,12 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 // doOnce performs a single HTTP round-trip. retryable reports whether the
 // failure is worth retrying; retryAfter carries the provider's Retry-After
 // wish (0 when absent).
-func (c *AnthropicClient) doOnce(ctx context.Context, body []byte) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
+//
+// signatures is the table a 400 body is judged by. It is a parameter rather
+// than the package-level table because part of it depends on what THIS request
+// carries (anthropicSignatures), and the caller is the last place that still
+// knows.
+func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []errorSignature) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
 	base := c.BaseURL
 	if base == "" {
 		base = defaultAnthropicBaseURL
@@ -379,7 +390,7 @@ func (c *AnthropicClient) doOnce(ctx context.Context, body []byte) (resp *Respon
 		// which includes 529, the non-standard "overloaded" status Anthropic
 		// documents as retryable), same typed statusError, same Retry-After
 		// reading - only the error-signature table differs.
-		retryable, retryAfter, err := statusFailure(httpResp, anthropicErrorSignatures)
+		retryable, retryAfter, err := statusFailure(httpResp, signatures)
 		return nil, retryable, retryAfter, err
 	}
 
@@ -481,21 +492,27 @@ func (e *statusError) rejectsOutputConfig() bool {
 	return e.code == http.StatusBadRequest && strings.Contains(e.snippet, "output_config")
 }
 
-// anthropicErrorSignatures is the ordered table consulted for a non-retryable
-// 400 on the Messages API wire, the counterpart of errorSignatures on the
-// OpenAI wire.
+// anthropicErrorSignatures is the shape-independent part of the table
+// consulted for a non-retryable 400 on the Messages API wire, the counterpart
+// of errorSignatures on the OpenAI wire. anthropicSignatures builds the table
+// an actual request is judged by, adding the thinking-shape entry when the
+// request carried a thinking shape at all.
 //
-// CONTRACT: these are STRING HEURISTICS by necessity (design doc §"Error-
-// signature detection") and the fixtures in anthropic_thinking_test.go are what
-// pin them. They are safe in a way a general string match is not, because they
-// change NOTHING but the human-facing text: no retry, no downgrade, no request
-// rewrite. A signature that stops matching (Anthropic reworded its 400) costs a
-// hint, never correctness.
+// CONTRACT: recognizing WHICH failure happened is a STRING HEURISTIC by
+// necessity (design doc §"Error-signature detection") and the fixtures in
+// anthropic_thinking_test.go are what pin it. That is safe in a way a general
+// string match is not, because it changes NOTHING but the human-facing text: no
+// retry, no downgrade, no request rewrite. A signature that stops matching
+// (Anthropic reworded its 400) costs a hint, never correctness.
 //
-// The two thinking-shape entries below (issue #14) advise the reasoning knob
-// to use when the dialect layer picks the wrong thinking generation for the
-// model - adaptive against a legacy model, or legacy budget_tokens against an
-// adaptive one.
+// CONTRACT: the thinking-shape entry's ADVICE, however, is grounded in the
+// REQUEST and never in the server's phrasing (see anthropicSignatures). Both
+// directions of the shape mismatch produce 400s that name thinking.type and may
+// name either value in either role - "\"thinking.type.enabled\" is not
+// supported" is a real 4.7+ rejection of the LEGACY shape - so no wording can
+// tell them apart, and a hint derived from wording could point the operator at
+// the exact spelling they just sent. Deriving it from the shape amele sent
+// makes that reversal impossible by construction.
 var anthropicErrorSignatures = []errorSignature{
 	{
 		// Sampling: current Claude models reject a non-default temperature
@@ -518,41 +535,67 @@ var anthropicErrorSignatures = []errorSignature{
 		},
 		advice: "this model rejects non-default sampling; remove provider.temperature/top_p",
 	},
-	{
-		// Thinking shape, wrong direction 1: budget_tokens against an
-		// adaptive-generation model (4.7+). Keyed on the field name plus a
-		// rejection phrase so a 400 that merely mentions the field while
-		// complaining about something else does not match.
-		match: func(e *statusError) bool {
-			return strings.Contains(e.snippet, "budget_tokens") &&
-				(strings.Contains(e.snippet, "not permitted") ||
-					strings.Contains(e.snippet, "not supported") ||
-					strings.Contains(e.snippet, "Extra inputs"))
-		},
-		advice: "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)",
-	},
-	{
-		// Thinking shape, wrong direction 2: adaptive against a legacy model
-		// (<=4.5). The server complains about thinking.type's vocabulary.
-		// "thinking.type" (the path form) keeps this away from the echo-back
-		// 400 family, which complains about thinking BLOCKS in messages, not
-		// about the request's thinking control object.
-		//
-		// Keyed on "enabled" alone, NOT on the broader "Input should be" phrase:
-		// a validation 400 that rejects an unknown union variant on a 4.7+
-		// adaptive model reads "thinking.type: Input should be 'adaptive' or
-		// 'disabled'" - it names "disabled", not "enabled", but still contains
-		// "Input should be". Matching on that phrase alone would fire this entry
-		// for the OPPOSITE direction (legacy budget_tokens sent to an adaptive
-		// model) and hand out reversed advice: telling an operator who is
-		// already using budget_tokens to switch to it. "enabled" only appears
-		// when the server names it as an ACCEPTED value, which happens only on
-		// the <=4.5 direction this entry is meant to cover.
-		match: func(e *statusError) bool {
-			return strings.Contains(e.snippet, "thinking.type") && strings.Contains(e.snippet, "enabled")
-		},
-		advice: "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort",
-	},
+}
+
+// The two thinking-shape hints (issue #14). Each names the spelling the
+// operator did NOT send, in the config's vocabulary.
+const (
+	adviceAnthropicUseEffort = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
+	adviceAnthropicUseBudget = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
+)
+
+// anthropicSignatures returns the error-signature table for a request that
+// carried the thinking object sent (nil when the config asked for nothing).
+//
+// The shape-independent entries always apply. A thinking-shape entry is added
+// only when amele actually sent a thinking generation that CAN be wrong for the
+// model - the legacy `{enabled, budget_tokens}` shape or the adaptive one - and
+// its advice names the opposite spelling of what was sent, because that is the
+// only remaining thing to try. A request that sent no thinking object, or sent
+// `{disabled}`, gets no thinking hint: a thinking-shape 400 it did not cause is
+// something amele cannot explain, and an ungrounded hint is worse than none.
+func anthropicSignatures(sent *anThinking) []errorSignature {
+	var advice string
+	switch {
+	case sent == nil:
+		return anthropicErrorSignatures
+	case sent.Type == thinkingLegacyEnabled:
+		advice = adviceAnthropicUseEffort
+	case sent.Type == thinkingAdaptive:
+		advice = adviceAnthropicUseBudget
+	default:
+		// thinkingOff, and any shape a future mapAnthropicThinking adds
+		// without teaching this function what its opposite is.
+		return anthropicErrorSignatures
+	}
+	// A fresh slice per call: appending onto the package-level table would
+	// race, and could publish one request's advice to the next.
+	signatures := make([]errorSignature, 0, len(anthropicErrorSignatures)+1)
+	signatures = append(signatures, anthropicErrorSignatures...)
+	return append(signatures, errorSignature{match: rejectsThinkingShape, advice: advice})
+}
+
+// rejectsThinkingShape reports whether a 400 body is the server refusing the
+// REQUEST's thinking control object, as opposed to any other 400.
+//
+// Keyed on the object's own field names plus a rejection phrase, so a 400 that
+// merely mentions thinking while complaining about something else does not
+// match. The path forms ("thinking.type", "thinking.type.enabled",
+// "thinking.budget_tokens") are what keep this away from the echo-back family,
+// which rejects thinking BLOCKS at messages.N.content.M and names neither
+// field.
+//
+// It deliberately does NOT try to read a direction out of the wording: both
+// directions produce bodies from this same phrasing pool (see the CONTRACT on
+// anthropicErrorSignatures). Direction comes from the request.
+func rejectsThinkingShape(e *statusError) bool {
+	if !strings.Contains(e.snippet, "thinking.type") && !strings.Contains(e.snippet, "budget_tokens") {
+		return false
+	}
+	return strings.Contains(e.snippet, "not permitted") ||
+		strings.Contains(e.snippet, "not supported") ||
+		strings.Contains(e.snippet, "Extra inputs") ||
+		strings.Contains(e.snippet, "Input should be")
 }
 
 // mapAnthropicThinking translates the neutral reasoning knob into the two
