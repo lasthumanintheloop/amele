@@ -579,23 +579,6 @@ func mapStopReason(stopReason string) string {
 	}
 }
 
-// compactJSONObject normalizes a tool_use input into the compact JSON string
-// the neutral ToolCall carries. Absent or null input becomes "{}" so tools
-// always receive a parseable object.
-func compactJSONObject(raw json.RawMessage) string {
-	if len(raw) == 0 || string(raw) == "null" {
-		return "{}"
-	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, raw); err != nil {
-		// Malformed provider JSON is deferred to the tool layer, mirroring
-		// the OpenAI client: parsing tool arguments is the tool's job so the
-		// model can recover from its own bad output.
-		return string(raw)
-	}
-	return buf.String()
-}
-
 // toWire converts the neutral request into the Anthropic Messages JSON shape:
 // the system prompt moves to the top-level "system" field, assistant tool
 // calls become tool_use content blocks, consecutive RoleTool messages merge
@@ -731,27 +714,6 @@ func (out *anRequest) applyKnobs(req Request) {
 	// never drops the value silently.
 	out.Temperature = req.Temperature
 	out.TopP = req.TopP
-}
-
-// extraFields copies the caller's raw provider.params into a fresh map, so the
-// fragments merged into one request body can never leak into another.
-func extraFields(extra map[string]json.RawMessage) map[string]json.RawMessage {
-	if len(extra) == 0 {
-		return nil
-	}
-	fields := make(map[string]json.RawMessage, len(extra))
-	for key, value := range extra {
-		fields[key] = value
-	}
-	return fields
-}
-
-// isJSONArray reports whether a carrier holds a JSON array, i.e. whether it can
-// be a content array of this wire at all. nil, a JSON null and a payload from
-// another provider's wire format all answer false.
-func isJSONArray(raw json.RawMessage) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) > 0 && trimmed[0] == '['
 }
 
 // isToolResultMessage reports whether msg is a user message produced by the
