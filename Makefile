@@ -38,7 +38,13 @@ fmt:
 
 lint:
 	go vet ./...
-	@command -v golangci-lint >/dev/null && golangci-lint run ./... || echo "golangci-lint not installed locally; CI enforces it"
+	@if command -v golangci-lint >/dev/null 2>&1; then \
+		golangci-lint run ./...; \
+	elif [ -x "$$(go env GOPATH)/bin/golangci-lint" ]; then \
+		"$$(go env GOPATH)/bin/golangci-lint" run ./...; \
+	else \
+		echo "golangci-lint not installed locally (checked PATH and $$(go env GOPATH)/bin); CI enforces it"; \
+	fi
 
 # budget builds the release binary and enforces the size ceiling.
 budget: build

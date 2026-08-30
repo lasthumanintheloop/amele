@@ -503,8 +503,8 @@ func (l *Loop) checkTokenBudget(res *Result, resp *llm.Response) error {
 	if resp.UsageMissing {
 		return fmt.Errorf("%w: limits.max_tokens is set but the provider did not report token usage; remove the limit or use an endpoint that reports usage", ErrBudgetExceeded)
 	}
-	// bütçe kontrolü yanıt geldikten sonra: bir turn kadar taşabilir, bilinçli
-	// (threat-model §5'te yazıyor)
+	// Budget check runs after the response arrives: it can overshoot by one
+	// turn, deliberately (threat-model §5).
 	if res.Usage.Total() > l.Limits.MaxTokens {
 		return fmt.Errorf("%w: max_tokens (%d) exceeded: %d used", ErrBudgetExceeded, l.Limits.MaxTokens, res.Usage.Total())
 	}

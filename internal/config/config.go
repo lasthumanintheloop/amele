@@ -182,7 +182,7 @@ type ProviderConfig struct {
 	// Params is the escape hatch: arbitrary keys merged verbatim into the
 	// request body root, for provider extras amele has no neutral field for.
 	// Keys amele writes itself ON THE ACTIVE TARGET are rejected at validation
-	// time (see forbiddenParamsKeys), so this can extend a request but never
+	// time (see ownedParamsKeys), so this can extend a request but never
 	// rewrite one - while a key that target never writes (thinking on kimi)
 	// stays reachable.
 	Params map[string]any `yaml:"params"`
@@ -654,8 +654,8 @@ func load(path string, env LookupEnv, tolerant bool) (*Config, error) {
 		if errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("%w: parsing %s: file is empty", ErrInvalid, path)
 		}
-		// not: yaml.v3 satır numarasını bazen 1 eksik raporluyor, upstream
-		// meselesi, kurcalama
+		// Note: yaml.v3 sometimes reports the line number off by one;
+		// upstream bug, don't fiddle with it.
 		return nil, fmt.Errorf("%w: parsing %s: %v", ErrInvalid, path, err)
 	}
 	if doc.Kind == 0 {
@@ -1154,7 +1154,7 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 	dialect, known := c.tuningDialect(add)
 	c.validateReasoning(add, dialect, known)
 	c.validateSampling(add, dialect, known)
-	validateParams(add, c.Provider.Params, c.forbiddenParamsKeys(dialect, known))
+	validateParams(add, c.Provider.Params, c.ownedParamsKeys(dialect, known), reservedWireFields)
 }
 
 // tuningDialect resolves the dialect the dialect-DEPENDENT rules are checked
@@ -1186,36 +1186,39 @@ func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialec
 	return dialect, true
 }
 
-// forbiddenParamsKeys returns the request-body keys provider.params must not
-// carry for the ACTIVE target: what that dialect/wire writes itself, plus the
-// keys amele reserves on every target.
+// ownedParamsKeys returns the request-body keys the ACTIVE target writes
+// itself - the owned half of what provider.params must not carry. The
+// reserved half (reservedWireFields, refused on every target regardless of
+// what this returns) is passed separately by the validateParams call site, so
+// the two get their own violation wording (issue #16): a key amele writes on
+// this target would be silently overwritten or overwrite a contract, while a
+// reserved key is refused because amele's own machinery cannot survive it at
+// all - neither reason describes the other case.
 //
-// When the dialect did not parse it returns the reserved keys ALONE. Which key
-// a dialect writes is a dialect question and is unanswerable then, so the same
-// one-error rule the other dialect-dependent rules follow applies: the dialect
-// is reported once instead of piling on a collision the operator cannot act on
-// yet. The reserved keys are not a dialect question - they are refused on every
-// target, because amele's own machinery cannot survive them - so withholding
-// them would cost the operator a second validate round for a violation that was
-// already answerable, and validate's contract is one pass, every violation.
-func (c *Config) forbiddenParamsKeys(dialect llm.Dialect, known bool) []string {
+// When the dialect did not parse it returns nil. Which key a dialect writes is
+// a dialect question and is unanswerable then, so the same one-error rule the
+// other dialect-dependent rules follow applies: the dialect is reported once
+// instead of piling on a collision the operator cannot act on yet. The
+// reserved keys are not a dialect question - they are refused on every target
+// regardless - so the call site passes them unconditionally rather than
+// costing the operator a second validate round for a violation that was
+// already answerable, against validate's one-pass, every-violation contract.
+func (c *Config) ownedParamsKeys(dialect llm.Dialect, known bool) []string {
 	switch c.Provider.Type {
 	case ProviderTypeAnthropic:
 		// The dialect is not consulted on this wire, so a leftover (even an
 		// unparseable) value cannot decide the answer.
-		return slices.Concat(llm.AnthropicOwnedWireFields(), reservedWireFields)
+		return llm.AnthropicOwnedWireFields()
 	case ProviderTypeGemini:
 		// Same reasoning, and here the dialect is not even legal: an illegal
 		// one is reported on its own line and must not also cost the operator
 		// the params answer, which this wire can give without it.
-		return slices.Concat(llm.GeminiOwnedWireFields(), reservedWireFields)
+		return llm.GeminiOwnedWireFields()
 	}
 	if !known {
-		// Cloned, like the Concat branches allocate: handing out the package
-		// var would make a shared list writable through a return value.
-		return slices.Clone(reservedWireFields)
+		return nil
 	}
-	return slices.Concat(llm.OwnedWireFields(dialect), reservedWireFields)
+	return llm.OwnedWireFields(dialect)
 }
 
 // validateReasoning checks the thinking knob against the effort vocabulary and
@@ -1364,20 +1367,31 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 }
 
 // validateParams checks the raw escape hatch: no collision with a key the
-// active target writes itself (forbidden, empty when that is unanswerable), and
-// nothing JSON cannot express.
+// active target writes itself (owned, empty when that is unanswerable) or with
+// a key amele reserves on every target (reserved), and nothing JSON cannot
+// express.
 //
 // CONTRACT: params is merged verbatim into the request body root, so a
 // collision would either clobber an amele contract (tools, response_format) or
-// be clobbered by it - both silently.
-func validateParams(add func(format string, args ...any), params map[string]any, forbidden []string) {
+// be clobbered by it - both silently. The two lists get their own violation
+// wording (issue #16): an owned-key collision would be silently overwritten
+// or overwrite a contract on THIS target, while a reserved key is refused on
+// EVERY target because amele's own machinery cannot survive it - neither
+// reason describes the other case, so one message for both would misdirect
+// the fix for whichever half it does not describe.
+func validateParams(add func(format string, args ...any), params map[string]any, owned, reserved []string) {
 	if len(params) == 0 {
 		return
 	}
 	// Sorted so the joined message is deterministic; Go map iteration order
 	// would otherwise shuffle violations between runs.
 	for _, key := range slices.Sorted(maps.Keys(params)) {
-		if slices.Contains(forbidden, key) {
+		switch {
+		case slices.Contains(reserved, key):
+			// Checked first: a key could in principle appear in both lists, and
+			// "refused on every target" is the stronger, always-true claim.
+			add("provider.params key %q is reserved on every target (amele's own request machinery sets it); remove it", key)
+		case slices.Contains(owned, key):
 			add("provider.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", key)
 		}
 	}

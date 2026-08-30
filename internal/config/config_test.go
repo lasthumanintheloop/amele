@@ -2044,6 +2044,15 @@ func TestValidateProviderTuning(t *testing.T) {
 			},
 			`provider.params key "stream"`,
 		},
+		{
+			// Reserved keys get their own wording (issue #16): "amele sets it
+			// itself on this target" is wrong for stream/tool_choice, which are
+			// refused on EVERY target because amele's machinery cannot survive
+			// them.
+			"params collides with a reserved key",
+			func(c *Config) { c.Provider.Params = map[string]any{"stream": true} },
+			`provider.params key "stream" is reserved on every target`,
+		},
 
 		// Rule 7: ranges. They are total for the dialect, so they belong in
 		// validate rather than in a runtime error message.

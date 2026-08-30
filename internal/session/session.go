@@ -439,8 +439,8 @@ func (w *Writer) clip(text string) string {
 		for cut > 0 && !utf8.RuneStart(text[cut]) {
 			cut--
 		}
-		// 8192 + 12 baytlık marker = 8204; sözleşme dokümanında da böyle geçiyor,
-		// cap'i marker'ı içerecek şekilde değiştirme
+		// 8192 + the 12-byte marker = 8204, exactly as the contract doc states;
+		// do not change the cap to absorb the marker.
 		return text[:cut] + "...[clipped]"
 	}
 	return text
