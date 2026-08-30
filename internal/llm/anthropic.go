@@ -491,6 +491,11 @@ func (e *statusError) rejectsOutputConfig() bool {
 // change NOTHING but the human-facing text: no retry, no downgrade, no request
 // rewrite. A signature that stops matching (Anthropic reworded its 400) costs a
 // hint, never correctness.
+//
+// The two thinking-shape entries below (issue #14) advise the reasoning knob
+// to use when the dialect layer picks the wrong thinking generation for the
+// model - adaptive against a legacy model, or legacy budget_tokens against an
+// adaptive one.
 var anthropicErrorSignatures = []errorSignature{
 	{
 		// Sampling: current Claude models reject a non-default temperature
@@ -512,6 +517,31 @@ var anthropicErrorSignatures = []errorSignature{
 				strings.Contains(e.snippet, "may only be set to 1")
 		},
 		advice: "this model rejects non-default sampling; remove provider.temperature/top_p",
+	},
+	{
+		// Thinking shape, wrong direction 1: budget_tokens against an
+		// adaptive-generation model (4.7+). Keyed on the field name plus a
+		// rejection phrase so a 400 that merely mentions the field while
+		// complaining about something else does not match.
+		match: func(e *statusError) bool {
+			return strings.Contains(e.snippet, "budget_tokens") &&
+				(strings.Contains(e.snippet, "not permitted") ||
+					strings.Contains(e.snippet, "not supported") ||
+					strings.Contains(e.snippet, "Extra inputs"))
+		},
+		advice: "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)",
+	},
+	{
+		// Thinking shape, wrong direction 2: adaptive against a legacy model
+		// (<=4.5). The server complains about thinking.type's vocabulary.
+		// "thinking.type" (the path form) keeps this away from the echo-back
+		// 400 family, which complains about thinking BLOCKS in messages, not
+		// about the request's thinking control object.
+		match: func(e *statusError) bool {
+			return strings.Contains(e.snippet, "thinking.type") &&
+				(strings.Contains(e.snippet, "enabled") || strings.Contains(e.snippet, "Input should be"))
+		},
+		advice: "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort",
 	},
 }
 
@@ -730,7 +760,19 @@ func (c *AnthropicClient) httpClient() *http.Client {
 	}
 	// A fresh Client per call is cheap: it shares http.DefaultTransport, so
 	// connection pooling is preserved.
-	return &http.Client{Timeout: c.requestTimeout()}
+	return &http.Client{
+		Timeout: c.requestTimeout(),
+		// SECURITY: redirects are never followed. Go's follower strips the
+		// Authorization header when the host changes, but it PRESERVES custom
+		// headers - and this wire's credential is the custom header x-api-key,
+		// so a 302 from a compromised or misconfigured proxy would hand the
+		// key to whatever host it named. Nothing legitimate is lost: the
+		// Messages API answers a POST directly, so a 3xx here is already an
+		// anomaly, and returning it makes it a visible status failure instead
+		// of a silent hop. The gemini client and the MCP HTTP transport
+		// refuse redirects for the same reason.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 }
 
 // requestTimeout returns the effective per-request ceiling, for both the

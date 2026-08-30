@@ -640,3 +640,46 @@ func TestAnthropicChatUsageIsSanitized(t *testing.T) {
 		})
 	}
 }
+
+// TestAnthropicRefusesRedirects pins the CheckRedirect posture: x-api-key is a
+// custom header Go's redirect follower PRESERVES across host changes, so a 3xx
+// must surface as a status failure instead of being followed (same posture as
+// the gemini client and the MCP HTTP transport).
+func TestAnthropicRefusesRedirects(t *testing.T) {
+	var elsewhereHits int
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		elsewhereHits++
+		if r.Header.Get("x-api-key") != "" {
+			t.Errorf("the api key followed a redirect to another host")
+		}
+		_, _ = w.Write([]byte(anOKBody("stolen")))
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	// A fixed destination, not one derived from the request: the test is about
+	// what the CLIENT does with a 302, and echoing the request path back into
+	// the Location header is the open-redirect shape gosec (rightly) flags.
+	target := elsewhere.URL + "/v1/messages"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target, http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	client := &AnthropicClient{BaseURL: srv.URL, APIKey: testAPIKey}
+	_, err := client.Chat(context.Background(), Request{
+		Model: "m", Messages: []Message{{Role: RoleUser, Content: "hi"}},
+	})
+	if !errors.Is(err, ErrProvider) {
+		t.Fatalf("err: got %v, want a provider error", err)
+	}
+	var se *statusError
+	if !errors.As(err, &se) {
+		t.Fatalf("err %v is not a statusError", err)
+	}
+	if se.code != http.StatusFound {
+		t.Errorf("code: got %d, want 302 (the redirect itself is the answer)", se.code)
+	}
+	if elsewhereHits != 0 {
+		t.Errorf("the redirect was followed %d times", elsewhereHits)
+	}
+}

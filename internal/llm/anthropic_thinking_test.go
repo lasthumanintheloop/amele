@@ -672,6 +672,69 @@ func TestAnthropic400AdviceForSampling(t *testing.T) {
 	}
 }
 
+// The two thinking-shape 400s the dialect layer is most likely to produce
+// (research §3, "reasoning knob" row): `thinking: {type: adaptive}` against a
+// model that predates it (<=4.5, so the server complains about
+// thinking.type's vocabulary), and the legacy `enabled` + budget_tokens shape
+// against an adaptive-generation model (4.7+, so the server rejects
+// budget_tokens as an extra input). Not captured live - see issue #17.
+const (
+	bodyAnthropicAdaptiveOnLegacyModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"thinking.type: Input should be 'enabled' or 'disabled'" + `"}}`
+	bodyAnthropicBudgetTokensOnAdaptiveModel = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"thinking.budget_tokens: Extra inputs are not permitted; this model does not support budget_tokens" + `"}}`
+	// The echo-back family: a thinking BLOCK rejected inside messages, not the
+	// request's thinking control object. Must match neither shape entry.
+	bodyAnthropicThinkingBlockEcho400 = `{"type":"error","error":{"type":"invalid_request_error","message":"` +
+		"messages.1.content.0: thinking block signature is invalid" + `"}}`
+	adviceThinkingBudgetOnAdaptive = "this model takes provider.reasoning.effort, not budget_tokens (legacy thinking is Haiku 4.5 and older)"
+	adviceThinkingAdaptiveOnLegacy = "this model predates adaptive thinking; use provider.reasoning.budget_tokens instead of .effort"
+)
+
+// TestAnthropic400AdviceForThinkingShape (issue #14): the recognized
+// thinking-shape 400 gains the hint naming the reasoning knob to use instead,
+// same message, same single final call. The echo-back 400 (a thinking block
+// rejected in messages) must carry no advice.
+func TestAnthropic400AdviceForThinkingShape(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"adaptive thinking on a legacy model", bodyAnthropicAdaptiveOnLegacyModel, adviceThinkingAdaptiveOnLegacy},
+		{"legacy budget_tokens on an adaptive model", bodyAnthropicBudgetTokensOnAdaptiveModel, adviceThinkingBudgetOnAdaptive},
+		{"a thinking-block echo 400 does not match the shape entry", bodyAnthropicThinkingBlockEcho400, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int
+			srv := anthropicServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				calls++
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(tt.body))
+			})
+			client := &AnthropicClient{BaseURL: srv.URL}
+			_, err := client.Chat(context.Background(), Request{
+				Model:    "claude-opus-5",
+				Messages: []Message{{Role: RoleUser, Content: "x"}},
+			})
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			want := "provider error: status 400: " + tt.body
+			if tt.want != "" {
+				want += " — " + tt.want
+			}
+			if err.Error() != want {
+				t.Errorf("message:\n got %q\nwant %q", err.Error(), want)
+			}
+			if calls != 1 {
+				t.Errorf("400 must not be retried, got %d calls", calls)
+			}
+		})
+	}
+}
+
 // TestAnthropicContentDecoding: the content array is decoded separately from
 // the envelope now that its raw bytes are the carrier, so both ends of that
 // split need pinning - an absent content field is an empty turn, a content
