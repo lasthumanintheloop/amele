@@ -19,7 +19,8 @@ jq -r 'select(.type=="tool_result") | "\(.tool)\t\(.outcome)"' run-*.jsonl
 Note that a failing command is not an `error`: `grep` exiting 1 is
 `nonzero_exit`, and `is_error` is reserved for calls amele could not dispatch
 at all. `result_bytes` reports the full size of the tool's answer, which is how
-you see when the 8 KB per-field log clip dropped part of what the model read.
+you see when the per-field log clip (`limits.max_logged_field`, 8 KB by
+default; `0` writes every field whole) dropped part of what the model read.
 The full field list is in
 [docs/contracts/jsonl-events.md](contracts/jsonl-events.md).
 

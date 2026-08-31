@@ -107,6 +107,53 @@ merging into a nested object amele also writes would need a merge rule this
 strict endpoint gives no room to get wrong. Ask for a neutral field if you need
 one.
 
+### Reproducible sampling (seed)
+
+There is no `provider.seed` field, on purpose: a seed is one endpoint's
+parameter with one endpoint's semantics, and `params` already carries it
+without amele pretending the guarantee is portable.
+
+```yaml
+provider:
+  temperature: 0
+  params:
+    seed: 42
+```
+
+On the **OpenAI-compatible wire** that is all there is to it: `seed` is not a
+key amele writes on any dialect, so it merges into the request body root
+verbatim and reaches the endpoint exactly as typed. What the endpoint then does
+with it is the endpoint's business - OpenAI documents `seed` as best-effort and
+pairs it with a `system_fingerprint` that tells you when the backend changed
+underneath you; other hosts vary, and some ignore the field entirely. Pin
+`temperature: 0` as well: a seed without a fixed temperature reproduces one
+sampling path, not one answer.
+
+The other two wires do not have this knob in that place:
+
+- **anthropic wire**: the Messages API has no seed parameter at all. Nothing in
+  amele collides with the key, so `validate` passes and the field is merged -
+  and the request then reaches an API that does not know it. `params` is the
+  slot where amele deliberately stops having an opinion; this is what that
+  costs.
+- **gemini wire**: the knob exists, but as `generationConfig.seed` - one level
+  below where `params` merges. A root-level `seed` is therefore **not** the
+  generation seed; it is an unknown root field on a strict endpoint (see the
+  note above on why nested merging is not offered).
+
+**Sweeping a seed from a shell.** Prefer templating the YAML - `yq
+'.provider.params.seed = 7'`, or `sed` on a placeholder - over
+`seed: ${SEED}`. Interpolation does produce a number when the reference is
+written **unquoted** (the plain scalar's type is re-resolved after
+substitution, so `seed: ${SEED}` with `SEED=42` sends `42`, while
+`seed: "${SEED}"` sends the string `"42"` and is refused or ignored by the
+endpoint). The reason to avoid it is elsewhere: every interpolated value is
+registered as a secret and redacted **by value** in the session log
+([session-logging.md](session-logging.md)), so a seed of `42` rewrites every
+literal `42` in that run's free-text fields - the task, tool arguments, tool
+output, the model's own text, and the `-v` progress lines - to `[REDACTED]`.
+A seed is not a credential; keep it out of the channel meant for credentials.
+
 ### Retries
 
 A 429, a 5xx or a dropped connection is retried; everything else is returned to
@@ -654,13 +701,49 @@ That has three practical consequences.
    Crossing the budget is exit 3, not a warning.
 3. **Watch `reasoning_bytes`.** Every `llm_response` event in the
    [session log](contracts/jsonl-events.md#llm_response---one-per-provider-round-trip)
-   carries the byte size of that turn's reasoning payload (never its content -
-   the model's scratchpad is not written to disk). It is what answers "why did
+   carries the byte size of that turn's reasoning payload - the size always,
+   the content only when you ask for it (below). It is what answers "why did
    that turn cost so much?".
 
 If a run does not need the depth, `reasoning: {effort: low}` or `none` is the
 cheapest change available - and on the dialects that cannot turn thinking off,
 the answer is a smaller model rather than a knob.
+
+### `log_reasoning: true`, per family
+
+`log_reasoning: true` writes the reasoning payload itself into the session log
+as the `reasoning` field of each `llm_response`
+([JSONL v1.5](contracts/jsonl-events.md#v15-amele-v02x---opt-in-reasoning-content-additive-v-stays-1)).
+It is off by default and it is a data-governance decision, not a verbosity
+setting: a scratchpad can paraphrase a secret in words the by-value redactor
+never recognizes. What it gives you is exactly what
+`reasoning_bytes` counted - the raw payload, as the wire sent it, clipped and
+redacted like every other free-text field. Per family:
+
+- **`openai`**: nothing to log. That API returns no reasoning on this wire, so
+  `reasoning_bytes` is absent and the flag changes not one byte of the log.
+- **`deepseek`, `glm`, `kimi`**: the `reasoning_content` string. It is logged
+  as the raw JSON value, so the quotes around it are part of the logged text -
+  parse it, do not read it as a sentence.
+- **`groq`**: the same, plus the case the table mentions - a bare `reasoning`
+  field, which this dialect captures for observability and never echoes back.
+  What was captured is what is logged.
+- **`openrouter`**: the `reasoning_details` array, as the JSON array text.
+- **anthropic wire**: the raw content-blocks JSON array of the turn, which is
+  the whole carrier - `thinking` blocks (with their signatures) interleaved
+  with the `text` and `tool_use` blocks they were produced with, because that
+  array is what round-trips byte-exact. A `redacted_thinking` block stays what
+  it is on the wire: opaque ciphertext, unreadable in the log too.
+- **gemini wire**: the raw parts JSON array of the turn, captured whenever the
+  turn carried a thought part or a thought signature - so thought summaries,
+  text and `functionCall` parts sit in the logged array together, for the same
+  round-trip reason.
+
+Two consequences worth planning for: the log grows by roughly `reasoning_bytes`
+per turn (raise `limits.max_logged_field`, or set it to `0`, if you want the
+payload whole rather than clipped), and the file now contains model-authored
+prose that no reviewer has read. Treat those session files the way you would
+treat the transcript they are.
 
 ## Structured output
 

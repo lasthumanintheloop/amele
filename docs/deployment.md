@@ -1,11 +1,12 @@
-# Deployment: cron, systemd, log cleanup, embedding
+# Deployment: cron, systemd, log cleanup, pipelines, embedding
 
 amele is one static binary and one YAML file - there is no server to run and
 nothing to install besides the binary itself (see the [README](../README.md)).
-This document covers the four things that come up once an agent config leaves
+This document covers the five things that come up once an agent config leaves
 a terminal and starts running unattended: scheduling it with cron or systemd,
-what happens to session logs over time, and calling amele from another
-program instead of a shell. Everything here composes with the frozen
+what happens to session logs over time, fanning one config out over many
+items, and calling amele from another program instead of a shell. Everything
+here composes with the frozen
 [CLI contract](contracts/cli.md) and [exit-code contract](contracts/exit-codes.md);
 nothing below introduces new behavior.
 
@@ -227,7 +228,96 @@ something else in the deployment funnels amele's stderr into a single
 growing file (e.g. the `>> cron.log 2>&1` pattern in §1), where rotating
 *that* file is the ordinary logrotate use case.
 
-## 4. Embedding amele as an agent core from another program
+## 4. Pipelines: one config, many items
+
+The other unattended shape is a batch: the same agent run once per row of a
+file, often several at a time. Nothing new is needed for it - the pieces are
+`--set`, the exit-code table, and one session file per run - but four details
+decide whether the result is a pile of runs or a record you can reason about.
+
+**Correlation: give every item its own `session_dir`.** The session file's name
+is chosen by amele (`run-<UTC timestamp>-<pid>.jsonl`), so the way to find
+*this item's* record later is to point the run at a directory of its own:
+
+```sh
+amele run agent.yaml -q --set "session_dir=out/$item" "process $item"
+```
+
+The one file in `out/$item/` is that item's log. Two notes on the path: a
+`session_dir` given as an override resolves against the **current working
+directory**, not the config's directory (the [CLI
+contract](contracts/cli.md)), and the item name becomes a path component -
+sanitize it if the list is not yours, exactly as you would before any other
+`mkdir`. If you would rather have
+the chosen filename told to you than go looking, `print_session_path: true` in
+the config prints one `session log: <path>` note to stderr per run (dropped by
+`-q`, so pick one or the other).
+
+**Parallel fan-out is safe by construction.** With `xargs -P` several runs
+overlap in time. They cannot collide in the log even when pointed at the *same*
+directory: the filename carries a UTC timestamp **and** the pid, and the file
+is opened with `O_EXCL`, so a name collision fails loudly instead of two runs
+interleaving into one file ([JSONL
+contract](contracts/jsonl-events.md#file)). Per-item directories are for
+correlation, not for safety.
+
+What must be off is the run lock. `lock: true` is single-flight *per config
+file* (§1), so a config carrying it turns a fan-out into one working run and
+N-1 immediate exit-7s. Leave it unset for batch configs - the same rule §5
+states for concurrent embedding - and keep it for the scheduled config that
+must not overlap itself.
+
+**Branch on the exit code, per item.** The batch's decision is not "did it
+work" but "whose problem is this": a provider failure is worth retrying, an
+unmet schema is this item's problem, and a config error is every item's
+problem and should stop the batch rather than repeat N times.
+
+```sh
+#!/bin/sh
+# run-one.sh - one item, one session dir, one verdict.
+item=$1
+mkdir -p out   # the shell opens the redirect before amele creates session_dir
+amele run agent.yaml -q --set "session_dir=out/$item" "process $item" \
+  > "out/$item.json"
+case $? in
+  0) exit 0 ;;   # stdout holds the answer (JSON, with output.schema set)
+  5) exit 75 ;;  # provider/network, retries already spent: EX_TEMPFAIL, requeue
+  6) exit 1 ;;   # schema unmet: this item is bad, the batch is fine
+  3) exit 1 ;;   # budget: this item is too big, the batch is fine
+  2) exit 78 ;;  # config error: identical for every item - stop the batch
+  *) exit 1 ;;
+esac
+```
+
+```sh
+xargs -P 4 -n 1 ./run-one.sh < items.txt
+```
+
+Only exit 2 is a batch-level verdict; the rest are per-item. `xargs` itself
+stops on a child that exits 255, so a wrapper that wants "abort the whole
+fan-out on a config error" can spell that verdict `exit 255` instead of `78`.
+
+**The full-record combination.** When a batch exists to be audited afterwards -
+an evaluation set, a regression sweep, a disputed decision - two config keys
+turn each session file into the complete record:
+
+```yaml
+limits:
+  max_logged_field: 0   # no per-field clip: tool output and args are whole
+log_reasoning: true     # the model's reasoning payload, not just its size
+```
+
+Both are deliberate, and the second one is a **data-governance decision, not a
+verbosity setting**. Redaction still runs unconditionally - `${VAR}` values are
+replaced by value before anything is written, whatever the bound - but
+redaction is by value, and a reasoning trace is where a model *paraphrases*:
+"the key starts with sk-live and ends in 7f" survives a redactor that is
+looking for the key itself. Turn it on for batches whose logs you would be
+comfortable reading aloud, keep it off for the rest, and remember that
+`max_logged_field: 0` makes files as large as the tool output they carry -
+§3's cleanup story matters more, not less, once a batch runs nightly.
+
+## 5. Embedding amele as an agent core from another program
 
 Because amele is one binary that speaks stdin/stdout/exit-codes, calling it
 from PHP or Python is a subprocess call, not an SDK integration. The pattern
