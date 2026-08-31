@@ -1256,3 +1256,75 @@ func TestRenderMaxLoggedFieldOverrideMarked(t *testing.T) {
 		t.Errorf("report missing %q:\n%s", want, got)
 	}
 }
+
+// TestRenderDataGovernanceKeys: log_reasoning and print_session_path are the
+// two keys --set cannot reach, which makes this report the only place an
+// operator pre-flighting someone else's pack can learn that the run writes the
+// model's scratchpad to disk. Both directions are pinned: enabled prints a row
+// (and, for log_reasoning, a warning), disabled prints nothing at all.
+//
+// No golden fixture enables either key, so the rows are tested here rather
+// than by widening eleven goldens that would then only prove the default.
+func TestRenderDataGovernanceKeys(t *testing.T) {
+	const reasoningRow = "  log_reasoning: enabled"
+	const pathRow = "  print_session_path: enabled"
+	const reasoningWarn = "  - log_reasoning is enabled: the session log will contain the model's reasoning"
+
+	cases := []struct {
+		name    string
+		mutate  func(*config.Config)
+		want    []string
+		notWant []string
+	}{
+		{
+			name:    "off by default: no rows, no warning",
+			mutate:  func(*config.Config) {},
+			notWant: []string{reasoningRow, pathRow, "log_reasoning", "print_session_path"},
+		},
+		{
+			name:   "log_reasoning says what it means and warns",
+			mutate: func(c *config.Config) { c.LogReasoning = true },
+			want: []string{
+				reasoningRow + " (the provider's reasoning payload - the model's own " +
+					"scratchpad - is written into the log)\n",
+				reasoningWarn + "; redaction matches secret values and cannot catch a paraphrased one\n",
+			},
+			notWant: []string{pathRow},
+		},
+		{
+			name:    "print_session_path is reported, and warns about nothing",
+			mutate:  func(c *config.Config) { c.PrintSessionPath = true },
+			want:    []string{pathRow + " (the run names its session file on stderr)\n"},
+			notWant: []string{reasoningRow, reasoningWarn},
+		},
+		{
+			// Both keys are inert without a log: cmd/amele consults them on
+			// the writer it opens, and there is none. A row here would promise
+			// something the run does not do - and the warning would cry wolf.
+			name: "inert without a session log",
+			mutate: func(c *config.Config) {
+				c.SessionDir = ""
+				c.LogReasoning = true
+				c.PrintSessionPath = true
+			},
+			notWant: []string{reasoningRow, pathRow, reasoningWarn},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			tc.mutate(cfg)
+			got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("report missing %q:\n%s", want, got)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Errorf("report unexpectedly contains %q:\n%s", notWant, got)
+				}
+			}
+		})
+	}
+}

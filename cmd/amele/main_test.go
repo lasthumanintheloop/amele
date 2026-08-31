@@ -4322,8 +4322,15 @@ func TestE2EReasoningLoggedOnlyOnOptIn(t *testing.T) {
 			}
 			raw := readSessionRaw(t, dir)
 			if tt.want {
-				if !strings.Contains(e.Reasoning, payload) {
-					t.Errorf("event.Reasoning = %q, want it to carry %q", e.Reasoning, payload)
+				// CONTRACT: the logged value is the provider's RAW payload,
+				// not prose - on this wire (an OpenAI-compatible
+				// reasoning_content, a JSON string) that includes the JSON's
+				// own quoting, so `X` logs as `"X"`, quotes and all
+				// (docs/contracts/jsonl-events.md, `reasoning`). Equality, not
+				// containment: a substring check passes either way and would
+				// leave the sentence a consumer parses by untested.
+				if want := `"` + payload + `"`; e.Reasoning != want {
+					t.Errorf("event.Reasoning = %q, want exactly %q", e.Reasoning, want)
 				}
 				if !strings.Contains(raw, `"reasoning":`) {
 					t.Errorf("session log has no reasoning key:\n%s", raw)

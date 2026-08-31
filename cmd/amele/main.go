@@ -220,14 +220,14 @@ FLAGS
                     provider.max_output_tokens, provider.reasoning.effort,
                     provider.temperature, provider.top_p
                   Tools, permissions, the provider's identity (type, base_url,
-                  api_key), the run lock and what the session log RECORDS
-                  (log_reasoning) are deliberately NOT settable: the
-                  YAML file stays the audited grant of authority, so what
-                  "amele explain agent.yaml" reports cannot be widened - or, in
-                  the lock's case, weakened - by a flag on the cron line
-                  (docs/threat-model.md §2). The provider tuning knobs above
-                  are settable because they only change what a run spends, not
-                  what it may do.
+                  api_key), the run lock and what the session log RECORDS or
+                  ANNOUNCES (log_reasoning, print_session_path) are deliberately
+                  NOT settable: the YAML file stays the audited grant of
+                  authority, so what "amele explain agent.yaml" reports cannot
+                  be widened - or, in the lock's case, weakened - by a flag on
+                  the cron line (docs/threat-model.md §2). The provider tuning
+                  knobs above are settable because they only change what a run
+                  spends, not what it may do.
                   workspace, session_dir and system_prompt_file resolve against
                   the CURRENT DIRECTORY, not the config's - a path typed in a
                   shell means what it means in that shell. system_prompt_file

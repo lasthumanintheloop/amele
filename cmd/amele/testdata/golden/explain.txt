@@ -35,7 +35,6 @@ BUDGETS
   max_turns:  10
   max_tokens: UNBOUNDED (no token budget)
   timeout:    5m0s
-  max_logged_field: 8192 (default)
 
 CONCURRENCY
   lock: enabled (a run started while another holds <config>.lock exits 7)
@@ -47,6 +46,7 @@ OUTPUT
 
 SESSION
   session_dir: "<TMP>/sessions"
+  max_logged_field: 8192 (default)
 
 WARNINGS
   - permission entry "ghost_tool" matches no tool - typo?

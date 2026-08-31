@@ -1400,31 +1400,11 @@ func budgetsSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	} else {
 		fmt.Fprintf(b, "  timeout:    none%s\n", set.mark("limits.timeout"))
 	}
-	// The log's own budget: how many bytes of each free-text field reach the
-	// session file. All three states are reported because none can be read off
-	// the YAML - an absent key means 8192, and an explicit 0 means the OPPOSITE
-	// of what a 0 means on every other line here (no bound at all, not "no
-	// budget left"). The row is not aligned with the three above: its label is
-	// wider than their padding, and widening theirs would rewrite every golden.
-	switch v := cfg.Limits.MaxLoggedField; {
-	case v == nil:
-		fmt.Fprintf(b, "  max_logged_field: %d (default)%s\n", defaultMaxLoggedField, set.mark("limits.max_logged_field"))
-	case *v == 0:
-		fmt.Fprintf(b, "  max_logged_field: UNBOUNDED (every logged field written whole)%s\n",
-			set.mark("limits.max_logged_field"))
-	default:
-		fmt.Fprintf(b, "  max_logged_field: %d%s\n", *v, set.mark("limits.max_logged_field"))
-	}
+	// limits.max_logged_field is deliberately NOT here: it bounds bytes on
+	// disk, not what the run may spend, so it is reported with the log it
+	// belongs to (sessionSection).
 	b.WriteString("\n")
 }
-
-// defaultMaxLoggedField mirrors internal/session's clip bound so the dry run
-// can name the number an omitted limits.max_logged_field resolves to.
-//
-// It is a copy, not an import: session does not export the constant, and
-// explain must not gain a dependency on the writer package to print one
-// number. TestExplainDefaultMatchesSessionDefault pins the two together.
-const defaultMaxLoggedField = 8 * 1024
 
 // concurrencySection reports what this config lets run at the same time: two
 // whole runs of it (`lock`), and two tool calls inside one turn
@@ -1489,21 +1469,76 @@ func outputSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	b.WriteString("\n")
 }
 
-// sessionSection reports where the audit trail goes - or that there is none.
+// defaultMaxLoggedField mirrors internal/session's clip bound so the dry run
+// can name the number an omitted limits.max_logged_field resolves to.
+//
+// It is a copy, not an import: session does not export the constant, and
+// explain must not gain a dependency on the writer package to print one
+// number. TestExplainDefaultMatchesSessionDefault pins the two together.
+const defaultMaxLoggedField = 8 * 1024
+
+// sessionSection reports where the audit trail goes - or that there is none -
+// and, when one is written, what it will contain and whether the run says
+// where it went. max_logged_field is reported here rather than under BUDGETS
+// because it is the LOG's budget: it bounds bytes on disk, not what the run
+// may spend in turns, tokens or seconds.
+//
+// log_reasoning and print_session_path are reported only when they are on, and
+// only when a log is actually written (cmd/amele consults both on the writer it
+// just opened, so without session_dir neither does anything). They are the two
+// keys `--set` cannot reach, precisely because what a run persists is a
+// data-governance decision that belongs in the audited YAML - which makes this
+// report the only place an operator pre-flighting someone else's pack can see
+// them. Unlike `lock`, whose off state is worth stating out loud, these two
+// default to off and off is what a reader assumes; printing "disabled" rows on
+// every report would cost eleven goldens two lines each to say nothing.
 func sessionSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	b.WriteString("SESSION\n")
 	if cfg.SessionDir == "" {
-		fmt.Fprintf(b, "  session_dir: none (no audit log)%s\n\n", set.mark("session_dir"))
+		fmt.Fprintf(b, "  session_dir: none (no audit log)%s\n", set.mark("session_dir"))
+		// The clip bound is still stated with no log to clip: it is the only
+		// one of the three on the --set allowlist, and a dropped row would
+		// drop its "(overridden via --set)" marker with it - the report would
+		// go silent about a flag the cron line carries.
+		maxLoggedFieldRow(b, cfg, set)
+		b.WriteString("\n")
 		return
 	}
-	fmt.Fprintf(b, "  session_dir: %s%s\n\n", field(cfg.SessionDir, "(unset)"), set.mark("session_dir"))
+	fmt.Fprintf(b, "  session_dir: %s%s\n", field(cfg.SessionDir, "(unset)"), set.mark("session_dir"))
+	maxLoggedFieldRow(b, cfg, set)
+	if cfg.LogReasoning {
+		b.WriteString("  log_reasoning: enabled (the provider's reasoning payload - the model's own " +
+			"scratchpad - is written into the log)\n")
+	}
+	if cfg.PrintSessionPath {
+		b.WriteString("  print_session_path: enabled (the run names its session file on stderr)\n")
+	}
+	b.WriteString("\n")
+}
+
+// maxLoggedFieldRow writes the log's own budget: how many bytes of each
+// free-text field reach the session file.
+//
+// All three states are reported because none can be read off the YAML - an
+// absent key means 8192, and an explicit 0 means the OPPOSITE of what a 0
+// means on a budget line (no bound at all, not "no budget left").
+func maxLoggedFieldRow(b *strings.Builder, cfg *config.Config, set overrides) {
+	switch v := cfg.Limits.MaxLoggedField; {
+	case v == nil:
+		fmt.Fprintf(b, "  max_logged_field: %d (default)%s\n", defaultMaxLoggedField, set.mark("limits.max_logged_field"))
+	case *v == 0:
+		fmt.Fprintf(b, "  max_logged_field: UNBOUNDED (every logged field written whole)%s\n",
+			set.mark("limits.max_logged_field"))
+	default:
+		fmt.Fprintf(b, "  max_logged_field: %d%s\n", *v, set.mark("limits.max_logged_field"))
+	}
 }
 
 // warningsSection lists everything valid-but-suspicious. Validate deliberately
 // accepts these configs (see internal/config's rationale on inert permission
 // entries); explain is where they get said out loud instead of failing a cron
 // run. The order is fixed - sorted permission entries, then shell, tokens,
-// session - so the section is golden-testable.
+// session, reasoning - so the section is golden-testable.
 func warningsSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry, mcpReports []MCPServerReport) {
 	b.WriteString("WARNINGS\n")
 	ws := collectWarnings(cfg, reg, mcpReports)
@@ -1541,6 +1576,16 @@ func collectWarnings(cfg *config.Config, reg *tools.Registry, mcpReports []MCPSe
 	}
 	if cfg.SessionDir == "" {
 		ws = append(ws, "session_dir is not set: no session log (audit trail) will be written")
+	}
+	// SECURITY: the one config key that widens what lands on disk beyond what
+	// the redactor can reason about. Redaction (internal/session) still runs
+	// on the payload, but it matches known secret VALUES, and a scratchpad
+	// paraphrases: "the key ends in 7f" survives every value match. Warned only
+	// when a log is actually written - without session_dir the key is inert,
+	// and the warning above already says nothing is recorded.
+	if cfg.LogReasoning && cfg.SessionDir != "" {
+		ws = append(ws, "log_reasoning is enabled: the session log will contain the model's reasoning; "+
+			"redaction matches secret values and cannot catch a paraphrased one")
 	}
 	// Tool definitions ride along on every request, so an unfiltered server is
 	// a recurring cost the operator never sees itemised. The threshold is

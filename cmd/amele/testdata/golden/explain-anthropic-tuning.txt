@@ -33,7 +33,6 @@ BUDGETS
   max_turns:  20
   max_tokens: UNBOUNDED (no token budget)
   timeout:    none
-  max_logged_field: 8192 (default)
 
 CONCURRENCY
   lock: disabled (concurrent runs of this config are allowed)
@@ -44,6 +43,7 @@ OUTPUT
 
 SESSION
   session_dir: none (no audit log)
+  max_logged_field: 8192 (default)
 
 WARNINGS
   - limits.max_tokens is 0: no token budget bounds this run

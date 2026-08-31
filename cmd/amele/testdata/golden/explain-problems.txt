@@ -33,7 +33,6 @@ BUDGETS
   max_turns:  4
   max_tokens: 1000
   timeout:    none
-  max_logged_field: 8192 (default)
 
 CONCURRENCY
   lock: disabled (concurrent runs of this config are allowed)
@@ -44,6 +43,7 @@ OUTPUT
 
 SESSION
   session_dir: none (no audit log)
+  max_logged_field: 8192 (default)
 
 WARNINGS
   - session_dir is not set: no session log (audit trail) will be written
