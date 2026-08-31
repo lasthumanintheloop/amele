@@ -2,6 +2,7 @@ package explain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
+	"github.com/lasthumanintheloop/amele/internal/session"
 	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
@@ -1165,5 +1167,92 @@ func TestRenderCannotForgeRowsWithConfigValues(t *testing.T) {
 	// The PROBLEMS block stays one bullet long.
 	if n := strings.Count(got, "\n  - "); n != 1 {
 		t.Errorf("PROBLEMS bullet count = %d, want 1:\n%s", n, got)
+	}
+}
+
+// ptrInt returns a pointer to n, for limits.max_logged_field where nil (use
+// the default), 0 (unbounded) and n are three different answers.
+func ptrInt(n int) *int { return &n }
+
+// TestRenderMaxLoggedField: the clip bound is the one settable key whose three
+// states cannot be read off the YAML - an omitted key means 8192, and a 0
+// means the opposite of what a budget line usually means (no bound at all).
+// That is precisely what a dry run exists to say out loud.
+func TestRenderMaxLoggedField(t *testing.T) {
+	cases := []struct {
+		name    string
+		value   *int
+		want    string
+		notWant string
+	}{
+		{
+			name: "unset names the default",
+			want: "  max_logged_field: 8192 (default)\n",
+		},
+		{
+			name:    "explicit zero is unbounded",
+			value:   ptrInt(0),
+			want:    "  max_logged_field: UNBOUNDED (every logged field written whole)\n",
+			notWant: "8192",
+		},
+		{
+			name:    "custom bound is stated bare",
+			value:   ptrInt(256),
+			want:    "  max_logged_field: 256\n",
+			notWant: "(default)",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.Limits.MaxLoggedField = tc.value
+			got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("report missing %q:\n%s", tc.want, got)
+			}
+			if tc.notWant != "" && strings.Contains(got, "max_logged_field: "+tc.notWant) {
+				t.Errorf("report still says %q:\n%s", tc.notWant, got)
+			}
+		})
+	}
+}
+
+// TestExplainDefaultMatchesSessionDefault pins the number this package prints
+// for an omitted limits.max_logged_field to the bound the writer actually
+// applies. The constant is duplicated (session does not export it), so the two
+// are held together by behavior instead: a writer opened with zero options
+// clips at exactly the number the report names. A drift here would make the
+// dry run lie about the log it is describing.
+func TestExplainDefaultMatchesSessionDefault(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.RunStart("m", strings.Repeat("t", defaultMaxLoggedField*2))
+
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var e struct {
+		Task string `json:"task"`
+	}
+	if err := json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]), &e); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(strings.TrimSuffix(e.Task, "...[clipped]")); got != defaultMaxLoggedField {
+		t.Errorf("writer clips at %d bytes, explain reports %d", got, defaultMaxLoggedField)
+	}
+}
+
+// TestRenderMaxLoggedFieldOverrideMarked: the key is on the --set allowlist,
+// so its line must carry the same provenance marker every other settable
+// budget line carries.
+func TestRenderMaxLoggedFieldOverrideMarked(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Limits.MaxLoggedField = ptrInt(64)
+	got := Render(cfg, registryWith(t, fsBuiltins...), []string{"limits.max_logged_field=64"}, nil, alwaysFound, nil)
+	if want := "  max_logged_field: 64 (overridden via --set)\n"; !strings.Contains(got, want) {
+		t.Errorf("report missing %q:\n%s", want, got)
 	}
 }

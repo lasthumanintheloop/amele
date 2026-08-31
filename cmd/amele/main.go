@@ -1787,7 +1787,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 
-	agent, answer, hints, err := buildAgent(cfg, validator, lines, stderr, secrets)
+	agent, answer, hints, err := buildAgent(cfg, validator, lines, stderr, secrets, parsed.quiet)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
@@ -2040,7 +2040,7 @@ func startRun(ctx context.Context, cfg *config.Config, validator *schema.Validat
 func reportGateFailure(cfg *config.Config, validator *schema.Validator, parsed agentArgs, taskArgs string,
 	gateErr error, lines *lineReader, stderr io.Writer, secrets *session.SecretSet) int {
 	code := exitCodeFor(gateErr)
-	agent, _, _, err := buildAgent(cfg, validator, lines, stderr, secrets)
+	agent, _, _, err := buildAgent(cfg, validator, lines, stderr, secrets, parsed.quiet)
 	if err != nil {
 		// No session could be opened at all (a bad session_dir, a broken tool
 		// definition). Both failures are reported: the one that ended the run
@@ -2180,7 +2180,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	// ONE registry for the whole conversation (see runSecrets).
 	secrets := runSecrets(cfg)
 
-	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr, secrets)
+	agent, _, hints, err := buildAgent(cfg, nil, lines, stderr, secrets, parsed.quiet)
 	if err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
@@ -2546,6 +2546,33 @@ func runSecrets(cfg *config.Config) *session.SecretSet {
 	return session.NewSecretSet(agentSecrets(cfg))
 }
 
+// sessionOptions translates the config's session-logging keys into the
+// writer's options. It exists as its own function because the two layers spell
+// "no bound" differently and the translation must live in exactly one place:
+//
+//	config (YAML)                     session.Options
+//	limits.max_logged_field absent    0   -> the package default (8192)
+//	limits.max_logged_field: 0        -1  -> unbounded, nothing is clipped
+//	limits.max_logged_field: n        n   -> n bytes
+//
+// CONTRACT: the middle row is the whole reason this is not an assignment.
+// Copying the number across (opts.MaxLoggedField = *cfg...) would turn the
+// operator's explicit "log everything" into the 8 KiB default, silently and
+// with every unit test still green - the config says 0 means unbounded
+// (docs/contracts/config.schema.json), while a zero-valued Options field can
+// only mean "this caller never heard of the option".
+func sessionOptions(cfg *config.Config, secrets *session.SecretSet) session.Options {
+	opts := session.Options{SecretSource: secrets, LogReasoning: cfg.LogReasoning}
+	if cfg.Limits.MaxLoggedField != nil {
+		if v := *cfg.Limits.MaxLoggedField; v == 0 {
+			opts.MaxLoggedField = -1
+		} else {
+			opts.MaxLoggedField = v
+		}
+	}
+	return opts
+}
+
 // buildAgent assembles the loop for one run: tools, permissions, session
 // logging, provider and - when validator is non-nil - structured output
 // enforcement. lines and stderr are the terminal the permission approver asks
@@ -2556,8 +2583,11 @@ func runSecrets(cfg *config.Config) *session.SecretSet {
 // the CANONICAL JSON the validator accepted, which only the validator closure
 // below ever sees. Result.FinalText is the raw model reply and may be wrapped
 // in a ```json fence or padded with prose, so it is not printable.
+//
+// quiet is only consulted for the print_session_path note: it is a note like
+// every other, and -q means errors only (docs/contracts/cli.md).
 func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineReader, stderr io.Writer,
-	secrets *session.SecretSet) (*loop.Loop, func(*loop.Result) string, map[string]string, error) {
+	secrets *session.SecretSet, quiet bool) (*loop.Loop, func(*loop.Result) string, map[string]string, error) {
 	registry, err := buildRegistry(cfg)
 	if err != nil {
 		return nil, nil, nil, err
@@ -2575,9 +2605,24 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 
 	var sess *session.Writer
 	if cfg.SessionDir != "" {
-		sess, err = session.New(cfg.SessionDir, session.Options{SecretSource: secrets})
+		sess, err = session.New(cfg.SessionDir, sessionOptions(cfg, secrets))
 		if err != nil {
 			return nil, nil, nil, err
+		}
+		// The note names the file this run is writing, so a human who did not
+		// choose the timestamped name can `tail -f` it. It is a note, so -q
+		// (errors only) drops it like every other.
+		//
+		// SECURITY: printed verbatim, deliberately. The path is session_dir
+		// from the operator's own config plus a timestamp this process
+		// generated - nothing the model or a tool produced can reach this
+		// line. A session_dir written as ${VAR} is registered as a secret and
+		// so IS redacted inside the log; redacting it here too would print
+		// "[REDACTED]/run-....jsonl", which is exactly the one thing this note
+		// exists to avoid. The operator asked, in their own config, to be
+		// shown their own directory on their own terminal.
+		if cfg.PrintSessionPath && !quiet {
+			_, _ = fmt.Fprintf(stderr, "session log: %s\n", sess.Path())
 		}
 	}
 

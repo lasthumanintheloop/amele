@@ -32,6 +32,7 @@ BUDGETS
   max_turns:  20
   max_tokens: 50000
   timeout:    none
+  max_logged_field: 8192 (default)
 
 CONCURRENCY
   lock: disabled (concurrent runs of this config are allowed)

@@ -4228,7 +4228,7 @@ func TestBuildAgentParallelWiring(t *testing.T) {
 				Permissions: tt.perms,
 				Provider:    config.ProviderConfig{BaseURL: "https://api.example.com/v1", APIKey: "k"},
 			}
-			agent, _, _, err := buildAgent(cfg, nil, newLineReader(strings.NewReader("")), io.Discard, nil)
+			agent, _, _, err := buildAgent(cfg, nil, newLineReader(strings.NewReader("")), io.Discard, nil, false)
 			if err != nil {
 				t.Fatalf("buildAgent: %v", err)
 			}
@@ -4240,6 +4240,241 @@ func TestBuildAgentParallelWiring(t *testing.T) {
 			}
 			if got := agent.AutoApprove(llm.ToolCall{Name: "fs_read"}); got != tt.wantAuto {
 				t.Errorf("AutoApprove(fs_read) = %v, want %v", got, tt.wantAuto)
+			}
+		})
+	}
+}
+
+// textBodyWithReasoning is textBody plus a reasoning payload on the assistant
+// message. reasoning_content is the carrier the default (openai) dialect reads
+// - see llm.reasoningField - so this is what a reasoning model looks like to
+// the OpenAI-compatible client the e2e tests drive.
+func textBodyWithReasoning(content, reasoning string) string {
+	c, _ := json.Marshal(content)
+	r, _ := json.Marshal(reasoning)
+	return fmt.Sprintf(`{
+		"choices": [{"message": {"role": "assistant", "content": %s, "reasoning_content": %s}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 10, "completion_tokens": 5}
+	}`, c, r)
+}
+
+// readSessionRaw returns the single session file under dir verbatim. Some
+// assertions are about the BYTES rather than the decoded events: "this key is
+// absent" is a claim about the line as it was written.
+func readSessionRaw(t *testing.T, dir string) string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("session files: %v, %v", files, err)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+// firstLLMResponse returns the first llm_response event of the run's log.
+func firstLLMResponse(t *testing.T, dir string) session.Event {
+	t.Helper()
+	for _, e := range readSessionEvents(t, dir) {
+		if e.Type == "llm_response" {
+			return e
+		}
+	}
+	t.Fatal("no llm_response event in the session log")
+	return session.Event{}
+}
+
+// TestE2EReasoningLoggedOnlyOnOptIn drives the whole wire: a provider that
+// returns a reasoning payload, through the loop, into the log. The size is
+// recorded either way (JSONL v1.4); the CONTENT appears only under
+// log_reasoning: true.
+//
+// SECURITY: the off case asserts on the raw bytes, not on the decoded event -
+// "the operator did not ask for the model's scratchpad, so not one byte of it
+// is on disk" is a claim about the file.
+func TestE2EReasoningLoggedOnlyOnOptIn(t *testing.T) {
+	const payload = "first I considered the alternatives"
+	tests := []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "default drops the content", yaml: "session_dir: sessions\n"},
+		{name: "opt-in logs it", yaml: "session_dir: sessions\nlog_reasoning: true\n", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := scriptedServer(t, textBodyWithReasoning("done", payload))
+			cfgPath, dir := writeTestConfig(t, srv.URL, tt.yaml)
+
+			code, _, stderr := execCLI(t, []string{"run", cfgPath, "think"}, "")
+			if code != ExitOK {
+				t.Fatalf("exit %d, stderr: %s", code, stderr)
+			}
+
+			e := firstLLMResponse(t, dir)
+			// The accounting is unconditional: the operator always learns the
+			// turn carried reasoning, even when the content is dropped.
+			if e.ReasoningBytes == 0 {
+				t.Error("reasoning_bytes = 0: the size must be recorded in both modes")
+			}
+			raw := readSessionRaw(t, dir)
+			if tt.want {
+				if !strings.Contains(e.Reasoning, payload) {
+					t.Errorf("event.Reasoning = %q, want it to carry %q", e.Reasoning, payload)
+				}
+				if !strings.Contains(raw, `"reasoning":`) {
+					t.Errorf("session log has no reasoning key:\n%s", raw)
+				}
+				return
+			}
+			if strings.Contains(raw, `"reasoning":`) || strings.Contains(raw, payload) {
+				t.Errorf("reasoning content leaked into the log without the opt-in:\n%s", raw)
+			}
+		})
+	}
+}
+
+// TestE2EMaxLoggedFieldWiring is the seam test for limits.max_logged_field.
+// The config and the writer use INVERTED conventions for zero (YAML 0 =
+// unbounded; writer 0 = "use the default"), so the explicit-zero case is the
+// one that catches a mapping that merely copied the number across: it would
+// pass every unit test and silently clip the operator's unbounded log at 8 KiB.
+func TestE2EMaxLoggedFieldWiring(t *testing.T) {
+	const marker = "...[clipped]"
+	tests := []struct {
+		name    string
+		yaml    string
+		answer  string
+		wantLen int
+	}{
+		{
+			name:    "unset keeps the 8192 default",
+			yaml:    "session_dir: sessions\n",
+			answer:  strings.Repeat("x", 9000),
+			wantLen: 8192,
+		},
+		{
+			name:    "custom bound clips there",
+			yaml:    "session_dir: sessions\nlimits:\n  max_logged_field: 24\n",
+			answer:  strings.Repeat("y", 200),
+			wantLen: 24,
+		},
+		{
+			name:    "explicit zero logs the field whole",
+			yaml:    "session_dir: sessions\nlimits:\n  max_logged_field: 0\n",
+			answer:  strings.Repeat("z", 9000),
+			wantLen: 9000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := scriptedServer(t, textBody(tt.answer))
+			cfgPath, dir := writeTestConfig(t, srv.URL, tt.yaml)
+
+			code, _, stderr := execCLI(t, []string{"run", cfgPath, "answer"}, "")
+			if code != ExitOK {
+				t.Fatalf("exit %d, stderr: %s", code, stderr)
+			}
+
+			got := firstLLMResponse(t, dir).Content
+			clipped := strings.HasSuffix(got, marker)
+			body := strings.TrimSuffix(got, marker)
+			if len(body) != tt.wantLen {
+				t.Errorf("logged content = %d bytes, want %d (clipped=%v)", len(body), tt.wantLen, clipped)
+			}
+			if wantClipped := tt.wantLen < len(tt.answer); clipped != wantClipped {
+				t.Errorf("clipped marker = %v, want %v", clipped, wantClipped)
+			}
+		})
+	}
+}
+
+// sessionPathNote returns the path the "session log:" note named, or "" when
+// stderr carried no such note.
+func sessionPathNote(stderr string) string {
+	const prefix = "session log: "
+	for _, line := range strings.Split(stderr, "\n") {
+		if after, ok := strings.CutPrefix(line, prefix); ok {
+			return after
+		}
+	}
+	return ""
+}
+
+// TestE2EPrintSessionPath: print_session_path is a NOTE, so it obeys the rule
+// every other note does - -q means errors only (docs/contracts/cli.md) - and
+// both entry points that open a session honor the key.
+func TestE2EPrintSessionPath(t *testing.T) {
+	tests := []struct {
+		name  string
+		yaml  string
+		cmd   string
+		flags []string
+		want  bool
+	}{
+		{
+			name: "off by default",
+			yaml: "session_dir: sessions\n",
+			cmd:  "run",
+		},
+		{
+			name: "on prints the path",
+			yaml: "session_dir: sessions\nprint_session_path: true\n",
+			cmd:  "run",
+			want: true,
+		},
+		{
+			name:  "quiet suppresses it",
+			yaml:  "session_dir: sessions\nprint_session_path: true\n",
+			cmd:   "run",
+			flags: []string{"-q"},
+		},
+		{
+			name: "chat prints it too",
+			yaml: "session_dir: sessions\nprint_session_path: true\n",
+			cmd:  "chat",
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := scriptedServer(t, textBody("done"))
+			cfgPath, dir := writeTestConfig(t, srv.URL, tt.yaml)
+
+			// Flags come after the config path - the CLI refuses them before it.
+			args := append([]string{tt.cmd, cfgPath}, tt.flags...)
+			stdin := ""
+			if tt.cmd == "run" {
+				args = append(args, "a task")
+			} else {
+				stdin = "a task\n" // one chat turn, then EOF
+			}
+			code, _, stderr := execCLI(t, args, stdin)
+			if code != ExitOK {
+				t.Fatalf("exit %d, stderr: %s", code, stderr)
+			}
+
+			path := sessionPathNote(stderr)
+			if !tt.want {
+				if path != "" {
+					t.Errorf("unexpected session path note %q in stderr: %s", path, stderr)
+				}
+				return
+			}
+			if path == "" {
+				t.Fatalf("stderr carries no session path note: %s", stderr)
+			}
+			// The note must name the file that was actually written, not the
+			// directory it lives in.
+			if _, err := os.Stat(path); err != nil {
+				t.Errorf("noted path does not exist: %v", err)
+			}
+			files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+			if len(files) != 1 || files[0] != path {
+				t.Errorf("noted path = %q, want the run's only session file %v", path, files)
 			}
 		})
 	}

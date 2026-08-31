@@ -1400,8 +1400,31 @@ func budgetsSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	} else {
 		fmt.Fprintf(b, "  timeout:    none%s\n", set.mark("limits.timeout"))
 	}
+	// The log's own budget: how many bytes of each free-text field reach the
+	// session file. All three states are reported because none can be read off
+	// the YAML - an absent key means 8192, and an explicit 0 means the OPPOSITE
+	// of what a 0 means on every other line here (no bound at all, not "no
+	// budget left"). The row is not aligned with the three above: its label is
+	// wider than their padding, and widening theirs would rewrite every golden.
+	switch v := cfg.Limits.MaxLoggedField; {
+	case v == nil:
+		fmt.Fprintf(b, "  max_logged_field: %d (default)%s\n", defaultMaxLoggedField, set.mark("limits.max_logged_field"))
+	case *v == 0:
+		fmt.Fprintf(b, "  max_logged_field: UNBOUNDED (every logged field written whole)%s\n",
+			set.mark("limits.max_logged_field"))
+	default:
+		fmt.Fprintf(b, "  max_logged_field: %d%s\n", *v, set.mark("limits.max_logged_field"))
+	}
 	b.WriteString("\n")
 }
+
+// defaultMaxLoggedField mirrors internal/session's clip bound so the dry run
+// can name the number an omitted limits.max_logged_field resolves to.
+//
+// It is a copy, not an import: session does not export the constant, and
+// explain must not gain a dependency on the writer package to print one
+// number. TestExplainDefaultMatchesSessionDefault pins the two together.
+const defaultMaxLoggedField = 8 * 1024
 
 // concurrencySection reports what this config lets run at the same time: two
 // whole runs of it (`lock`), and two tool calls inside one turn

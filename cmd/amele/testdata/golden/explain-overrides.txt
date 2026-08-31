@@ -44,6 +44,7 @@ BUDGETS
   max_turns:  3 (overridden via --set)
   max_tokens: 500 (overridden via --set)
   timeout:    5m0s
+  max_logged_field: 8192 (default)
 
 CONCURRENCY
   lock: enabled (a run started while another holds <config>.lock exits 7)
