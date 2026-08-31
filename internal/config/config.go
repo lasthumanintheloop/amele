@@ -398,6 +398,14 @@ type Limits struct {
 	MaxTokens int `yaml:"max_tokens"`
 	// Timeout bounds the whole run wall-clock. Zero disables it.
 	Timeout Duration `yaml:"timeout"`
+	// MaxLoggedField bounds how many bytes of each free-text field one
+	// session event persists (task, content, args, result, error, and the
+	// opt-in reasoning). nil means the default (8192); 0 means unbounded -
+	// an explicit choice to trade the disk-safety cap for a complete
+	// record (data-pipeline use); negative is a config error. A pointer
+	// because "unset" and "explicitly 0" are different statements, the
+	// same reason provider.temperature is one.
+	MaxLoggedField *int `yaml:"max_logged_field"`
 }
 
 // OutputConfig constrains the run's final answer to a JSON Schema.
@@ -513,6 +521,18 @@ type Config struct {
 	// SessionDir enables JSONL session logging when non-empty. Relative
 	// paths are resolved against the config file's directory.
 	SessionDir string `yaml:"session_dir"`
+	// LogReasoning opts the provider's reasoning payload into the session
+	// log as event content (JSONL v1.5 `reasoning` field).
+	// SECURITY: default false. Reasoning is the model's unfiltered
+	// scratchpad and can restate a secret in words the value redactor
+	// never sees; turning this on is a data-governance decision, which is
+	// why the key is YAML-only (not in the --set allowlist).
+	LogReasoning bool `yaml:"log_reasoning"`
+	// PrintSessionPath prints one stderr note naming the run's session
+	// file ("session log: <path>") once the log is open. Default false;
+	// suppressed by -q like every other note (the -q contract stays
+	// "errors only").
+	PrintSessionPath bool `yaml:"print_session_path"`
 	// Lock makes `amele run` single-flight per config file: before doing
 	// anything with the provider it takes a non-blocking advisory lock on
 	// "<config path>.lock", and a run that finds it held exits 7 immediately.
@@ -1015,6 +1035,12 @@ func (c *Config) Violations() []string {
 	}
 	if c.Limits.Timeout < 0 {
 		add("limits.timeout must not be negative")
+	}
+	// A negative byte count has no reading: it is neither a bound nor the
+	// "unbounded" 0, so it is refused here rather than silently clamped -
+	// clamping would leave the operator believing a bound applies.
+	if c.Limits.MaxLoggedField != nil && *c.Limits.MaxLoggedField < 0 {
+		add("limits.max_logged_field must be >= 0 (0 means unbounded); omit the key for the default")
 	}
 
 	if info, err := os.Stat(c.Workspace); err != nil {

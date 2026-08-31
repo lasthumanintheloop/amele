@@ -117,6 +117,7 @@ limits:
   max_turns: ${TURNS}
   max_tokens: ${MAXTOK}
   timeout: ${RUN_TIMEOUT}
+  max_logged_field: ${LOGCLIP}
 output:
   max_schema_retries: ${RETRIES}
 `

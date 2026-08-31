@@ -79,7 +79,8 @@ on `run`, `chat`, `validate` and `explain`.
   anything is spent.
 - **Settable keys (closed list).** `model`, `prompt`, `system_prompt_file`,
   `workspace`, `session_dir`, `limits.max_turns`, `limits.max_tokens`,
-  `limits.timeout`, `output.max_schema_retries`, `provider.max_output_tokens`,
+  `limits.timeout`, `limits.max_logged_field`, `output.max_schema_retries`,
+  `provider.max_output_tokens`,
   `provider.reasoning.effort`, `provider.temperature`, `provider.top_p`. Any
   other key - including a typo - is exit 2 with
   `cannot override "X" from the command line; settable keys: ...`.
@@ -108,6 +109,16 @@ on `run`, `chat`, `validate` and `explain`.
   long a failing call keeps trying - a rhythm the audited file owns, next to
   the `limits.timeout` that bounds it - and `params` is a free-form mapping with
   no `key=value` spelling.
+- **Addition (2026-08-31): `limits.max_logged_field`.** The per-field byte
+  bound on session log events joined the allowlist, next to the other budgets:
+  it changes how much a run writes, never what it may do. Its two companion
+  keys from the same feature are deliberately absent - `log_reasoning` decides
+  WHAT is persisted (the model's unfiltered scratchpad, which the value
+  redactor cannot see into) and `print_session_path` decides what is printed;
+  both are data-governance statements the audited YAML owns. Empty is a
+  setting here, as for `session_dir`: `--set limits.max_logged_field=` drops a
+  bound the file set and falls back to the built-in default (8192) for this
+  run, and `=0` asks for an unbounded record.
 - **Migration (2026-08-12): the allowlist shrank.** `lock` was settable when
   overrides shipped and no longer is: `--set lock=true|false` is now exit 2
   like any other non-settable key. It was the one entry that could *weaken* a
@@ -116,12 +127,14 @@ on `run`, `chat`, `validate` and `explain`.
   Set the field in YAML instead; nothing about `lock:` in the config changed.
   This is the only key ever removed from the list.
 - **Values.** Integers via `strconv` (`limits.max_turns`, `limits.max_tokens`,
+  `limits.max_logged_field`,
   `output.max_schema_retries`, `provider.max_output_tokens`); floating point
   via `strconv` (`provider.temperature`, `provider.top_p`);
   `limits.timeout` takes a Go duration
   (`30s`, `5m`); the rest are strings taken verbatim. An
   empty value is accepted where it means something: `--set session_dir=`
-  disables session logging, and `--set provider.reasoning.effort=` drops back
+  disables session logging, `--set limits.max_logged_field=` drops back to the
+  default clip, and `--set provider.reasoning.effort=` drops back
   to the provider's own default. It is refused for `workspace` and
   `system_prompt_file`, which name nothing readable when empty, and for the two
   sampling keys, where it is not a number.

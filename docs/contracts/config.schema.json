@@ -239,12 +239,26 @@
         "timeout": {
           "$ref": "#/$defs/duration",
           "description": "Wall-clock bound for the whole run (`amele run`) or for one exchange (`amele chat`), e.g. \"5m\". Empty or omitted disables it."
+        },
+        "max_logged_field": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Per-field byte bound for session log events. Omitted means 8192; 0 means unbounded (the disk-safety cap is deliberately lifted). May also be a whole-value ${VAR} reference."
         }
       }
     },
     "session_dir": {
       "type": "string",
       "description": "Enables append-only JSONL session logging into this directory when non-empty. Relative paths are resolved against the config file's directory. Interpolated environment values are redacted from the log."
+    },
+    "log_reasoning": {
+      "type": "boolean",
+      "description": "Records the provider's reasoning payload in the session log as event content. Default false; the reasoning content can restate secrets in words the value redactor never sees, so it is opt-in only and deliberately not settable from the command line."
+    },
+    "print_session_path": {
+      "type": "boolean",
+      "description": "Prints one stderr note naming this run's session file (\"session log: <path>\") once the log is open, so a caller can pick the file up without reconstructing its name. Default false; suppressed by -q like every other note."
     },
     "lock": {
       "type": "boolean",

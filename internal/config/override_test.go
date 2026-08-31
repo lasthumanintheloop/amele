@@ -27,8 +27,10 @@ func overrideBase() *Config {
 // round-trip from the command line into the field it names. A key that
 // silently does nothing would be the worst possible failure - the run would
 // proceed with the config's value while the operator believes otherwise.
-// The four provider tuning keys live in TestApplyOverridesProviderTuningKeys,
-// which covers the same ground for them.
+// The four provider tuning keys live in TestApplyOverridesProviderTuningKeys
+// and limits.max_logged_field in TestApplyOverridesMaxLoggedField, which cover
+// the same ground for them (their pointer fields need three cases each, which
+// would not fit this table's complexity budget).
 func TestApplyOverridesAllowedKeys(t *testing.T) {
 	baseDir := t.TempDir()
 
@@ -106,10 +108,11 @@ func TestApplyOverridesAllowedKeys(t *testing.T) {
 // operators to a flag that does not exist.
 func TestSettableKeysCoversAllowlist(t *testing.T) {
 	want := []string{
-		"limits.max_tokens", "limits.max_turns", "limits.timeout", "model",
-		"output.max_schema_retries", "prompt", "provider.max_output_tokens",
-		"provider.reasoning.effort", "provider.temperature", "provider.top_p",
-		"session_dir", "system_prompt_file", "workspace",
+		"limits.max_logged_field", "limits.max_tokens", "limits.max_turns",
+		"limits.timeout", "model", "output.max_schema_retries", "prompt",
+		"provider.max_output_tokens", "provider.reasoning.effort",
+		"provider.temperature", "provider.top_p", "session_dir",
+		"system_prompt_file", "workspace",
 	}
 	got := SettableKeys()
 	if len(got) != len(want) {
@@ -239,6 +242,7 @@ func TestApplyOverridesBadScalars(t *testing.T) {
 		{"duration", "limits.timeout=5 minutes", "limits.timeout"},
 		{"empty duration", "limits.timeout=", "limits.timeout"},
 		{"empty int", "limits.max_turns=", "limits.max_turns"},
+		{"int pointer", "limits.max_logged_field=lots", "limits.max_logged_field"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ApplyOverrides(overrideBase(), []string{tt.pair}, t.TempDir())
@@ -268,6 +272,65 @@ func TestApplyOverridesRejectsEmptyPathValues(t *testing.T) {
 				t.Errorf("error = %q, want it to name %q", err, key)
 			}
 		})
+	}
+}
+
+// TestApplyOverridesMaxLoggedField walks the pointer field's three states from
+// the command line. Zero is a value, not a slip - it asks for an unbounded
+// record - and empty is a setting rather than a slip too, like session_dir:
+// nil means "use the default clip", so `--set limits.max_logged_field=` is how
+// a caller drops a bound the YAML set and goes back to the built-in one for
+// this run.
+func TestApplyOverridesMaxLoggedField(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		pair string
+		want *int // nil means the pointer must be cleared
+	}{
+		{"a byte bound", "limits.max_logged_field=4096", ptrInt(4096)},
+		{"zero is unbounded", "limits.max_logged_field=0", ptrInt(0)},
+		{"empty is back to the default", "limits.max_logged_field=", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := overrideBase()
+			// Start from a value the YAML could have set, so the empty case
+			// proves a clear rather than a no-op on an already-nil field.
+			cfg.Limits.MaxLoggedField = ptrInt(128)
+
+			if err := ApplyOverrides(cfg, []string{tt.pair}, t.TempDir()); err != nil {
+				t.Fatalf("ApplyOverrides(%q): %v", tt.pair, err)
+			}
+			got := cfg.Limits.MaxLoggedField
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("max_logged_field = %d, want nil (back to the default)", *got)
+			case tt.want != nil && got == nil:
+				t.Errorf("max_logged_field = nil, want %d", *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Errorf("max_logged_field = %d, want %d", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyOverridesMaxLoggedFieldNegativeFailsValidation: the override parses
+// any integer, and Validate stays the single judge of the range - a negative
+// bound is exit 2 from --set exactly as the same value written in YAML is.
+func TestApplyOverridesMaxLoggedFieldNegativeFailsValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := overrideBase()
+	cfg.Workspace = dir
+	cfg.Provider.BaseURL = "https://api.example.com/v1"
+
+	if err := ApplyOverrides(cfg, []string{"limits.max_logged_field=-1"}, dir); err != nil {
+		t.Fatalf("ApplyOverrides must accept the parse and leave the range to Validate: %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Validate() = %v, want an ErrInvalid rejection", err)
+	}
+	if !strings.Contains(err.Error(), "limits.max_logged_field") {
+		t.Errorf("error = %q, want it to name limits.max_logged_field", err)
 	}
 }
 

@@ -41,7 +41,16 @@ import (
 // make a run spend differently. provider.dialect stays out because it reshapes
 // every request rather than retuning one, and provider.params because it writes
 // arbitrary keys into the request body.
+//
+// SECURITY: limits.max_logged_field (2026-08-31) is a BUDGET, not a
+// disclosure switch: it bounds how many bytes of each field the session log
+// keeps, so the worst an operator can do with it is make the log bigger or
+// smaller. Its two companions in the same feature - log_reasoning and
+// print_session_path - stay off the list deliberately: they decide WHAT is
+// persisted and what is printed, which is a data-governance statement the
+// audited YAML owns.
 var settableKeys = []string{
+	"limits.max_logged_field",
 	"limits.max_tokens",
 	"limits.max_turns",
 	"limits.timeout",
@@ -222,6 +231,8 @@ func (c *Config) applyScalarOverride(key, value string) (handled bool, err error
 		return true, overrideInt(key, value, &c.Limits.MaxTurns)
 	case "limits.max_tokens":
 		return true, overrideInt(key, value, &c.Limits.MaxTokens)
+	case "limits.max_logged_field":
+		return true, overrideIntPtr(key, value, &c.Limits.MaxLoggedField)
 	case "output.max_schema_retries":
 		return true, overrideInt(key, value, &c.Output.MaxSchemaRetries)
 	case "provider.max_output_tokens":
@@ -250,6 +261,28 @@ func overrideInt(key, value string, dst *int) error {
 		return fmt.Errorf("%w: --set %s: %q is not an integer", ErrInvalid, key, value)
 	}
 	*dst = parsed
+	return nil
+}
+
+// overrideIntPtr parses one integer override into dst, which is a POINTER
+// field: "--set limits.max_logged_field=0" therefore means the explicit
+// "unbounded" setting rather than "unset", the same distinction the YAML key
+// carries.
+//
+// An empty value is a setting here, not a slip (as with session_dir): it
+// clears the pointer, which is how a caller drops a bound the file set and
+// falls back to the built-in default for this run. Range checks stay in
+// Validate, like every other field's.
+func overrideIntPtr(key, value string, dst **int) error {
+	if value == "" {
+		*dst = nil
+		return nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fmt.Errorf("%w: --set %s: %q is not an integer", ErrInvalid, key, value)
+	}
+	*dst = &parsed
 	return nil
 }
 

@@ -2633,3 +2633,163 @@ func TestToolsParallelDefault(t *testing.T) {
 		})
 	}
 }
+
+// ptrInt returns a pointer to v, so the tables below can spell "explicitly 0"
+// and "absent" as two different values.
+func ptrInt(v int) *int { return &v }
+
+// TestValidateMaxLoggedField pins the three-way meaning of the pointer: absent
+// is the built-in clip, an explicit 0 is a legal "unbounded" (the operator
+// trading the disk-safety cap for a complete record), and a negative byte
+// count is a config error rather than a silently ignored value.
+func TestValidateMaxLoggedField(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name    string
+		value   *int
+		wantSub string // "" means the config must validate
+	}{
+		{"omitted means the default", nil, ""},
+		{"zero is legal (unbounded)", ptrInt(0), ""},
+		{"one byte is legal", ptrInt(1), ""},
+		{"a realistic bound", ptrInt(4096), ""},
+		{"negative is rejected", ptrInt(-1), "limits.max_logged_field"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tuningBase(dir)
+			cfg.Limits.MaxLoggedField = tt.value
+			err := cfg.Validate()
+			if tt.wantSub == "" {
+				if err != nil {
+					t.Fatalf("config must validate, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected a violation")
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error should wrap ErrInvalid: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not mention %q", err, tt.wantSub)
+			}
+			// The message must state what the field accepts, so the operator
+			// can fix it without opening the schema.
+			if !strings.Contains(err.Error(), "0 means unbounded") {
+				t.Errorf("error %q does not say what 0 means", err)
+			}
+		})
+	}
+}
+
+// TestLoadSessionLoggingKeys pins the YAML surface of the three keys the
+// data-pipeline use case needs: the per-field clip bound under limits, and the
+// two top-level booleans next to session_dir. All three must round-trip from
+// the file into the struct and validate.
+func TestLoadSessionLoggingKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML+`
+limits:
+  max_logged_field: 4096
+log_reasoning: true
+print_session_path: true
+session_dir: sessions
+`)
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.Limits.MaxLoggedField == nil || *cfg.Limits.MaxLoggedField != 4096 {
+		t.Errorf("max_logged_field = %v, want 4096", cfg.Limits.MaxLoggedField)
+	}
+	if !cfg.LogReasoning {
+		t.Error("log_reasoning = false, want true")
+	}
+	if !cfg.PrintSessionPath {
+		t.Error("print_session_path = false, want true")
+	}
+}
+
+// TestLoadSessionLoggingKeyDefaults pins the safe defaults: a config that says
+// nothing gets the built-in clip (nil, not 0) and both booleans off.
+// SECURITY: log_reasoning defaulting to false is the point of the key - the
+// reasoning payload is unfiltered model scratchpad, so it is persisted only
+// when the operator asked for it in the audited YAML.
+func TestLoadSessionLoggingKeyDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML)
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Limits.MaxLoggedField != nil {
+		t.Errorf("max_logged_field default = %d, want nil (the built-in default)", *cfg.Limits.MaxLoggedField)
+	}
+	if cfg.LogReasoning {
+		t.Error("log_reasoning default = true, want false")
+	}
+	if cfg.PrintSessionPath {
+		t.Error("print_session_path default = true, want false")
+	}
+}
+
+// TestLoadMaxLoggedFieldZero pins that an explicitly written 0 survives the
+// load as *0 rather than collapsing into "unset": it is the operator asking
+// for an unbounded record, and that difference is why the field is a pointer.
+func TestLoadMaxLoggedFieldZero(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML+"limits:\n  max_logged_field: 0\n")
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Limits.MaxLoggedField == nil {
+		t.Fatal("max_logged_field = nil, want an explicit 0 (unbounded)")
+	}
+	if *cfg.Limits.MaxLoggedField != 0 {
+		t.Errorf("max_logged_field = %d, want 0", *cfg.Limits.MaxLoggedField)
+	}
+}
+
+// TestLoadMaxLoggedFieldFromEnv keeps the schema's claim honest: it declares
+// the key as ["integer","string"] so an editor accepts the ${VAR} form, and
+// that form must actually load - the pointer field is the novel part, since a
+// missing variable must not become a spurious *0.
+func TestLoadMaxLoggedFieldFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML+"limits:\n  max_logged_field: ${LOGCLIP}\n")
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k", "LOGCLIP": "512"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.Limits.MaxLoggedField == nil || *cfg.Limits.MaxLoggedField != 512 {
+		t.Errorf("max_logged_field = %v, want 512", cfg.Limits.MaxLoggedField)
+	}
+}
+
+// TestSessionContentKeysAreNotSettable pins the deliberate omission: WHAT the
+// session log persists is a data-governance decision, so it lives in the YAML
+// the operator reviews, not in a flag appended to a cron line. Only the size
+// bound (limits.max_logged_field) is settable, next to the other budgets.
+// SECURITY: docs/threat-model.md §2 - the file is the audited grant.
+func TestSessionContentKeysAreNotSettable(t *testing.T) {
+	for _, key := range []string{"log_reasoning", "print_session_path"} {
+		if slices.Contains(SettableKeys(), key) {
+			t.Errorf("SettableKeys() advertises %q; it must stay YAML-only", key)
+		}
+	}
+}
