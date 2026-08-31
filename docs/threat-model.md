@@ -496,6 +496,16 @@ be read out of the YAML by hand.
 - Tool names and call IDs appear in session events unredacted; secrets
   belong in values, and redaction covers value fields (task, content,
   arguments, results).
+- `log_reasoning: true` widens the trail to the model's scratchpad. The
+  reasoning payload goes through the same unconditional §4.5 redaction as
+  every other logged field (JSON-escaped spellings included), but redaction
+  matches secret *values*, and a scratchpad paraphrases: a model that writes
+  "the token in the env starts with sk-live and ends in 7f" has leaked
+  something no value match can see. The key defaults to off and is
+  deliberately not settable from the command line (§5.5) - it is a
+  data-governance decision for the audited YAML, and `amele explain` reports
+  and warns about it. Opting in trades that residual risk for the ability to
+  audit *why* a run did what it did.
 
 ## 6. Safe configuration patterns
 
