@@ -866,3 +866,152 @@ func TestWriterRedactsSecretAddedAfterNew(t *testing.T) {
 		t.Errorf("session log lost the redaction marker:\n%s", data)
 	}
 }
+
+// TestClipLimitConfigurable pins limits.max_logged_field's writer half:
+// 0 keeps the 8192 default (today's behavior for every existing caller),
+// a positive value becomes the bound, negative disables clipping entirely.
+// The ...[clipped] marker still rides ON TOP of the limit (contract:
+// limit + 12 bytes), and redaction still runs first in every mode.
+func TestClipLimitConfigurable(t *testing.T) {
+	const marker = "...[clipped]"
+	long := strings.Repeat("a", 9000)
+	cases := []struct {
+		name       string
+		maxField   int
+		content    string
+		wantLen    int // expected len of the logged content field
+		wantMarker bool
+	}{
+		{"zero means the 8192 default", 0, long, maxLoggedField + len(marker), true},
+		{"custom small bound", 16, long, 16 + len(marker), true},
+		{"negative means unbounded", -1, long, 9000, false},
+		{"under any bound is untouched", 16, "short", len("short"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock(), MaxLoggedField: tc.maxField})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.LLMResponse(LLMResponse{Turn: 1, Content: tc.content, FinishReason: "stop"})
+
+			ev := firstLLMEvent(t, w.Path())
+			if len(ev.Content) != tc.wantLen {
+				t.Errorf("logged content is %d bytes, want %d", len(ev.Content), tc.wantLen)
+			}
+			if got := strings.HasSuffix(ev.Content, marker); got != tc.wantMarker {
+				t.Errorf("clip marker present = %v, want %v", got, tc.wantMarker)
+			}
+		})
+	}
+
+	// SECURITY: redaction runs BEFORE the bound in every mode, unbounded
+	// included - "no clipping" must never mean "no redaction".
+	t.Run("unbounded still redacts", func(t *testing.T) {
+		w, err := New(t.TempDir(), Options{Clock: fixedClock(), MaxLoggedField: -1, Secrets: []string{"sk-live"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.LLMResponse(LLMResponse{Turn: 1, Content: "key is sk-live" + long, FinishReason: "stop"})
+
+		ev := firstLLMEvent(t, w.Path())
+		if strings.Contains(ev.Content, "sk-live") {
+			t.Error("secret leaked when clipping was disabled")
+		}
+		if !strings.Contains(ev.Content, "[REDACTED]") {
+			t.Error("redaction marker missing in unbounded mode")
+		}
+	})
+}
+
+// TestReasoningLoggedOnlyWhenEnabled pins log_reasoning's writer half: the
+// reasoning payload is dropped unless the writer was opened with LogReasoning,
+// and once opted in it travels the same redact+clip path as every other
+// free-text field. The size (reasoning_bytes) is recorded either way.
+func TestReasoningLoggedOnlyWhenEnabled(t *testing.T) {
+	const payload = `{"x":"secret-value"}`
+
+	t.Run("default off drops the content", func(t *testing.T) {
+		w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.LLMResponse(LLMResponse{Turn: 1, Content: "hi", FinishReason: "stop", Reasoning: payload, ReasoningBytes: len(payload)})
+
+		data, err := os.ReadFile(w.Path())
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := strings.TrimSpace(string(data))
+		if strings.Contains(line, `"reasoning"`) {
+			t.Errorf("reasoning key written without the opt-in:\n%s", line)
+		}
+		if strings.Contains(line, "secret-value") {
+			t.Errorf("reasoning content leaked without the opt-in:\n%s", line)
+		}
+		var ev Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		if ev.ReasoningBytes != len(payload) {
+			t.Errorf("reasoning_bytes = %d, want %d", ev.ReasoningBytes, len(payload))
+		}
+	})
+
+	t.Run("opt-in logs the payload", func(t *testing.T) {
+		w, err := New(t.TempDir(), Options{Clock: fixedClock(), LogReasoning: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.LLMResponse(LLMResponse{Turn: 1, Content: "hi", FinishReason: "stop", Reasoning: payload, ReasoningBytes: len(payload)})
+
+		ev := firstLLMEvent(t, w.Path())
+		if ev.Reasoning != payload {
+			t.Errorf("reasoning = %q, want %q", ev.Reasoning, payload)
+		}
+	})
+
+	t.Run("opt-in still redacts", func(t *testing.T) {
+		w, err := New(t.TempDir(), Options{Clock: fixedClock(), LogReasoning: true, Secrets: []string{"secret-value"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.LLMResponse(LLMResponse{Turn: 1, Content: "hi", FinishReason: "stop", Reasoning: payload, ReasoningBytes: len(payload)})
+
+		ev := firstLLMEvent(t, w.Path())
+		if strings.Contains(ev.Reasoning, "secret-value") {
+			t.Errorf("secret survived in the logged reasoning: %q", ev.Reasoning)
+		}
+		if !strings.Contains(ev.Reasoning, "[REDACTED]") {
+			t.Errorf("reasoning was not redacted: %q", ev.Reasoning)
+		}
+	})
+
+	t.Run("opt-in still clips", func(t *testing.T) {
+		w, err := New(t.TempDir(), Options{Clock: fixedClock(), LogReasoning: true, MaxLoggedField: 16})
+		if err != nil {
+			t.Fatal(err)
+		}
+		long := strings.Repeat("r", 40)
+		w.LLMResponse(LLMResponse{Turn: 1, Content: "hi", FinishReason: "stop", Reasoning: long, ReasoningBytes: len(long)})
+
+		ev := firstLLMEvent(t, w.Path())
+		if want := strings.Repeat("r", 16) + "...[clipped]"; ev.Reasoning != want {
+			t.Errorf("reasoning = %q, want %q", ev.Reasoning, want)
+		}
+	})
+}
+
+// firstLLMEvent decodes the first line of a session file as an Event.
+func firstLLMEvent(t *testing.T, path string) Event {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ev Event
+	if err := json.Unmarshal([]byte(strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)[0]), &ev); err != nil {
+		t.Fatal(err)
+	}
+	return ev
+}

@@ -50,14 +50,23 @@ type Event struct {
 	OutputTokens int      `json:"output_tokens,omitempty"`
 	FinishReason string   `json:"finish_reason,omitempty"`
 	// ReasoningBytes is the size of the provider's reasoning payload for this
-	// turn (v1.4, additive; absent means none).
+	// turn (v1.4, additive; absent means none). It is recorded whether or not
+	// the content itself is logged, so "why did this turn cost that much?"
+	// always has an answer.
 	//
-	// SECURITY: the size, never the content. Reasoning is the model's
-	// unfiltered scratchpad - it can restate a credential in words the value
-	// redactor never sees - and replay does not need it (the fake provider
-	// scripts responses). What an operator asking "why did this turn cost
-	// that much?" needs is exactly this number.
+	// SECURITY: the size only, BY DEFAULT. Reasoning is the model's unfiltered
+	// scratchpad - it can restate a credential in words the value redactor
+	// never sees - so the content is written only when the operator opts in
+	// with log_reasoning: true (Options.LogReasoning), and then it goes into
+	// Reasoning below through the same redact+clip path as every other
+	// free-text field.
 	ReasoningBytes int `json:"reasoning_bytes,omitempty"`
+	// Reasoning is the provider's reasoning payload for the turn, as a
+	// string (clipped + redacted like every other free-text field). Present
+	// only when the writer was opened with LogReasoning (log_reasoning:
+	// true, JSONL v1.5); absent otherwise - absence is the pre-v1.5 and
+	// default-config shape.
+	Reasoning string `json:"reasoning,omitempty"`
 
 	// tool_call / tool_result. CallID links both back to the requesting
 	// llm_response entry in ToolCallIDs.
@@ -108,8 +117,10 @@ type Event struct {
 	DurationMS  int64  `json:"duration_ms,omitempty"`
 }
 
-// maxLoggedField bounds how much of args/results is persisted per event so a
-// single huge tool result cannot balloon the session file.
+// maxLoggedField is the DEFAULT bound on how much of args/results is persisted
+// per event, so a single huge tool result cannot balloon the session file. It
+// applies whenever Options.MaxLoggedField is zero, which is every caller that
+// does not configure limits.max_logged_field.
 const maxLoggedField = 8 * 1024
 
 // Writer appends events to one run's JSONL file. A nil *Writer is valid and
@@ -119,6 +130,13 @@ type Writer struct {
 	clock  Clock
 	redact func(string) string
 	path   string
+	// maxField is the resolved per-field byte bound: Options.MaxLoggedField
+	// when non-zero, the maxLoggedField default otherwise. Negative means no
+	// bound at all (redaction still runs; see clip).
+	maxField int
+	// logReasoning mirrors Options.LogReasoning. SECURITY: when false the
+	// reasoning payload handed to LLMResponse is dropped rather than written.
+	logReasoning bool
 	// mu serializes emit and the mcpErrors accesses, making a *Writer safe
 	// for concurrent use. Today's loop is sequential, but the MCP connect
 	// phase already drives one writer from several goroutines (through cmd's
@@ -149,6 +167,20 @@ type Options struct {
 	// credential; the two exist together only so callers with a fixed list
 	// need not build a set.
 	SecretSource *SecretSet
+	// MaxLoggedField overrides how many bytes of each free-text field are
+	// persisted per event. Zero means the package default (8192), so every
+	// existing caller keeps today's behavior; negative disables the bound
+	// entirely (limits.max_logged_field: 0 in the config). The ...[clipped]
+	// marker is appended on top of the bound, and redaction runs regardless.
+	MaxLoggedField int
+	// LogReasoning opts the provider's reasoning payload into the log
+	// (log_reasoning: true). SECURITY: default off. Reasoning is the model's
+	// unfiltered scratchpad - it can restate a credential in words the value
+	// redactor never sees - so the content is persisted only on this
+	// explicit opt-in, and even then it passes through the same redact+clip
+	// path as every other field. Event.ReasoningBytes carries the size
+	// either way.
+	LogReasoning bool
 }
 
 // New creates the session file inside dir. The filename embeds the UTC
@@ -186,7 +218,17 @@ func New(dir string, opts Options) (*Writer, error) {
 	if secrets == nil {
 		secrets = NewSecretSet(opts.Secrets)
 	}
-	return &Writer{w: f, clock: clock, redact: secrets.Redact, path: path}, nil
+	// Zero is "unset", not "unbounded": a caller that never heard of
+	// MaxLoggedField must keep the historical 8 KiB bound. Unbounded is
+	// spelled with a negative value so it has to be asked for.
+	maxField := opts.MaxLoggedField
+	if maxField == 0 {
+		maxField = maxLoggedField
+	}
+	return &Writer{
+		w: f, clock: clock, redact: secrets.Redact, path: path,
+		maxField: maxField, logReasoning: opts.LogReasoning,
+	}, nil
 }
 
 // Path returns the session file location ("" for a nil writer).
@@ -428,22 +470,26 @@ func (w *Writer) emit(e Event) {
 }
 
 // clip bounds and redacts a free-text field before logging.
+//
+// SECURITY: redaction runs FIRST and unconditionally - before the bound is
+// even consulted - so disabling the bound (w.maxField < 0) never means
+// disabling redaction.
 func (w *Writer) clip(text string) string {
 	if w == nil {
 		return ""
 	}
 	text = w.redact(text)
-	if len(text) > maxLoggedField {
-		cut := maxLoggedField
-		// back up to a rune boundary, torn runes become U+FFFD in json.Marshal
-		for cut > 0 && !utf8.RuneStart(text[cut]) {
-			cut--
-		}
-		// 8192 + the 12-byte marker = 8204, exactly as the contract doc states;
-		// do not change the cap to absorb the marker.
-		return text[:cut] + "...[clipped]"
+	if w.maxField < 0 || len(text) <= w.maxField {
+		return text
 	}
-	return text
+	cut := w.maxField
+	// back up to a rune boundary, torn runes become U+FFFD in json.Marshal
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	// 8192 + the 12-byte marker = 8204, exactly as the contract doc states;
+	// do not change the cap to absorb the marker.
+	return text[:cut] + "...[clipped]"
 }
 
 // RunStart records the beginning of a run.
@@ -471,22 +517,33 @@ type LLMResponse struct {
 	// FinishReason is the provider's stop reason, verbatim.
 	FinishReason string
 	// ReasoningBytes is the SIZE of the turn's reasoning payload - a length,
-	// not a payload: the caller passes len(message.Reasoning) and the
-	// reasoning itself is never written (see Event.ReasoningBytes). Zero
+	// not a payload: the caller passes len(message.Reasoning) and the size is
+	// recorded whether or not the content is (see Event.ReasoningBytes). Zero
 	// means the turn carried none.
 	ReasoningBytes int
+	// Reasoning is the turn's raw reasoning payload as text, before clipping
+	// and redaction. SECURITY: the writer DROPS it unless it was opened with
+	// Options.LogReasoning; passing it is always safe.
+	Reasoning string
 }
 
 // LLMResponse records a model turn: content (clipped and redacted), the IDs of
 // any tool calls it requested, the token accounting, and the size of the
-// turn's reasoning payload.
+// turn's reasoning payload. The reasoning content itself is written only when
+// the writer was opened with LogReasoning, through the same redact+clip path.
 func (w *Writer) LLMResponse(r LLMResponse) {
-	w.emit(Event{
+	e := Event{
 		Type: "llm_response", Turn: r.Turn,
 		Content: w.clip(r.Content), ToolCallIDs: r.ToolCallIDs,
 		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
 		FinishReason: r.FinishReason, ReasoningBytes: r.ReasoningBytes,
-	})
+	}
+	// SECURITY: the opt-in is checked here, so the default path cannot write a
+	// reasoning byte no matter what the caller passes.
+	if w != nil && w.logReasoning {
+		e.Reasoning = w.clip(r.Reasoning)
+	}
+	w.emit(e)
 }
 
 // ToolCall records a tool invocation request from the model. callID links the
