@@ -80,8 +80,8 @@ on `run`, `chat`, `validate` and `explain`.
 - **Settable keys (closed list).** `model`, `prompt`, `system_prompt_file`,
   `workspace`, `session_dir`, `limits.max_turns`, `limits.max_tokens`,
   `limits.timeout`, `limits.max_logged_field`, `output.max_schema_retries`,
-  `provider.max_output_tokens`,
-  `provider.reasoning.effort`, `provider.temperature`, `provider.top_p`. Any
+  `provider.max_output_tokens`, `provider.reasoning.effort`,
+  `provider.temperature`, `provider.top_p`. Any
   other key - including a typo - is exit 2 with
   `cannot override "X" from the command line; settable keys: ...`.
 - **What is deliberately NOT settable**, and why: `tools.*`, `mcp.*`,
@@ -127,11 +127,10 @@ on `run`, `chat`, `validate` and `explain`.
   Set the field in YAML instead; nothing about `lock:` in the config changed.
   This is the only key ever removed from the list.
 - **Values.** Integers via `strconv` (`limits.max_turns`, `limits.max_tokens`,
-  `limits.max_logged_field`,
-  `output.max_schema_retries`, `provider.max_output_tokens`); floating point
-  via `strconv` (`provider.temperature`, `provider.top_p`);
-  `limits.timeout` takes a Go duration
-  (`30s`, `5m`); the rest are strings taken verbatim. An
+  `limits.max_logged_field`, `output.max_schema_retries`,
+  `provider.max_output_tokens`); floating point via `strconv`
+  (`provider.temperature`, `provider.top_p`); `limits.timeout` takes a Go
+  duration (`30s`, `5m`); the rest are strings taken verbatim. An
   empty value is accepted where it means something: `--set session_dir=`
   disables session logging, `--set limits.max_logged_field=` drops back to the
   default clip, and `--set provider.reasoning.effort=` drops back
@@ -222,6 +221,11 @@ stdout gets nothing.
 lines, and - unless `-q` - the one-line summary:
 `✓ 8 turns, 3 tool calls, 41.0k tokens, 34.2s` (`✗` on failure; the two nouns
 turn singular at a count of exactly 1: `✓ 1 turn, 1 tool call, ...`).
+With `print_session_path: true` in the config, one further note - `session log:
+<path>` - is printed once, as soon as the session file is open, naming the
+timestamped file this run is writing so it can be followed with `tail -f`. It
+is a note like the others, so `-q` (errors only) drops it, and it appears only
+when `session_dir` is set.
 
 **Run lock**: with `lock: true` in the config, `run` takes a non-blocking
 advisory lock on `<absolute config path>.lock` (created 0600) before reading
@@ -278,8 +282,10 @@ is no delimiter. A scripted consumer that needs a parseable boundary should
 use `amele run` (one answer per process).
 
 **stderr**: the `> ` prompt, approval questions, notes (e.g.
-`output.schema is ignored in chat`), errors, the `-v` progress lines, and -
-unless `-q` - the cumulative session summary at the end.
+`output.schema is ignored in chat`, and the `session log:` note when
+`print_session_path` is set - once for the whole session, as in `run`), errors,
+the `-v` progress lines, and - unless `-q` - the cumulative session summary at
+the end.
 
 **Budgets**: `limits.max_turns` and `limits.max_tokens` form one pool for the
 whole session (exhausted → exit 3); `limits.timeout` bounds a single exchange,

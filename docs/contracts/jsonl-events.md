@@ -1,8 +1,9 @@
 # JSONL event schema
 
-**v1.4 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.5 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
-`mcp_connect.auth` (v1.3) and `llm_response.reasoning_bytes` (v1.4) added
+`mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4) and the
+opt-in `llm_response.reasoning` (v1.5) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
@@ -30,7 +31,7 @@ Every line is one JSON object with three always-present fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `v` | int | Wire schema version. Always `1` for this document - the `v1.4` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
+| `v` | int | Wire schema version. Always `1` for this document - the `v1.5` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
 | `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
@@ -57,7 +58,8 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `input_tokens` | int | Provider-reported input tokens for **this** round-trip (not cumulative). |
 | `output_tokens` | int | Provider-reported output tokens for this round-trip. |
 | `finish_reason` | string | The provider's finish reason verbatim (`stop`, `length`, `tool_calls`, `content_filter`, `error`, ...); may be absent when the provider omits it. |
-| `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is never logged**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn. Since v1.4. |
+| `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is not logged by default**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. `log_reasoning: true` opts it in (v1.5, the `reasoning` field below) through the same redact+clip path as every other free-text field; the rationale above is why that is a deliberate data-governance decision rather than a default. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn, and it answers it whether or not the content is logged. Since v1.4. |
+| `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Present **only** when the config sets `log_reasoning: true`; absence therefore means "not opted in", never "this turn carried no reasoning" - `reasoning_bytes` is the field that answers that. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text. Since v1.5. |
 
 ### `tool_call` - the model requested a tool
 
@@ -80,7 +82,7 @@ unknown-tool calls appear in the log too - that is the audit trail.
 | `is_error` | bool | Present (`true`) for **harness dispatch failures only**: the call never produced a tool's own output. Absent otherwise. See below. |
 | `outcome` | string | How the call ended, from the fixed enum below. Since v0.1.0; absent in logs written before it. |
 | `exit_code` | int | The command's exit status. Present **only** when a subprocess/shell tool actually ran and its status is known - i.e. together with `outcome: nonzero_exit`. A child killed by a signal reports `-1` here (Go's exit status for "died on a signal"), which is still `nonzero_exit`: the command ran, it just has no clean status. Since v0.1.0. |
-| `result_bytes` | int | Byte length of the **full** result text before session clipping (and before redaction, which rewrites lengths). Compare with `result`: the log keeps 8 KiB per field while the model may have read considerably more - the subprocess/shell cap is 64 KiB **per stream**, so a failed command's result carries up to 64 KiB of stdout plus 64 KiB of stderr plus the `exit status`/`stdout:`/`stderr:` framing. This field is what makes that loss visible. Absent for an empty result. Since v0.1.0. |
+| `result_bytes` | int | Byte length of the **full** result text before session clipping (and before redaction, which rewrites lengths). Compare with `result`: the log keeps `limits.max_logged_field` bytes per field (8 KiB unless the config says otherwise) while the model may have read considerably more - the subprocess/shell cap is 64 KiB **per stream**, so a failed command's result carries up to 64 KiB of stdout plus 64 KiB of stderr plus the `exit status`/`stdout:`/`stderr:` framing. This field is what makes that loss visible. Absent for an empty result. Since v0.1.0. |
 
 #### `is_error` vs `outcome`
 
@@ -242,12 +244,14 @@ round-trips must count `llm_response` events rather than read `run_end.turns`.
 
 ## Clipping and redaction
 
-Free-text fields (`task`, `content`, `args`, `result`) are bounded and
-scrubbed before they hit disk:
+Every free-text field is bounded and scrubbed before it hits disk - `task`,
+`content`, `args`, `result`, `error` and the opt-in `reasoning`. The bound is
+per field and applies to all of them, not to `result` alone:
 
-- **Clipping:** the payload is bounded to 8 KB (8192 bytes) per field, cut at a
-  UTF-8 rune boundary; when text is clipped the marker `...[clipped]` is
-  appended on top, so a clipped field value is up to 8192 bytes plus that
+- **Clipping:** the payload is bounded to `limits.max_logged_field` bytes per
+  field (default 8192; `0` disables the bound and writes every field whole),
+  cut at a UTF-8 rune boundary; when text is clipped the marker `...[clipped]`
+  is appended on top, so a clipped field value is up to the bound plus that
   12-byte marker.
 - **Redaction:** every value interpolated into the config via `${VAR}` - plus
   `provider.api_key` - is replaced by `[REDACTED]` wherever it appears, by
@@ -257,7 +261,9 @@ scrubbed before they hit disk:
   [docs/session-logging.md](../session-logging.md).
 
 Redaction runs before clipping, so a secret can never survive by sitting on
-the clip boundary.
+the clip boundary - and it runs unconditionally, before the bound is even
+consulted, so `limits.max_logged_field: 0` widens the record without weakening
+the scrubbing.
 
 ## Change policy
 
@@ -336,8 +342,39 @@ event type appeared.
 
 - absent `reasoning_bytes` means the turn carried no reasoning payload - or
   the log predates v1.4. It never means "unknown";
-- it is a SIZE and stays one. The reasoning content is deliberately not in the
-  log and never will be (see the field's note above), so a consumer must not
-  expect the payload to appear beside it in a later revision;
-- the number is the size amele stored, before any clipping applies to other
-  fields - reasoning is not clipped because it is not written.
+- it is a SIZE and stays one. It is not the length of the `reasoning` string
+  v1.5 added: it is measured on the payload amele stored, before redaction
+  rewrites lengths and before the clip bound shortens anything, so the two
+  numbers differ whenever either applies;
+- the reasoning content is not in the log by default and the size is what a
+  consumer can always count on: `reasoning` appears only under
+  `log_reasoning: true` (v1.5).
+
+### v1.5 (amele v0.2.x) - opt-in reasoning content (additive, `v` stays `1`)
+
+Added one optional field to `llm_response`: `reasoning`. Nothing was removed,
+renamed or re-typed, no other event type changed a byte, and no new event type
+appeared. The default is unchanged: without `log_reasoning: true` in the
+config, a v1.5 amele writes exactly the bytes a v1.4 one did.
+
+The same revision makes the clip bound configurable
+(`limits.max_logged_field`, default 8192, `0` unbounded). That is not a schema
+change - no field's type or meaning moved - but it does change what a reader
+may assume about a field's length: a value is no longer guaranteed to be at
+most 8204 bytes, and a consumer that sized a buffer on the old constant must
+stop.
+
+**Migration:** none required. Concretely:
+
+- absent `reasoning` means the run did not opt in - or the log predates v1.5.
+  It never means "the turn carried no reasoning": `reasoning_bytes` is the
+  field that answers that, and it is written whether or not the content is;
+- the value is the provider's raw payload rendered as text, not prose. Parse it
+  as that wire's shape (see the field's note above) - reading it as a plain
+  sentence will hand you the payload's own JSON quoting;
+- it is clipped and redacted like every other free-text field, so a logged
+  payload can be a prefix of what the model produced. `reasoning_bytes` remains
+  the honest size;
+- a consumer that must not touch model scratchpads should ignore the key. Its
+  presence is the operator's explicit decision, recorded in the config that
+  produced the run.
