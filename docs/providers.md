@@ -720,8 +720,12 @@ never recognizes. What it gives you is exactly what
 `reasoning_bytes` counted - the raw payload, as the wire sent it, clipped and
 redacted like every other free-text field. Per family:
 
-- **`openai`**: nothing to log. That API returns no reasoning on this wire, so
-  `reasoning_bytes` is absent and the flag changes not one byte of the log.
+- **`openai`**: against the OpenAI API itself, nothing to log - it returns no
+  reasoning on this wire, so `reasoning_bytes` is absent and the flag has
+  nothing to write. The dialect still reads `reasoning_content`, though, so a
+  *different* OpenAI-compatible endpoint driven with this dialect - a
+  self-hosted vLLM or SGLang, or a gateway that fills the field - is captured
+  and logged here like any other.
 - **`deepseek`, `glm`, `kimi`**: the `reasoning_content` string. It is logged
   as the raw JSON value, so the quotes around it are part of the logged text -
   parse it, do not read it as a sentence.
@@ -739,11 +743,13 @@ redacted like every other free-text field. Per family:
   text and `functionCall` parts sit in the logged array together, for the same
   round-trip reason.
 
-Two consequences worth planning for: the log grows by roughly `reasoning_bytes`
-per turn (raise `limits.max_logged_field`, or set it to `0`, if you want the
-payload whole rather than clipped), and the file now contains model-authored
-prose that no reviewer has read. Treat those session files the way you would
-treat the transcript they are.
+Two consequences worth planning for. The log grows by up to
+`limits.max_logged_field` bytes per turn, which is the whole `reasoning_bytes`
+only once the bound is lifted: at the 8 KB default a long trace is clipped
+(and a clipped payload no longer parses), so `max_logged_field: 0` is what
+trades the disk cap for a complete, parseable record. And the file now
+contains model-authored prose that no reviewer has read. Treat those session
+files the way you would treat the transcript they are.
 
 ## Structured output
 

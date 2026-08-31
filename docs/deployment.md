@@ -51,7 +51,7 @@ and let `-q` empty out stderr on the success path:
 
 ```
 MAILTO=ops@example.com
-0 3 * * *  cd /srv/myapp && amele run log-sentry/ "daily log triage" -q >/dev/null
+0 3 * * *  cd /srv/myapp && amele run log-sentry/ -q "daily log triage" >/dev/null
 ```
 
 With this line: a clean run writes its answer to `/dev/null` and nothing to
@@ -285,6 +285,7 @@ case $? in
   6) exit 1 ;;   # schema unmet: this item is bad, the batch is fine
   3) exit 1 ;;   # budget: this item is too big, the batch is fine
   2) exit 78 ;;  # config error: identical for every item - stop the batch
+  4|7|8) exit 78 ;;  # denied policy / lock held / required MCP server: ditto
   *) exit 1 ;;
 esac
 ```
@@ -293,7 +294,12 @@ esac
 xargs -P 4 -n 1 ./run-one.sh < items.txt
 ```
 
-Only exit 2 is a batch-level verdict; the rest are per-item. `xargs` itself
+Exits 2, 4, 7 and 8 are batch-level verdicts - a config error, a permission
+policy that aborted the run, a `lock: true` that should not have been there,
+and a `required: true` MCP server that is down are properties of the config or
+the machine, not of the row being processed: 2, 7 and 8 will stop the next item
+exactly as they stopped this one, and 4 will the moment the model reaches for
+the same denied tool again. Only 1, 3, 5 and 6 are per-item. `xargs` itself
 stops on a child that exits 255, so a wrapper that wants "abort the whole
 fan-out on a config error" can spell that verdict `exit 255` instead of `78`.
 
