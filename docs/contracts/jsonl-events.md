@@ -59,7 +59,7 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `output_tokens` | int | Provider-reported output tokens for this round-trip. |
 | `finish_reason` | string | The provider's finish reason verbatim (`stop`, `length`, `tool_calls`, `content_filter`, `error`, ...); may be absent when the provider omits it. |
 | `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is not logged by default**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. `log_reasoning: true` opts it in (v1.5, the `reasoning` field below) through the same redact+clip path as every other free-text field; the rationale above is why that is a deliberate data-governance decision rather than a default. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn, and it answers it whether or not the content is logged. Since v1.4. |
-| `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Present **only** when the config sets `log_reasoning: true`; absence therefore means "not opted in", never "this turn carried no reasoning" - `reasoning_bytes` is the field that answers that. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text. Since v1.5. |
+| `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Written **only** when the config sets `log_reasoning: true` **and** the turn carried a payload, so absence has three readings - the run did not opt in, the turn did no thinking, or the log predates v1.5 - and `reasoning_bytes` is what separates them: a positive `reasoning_bytes` with no `reasoning` means the content was not written (opted out, or a pre-v1.5 log), both absent means the turn carried no reasoning at all. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text - but a **clipped** value is a byte prefix plus the marker and will not parse at all (most visibly for the two array-shaped wires), so a consumer that needs to parse every turn sets `limits.max_logged_field: 0` and keeps the payload whole. Since v1.5. |
 
 ### `tool_call` - the model requested a tool
 
@@ -366,15 +366,21 @@ stop.
 
 **Migration:** none required. Concretely:
 
-- absent `reasoning` means the run did not opt in - or the log predates v1.5.
-  It never means "the turn carried no reasoning": `reasoning_bytes` is the
-  field that answers that, and it is written whether or not the content is;
+- absent `reasoning` is a disjunction, not a verdict: the run did not opt in,
+  the turn carried no reasoning, or the log predates v1.5. Read it with
+  `reasoning_bytes`, which is written whether or not the content is - positive
+  `reasoning_bytes` and no `reasoning` means the content was withheld, both
+  absent means there was none. (An opted-out run and a pre-v1.5 log look the
+  same from inside the file; the config that produced the run is what tells
+  them apart);
 - the value is the provider's raw payload rendered as text, not prose. Parse it
   as that wire's shape (see the field's note above) - reading it as a plain
   sentence will hand you the payload's own JSON quoting;
 - it is clipped and redacted like every other free-text field, so a logged
-  payload can be a prefix of what the model produced. `reasoning_bytes` remains
-  the honest size;
+  payload can be a prefix of what the model produced - and a clipped value is a
+  byte prefix with a marker glued on, which no JSON parser will accept.
+  `limits.max_logged_field: 0` is how a consumer that must parse every payload
+  asks for whole ones; `reasoning_bytes` remains the honest size either way;
 - a consumer that must not touch model scratchpads should ignore the key. Its
   presence is the operator's explicit decision, recorded in the config that
   produced the run.

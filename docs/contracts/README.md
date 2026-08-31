@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.4). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.5). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -82,7 +82,8 @@ Within a frozen version, changes must be additive and backwards-compatible:
 
 - **2026-08-24 - JSONL v1.4, reasoning observability.** `llm_response` gains
   the optional `reasoning_bytes` field: the SIZE of the provider's reasoning
-  payload for that turn, never its content - jsonl-events.md v1.4. Additive:
+  payload for that turn, not its content by default (v1.5 added the opt-in) -
+  jsonl-events.md v1.4. Additive:
   the wire `v` stays `1`, nothing was removed, renamed or re-typed. Migration:
   none required; absent `reasoning_bytes` means the turn carried no reasoning.
 - **2026-08-24 - config schema: the provider tuning surface.** `provider` gains
@@ -110,6 +111,31 @@ Within a frozen version, changes must be additive and backwards-compatible:
   backoff, `Retry-After` honored up to 60s). Migration: none required. The
   retryable failure classes (429, 5xx, network) are NOT configurable, and the
   `--set` allowlist is unchanged.
+
+- **2026-08-31 - JSONL v1.5, opt-in reasoning content.** `llm_response` gains
+  the optional `reasoning` field: the provider's reasoning payload itself,
+  written only when the config sets `log_reasoning: true` and the turn carried
+  one, through the same redact+clip path as every other free-text field -
+  jsonl-events.md v1.5. The same revision makes the per-field clip bound
+  configurable (`limits.max_logged_field`), so a logged value is no longer
+  guaranteed to be at most 8204 bytes. Additive: the wire `v` stays `1`,
+  nothing was removed, renamed or re-typed, and a run that sets neither key
+  writes exactly the bytes the previous release did. Migration: none required;
+  absent `reasoning` is a disjunction - not opted in, no reasoning that turn,
+  or a pre-v1.5 log - and `reasoning_bytes` is what separates them. The value
+  is the provider's RAW payload rendered as text (a JSON-string carrier keeps
+  its own quoting), and a clipped one is a byte prefix that will not parse.
+- **2026-08-31 - config schema: session logging keys.** Three optional keys:
+  `limits.max_logged_field` (integer or a whole-value `${VAR}`, minimum 0;
+  omitted means the built-in 8192, `0` means unbounded), `log_reasoning`
+  (boolean, default false) and `print_session_path` (boolean, default false -
+  one `session log: <path>` note on stderr, suppressed by `-q`). Additive:
+  every key is optional, `additionalProperties: false` still holds, and a
+  config that sets none of them behaves exactly as before. Migration: none
+  required. The `--set` allowlist gains `limits.max_logged_field` only
+  (cli.md); `log_reasoning` and `print_session_path` are deliberately NOT
+  settable - what a run persists is a data-governance decision the audited
+  YAML owns - and no key was removed.
 
 ## Schema versioning note (`$id`)
 
