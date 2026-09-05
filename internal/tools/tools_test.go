@@ -77,19 +77,118 @@ func TestFSReadWriteList(t *testing.T) {
 	}
 }
 
-func TestFSReadTruncation(t *testing.T) {
-	ctx := context.Background()
-	dir, fs := newFS(t, FSOptions{MaxReadBytes: 10})
-	if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(strings.Repeat("a", 100)), 0o600); err != nil {
-		t.Fatal(err)
+// invokeOutcome calls a tool through the loop's optional outcomeInvoker view
+// and fails the test if the tool does not offer it - the outcome is the only
+// place the truncation fact reaches the session log.
+func invokeOutcome(t *testing.T, tool Tool, rawArgs string) (string, Outcome) {
+	t.Helper()
+	oi, ok := tool.(interface {
+		InvokeOutcome(context.Context, string) (string, Outcome, error)
+	})
+	if !ok {
+		t.Fatalf("%s does not implement InvokeOutcome", tool.Def().Name)
 	}
-	out, err := fs["fs_read"].Invoke(ctx, `{"path": "big.txt"}`)
+	out, outcome, err := oi.InvokeOutcome(context.Background(), rawArgs)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("%s: %v", tool.Def().Name, err)
 	}
-	if !strings.HasSuffix(out, truncationMarker) || !strings.HasPrefix(out, strings.Repeat("a", 10)) {
-		t.Errorf("truncation: %q", out)
+	return out, outcome
+}
+
+// TestFSReadTruncation pins both halves of the cap: what the model sees (the
+// marker) and what the log sees (Outcome.Truncated). The boundary case - a
+// file of exactly MaxReadBytes - must report neither, because nothing was
+// dropped.
+func TestFSReadTruncation(t *testing.T) {
+	const maxRead = 16
+	tests := []struct {
+		name      string
+		size      int
+		wantTrunc bool
+	}{
+		{"well under max", 5, false},
+		{"exactly max", maxRead, false},
+		{"one over max", maxRead + 1, true},
+		{"far over max", 100, true},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir, fs := newFS(t, FSOptions{MaxReadBytes: maxRead})
+			content := strings.Repeat("a", tt.size)
+			if err := os.WriteFile(filepath.Join(dir, "big.txt"), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			out, outcome := invokeOutcome(t, fs["fs_read"], `{"path": "big.txt"}`)
+			if outcome.Truncated != tt.wantTrunc {
+				t.Errorf("Outcome.Truncated = %v, want %v", outcome.Truncated, tt.wantTrunc)
+			}
+			if got := strings.HasSuffix(out, TruncationMarker); got != tt.wantTrunc {
+				t.Errorf("truncation marker: got %v, want %v (%q)", got, tt.wantTrunc, out)
+			}
+			body := strings.TrimSuffix(out, TruncationMarker)
+			want := content
+			if tt.wantTrunc {
+				want = content[:maxRead]
+			}
+			if body != want {
+				t.Errorf("body = %q, want %q", body, want)
+			}
+			// Invoke is the same text without the outcome.
+			plain, err := fs["fs_read"].Invoke(context.Background(), `{"path": "big.txt"}`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plain != out {
+				t.Errorf("Invoke text %q != InvokeOutcome text %q", plain, out)
+			}
+		})
+	}
+}
+
+// TestFSListCap: the listing budget is an option, not a constant borrowed
+// from the subprocess tool, and the cut is reported out of band as well as in
+// the marker.
+func TestFSListCap(t *testing.T) {
+	const entries = 50
+	fill := func(t *testing.T, dir string) {
+		t.Helper()
+		for i := 0; i < entries; i++ {
+			name := fmt.Sprintf("f%02d", i)
+			if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	t.Run("small budget cuts on an entry boundary", func(t *testing.T) {
+		dir, fs := newFS(t, FSOptions{MaxListBytes: 40})
+		fill(t, dir)
+		out, outcome := invokeOutcome(t, fs["fs_list"], `{}`)
+		if !outcome.Truncated {
+			t.Error("Outcome.Truncated = false, want true")
+		}
+		if !strings.HasSuffix(out, "entries shown]") {
+			t.Errorf("listing lacks the entry-count marker: %q", out)
+		}
+		if !strings.Contains(out, fmt.Sprintf("of %d entries", entries)) {
+			t.Errorf("marker should state the total, got %q", out)
+		}
+	})
+
+	t.Run("default budget shows everything", func(t *testing.T) {
+		dir, fs := newFS(t, FSOptions{})
+		fill(t, dir)
+		out, outcome := invokeOutcome(t, fs["fs_list"], `{}`)
+		if outcome.Truncated {
+			t.Error("Outcome.Truncated = true, want false")
+		}
+		if got := len(strings.Split(out, "\n")); got != entries {
+			t.Errorf("listed %d entries, want %d", got, entries)
+		}
+		if strings.Contains(out, "truncated") {
+			t.Errorf("untruncated listing carries a marker: %q", out)
+		}
+	})
 }
 
 // TestFSListBounded: fs_read and subprocess output are capped, and fs_list
@@ -110,7 +209,7 @@ func TestFSListBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxOutputBytes+1024 {
+	if len(out) > DefaultMaxListBytes+1024 {
 		t.Errorf("fs_list output not bounded: %d bytes", len(out))
 	}
 	if !strings.Contains(out, "truncated") {
@@ -329,10 +428,10 @@ func TestSubprocessOutputTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxOutputBytes+len(truncationMarker) {
+	if len(out) > maxOutputBytes+len(TruncationMarker) {
 		t.Errorf("output not bounded: %d bytes", len(out))
 	}
-	if !strings.HasSuffix(out, truncationMarker) {
+	if !strings.HasSuffix(out, TruncationMarker) {
 		t.Error("missing truncation marker")
 	}
 }
@@ -583,10 +682,10 @@ func TestShellOutputTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxOutputBytes+len(truncationMarker) {
+	if len(out) > maxOutputBytes+len(TruncationMarker) {
 		t.Errorf("output not bounded: %d bytes", len(out))
 	}
-	if !strings.HasSuffix(out, truncationMarker) {
+	if !strings.HasSuffix(out, TruncationMarker) {
 		t.Error("missing truncation marker")
 	}
 }
@@ -823,7 +922,7 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := strings.HasSuffix(out, truncationMarker); got != tt.wantTruncated {
+			if got := strings.HasSuffix(out, TruncationMarker); got != tt.wantTruncated {
 				t.Errorf("truncation marker: got %v, want %v (output %d bytes)",
 					got, tt.wantTruncated, len(out))
 			}
@@ -843,7 +942,7 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 	if !strings.Contains(out, "stderr:") {
 		t.Fatalf("stderr not reported: %q", out[:min(len(out), 200)])
 	}
-	if !strings.Contains(out, truncationMarker) {
+	if !strings.Contains(out, TruncationMarker) {
 		t.Error("truncated stderr carries no truncation marker")
 	}
 	if len(out) > 2*maxOutputBytes+1024 {

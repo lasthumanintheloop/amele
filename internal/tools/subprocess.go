@@ -186,7 +186,7 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 			// stays the last thing the model reads on a cut error stream.
 			errText := strings.TrimSpace(stderr.String())
 			if stderrLim.dropped {
-				errText += truncationMarker
+				errText += TruncationMarker
 			}
 			return fmt.Sprintf("exit status %d\nstdout:\n%s\nstderr:\n%s", exitErr.ExitCode(), out, errText),
 				Outcome{Kind: OutcomeExit, ExitCode: exitErr.ExitCode()}, nil
@@ -271,7 +271,7 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 // bytes were actually discarded.
 func (l *limitedBuffer) text() string {
 	if l.dropped {
-		return l.buf.String() + truncationMarker
+		return l.buf.String() + TruncationMarker
 	}
 	return l.buf.String()
 }

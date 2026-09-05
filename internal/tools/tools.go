@@ -75,6 +75,10 @@ type Outcome struct {
 	Kind OutcomeKind
 	// ExitCode is the process exit status; meaningful only for OutcomeExit.
 	ExitCode int
+	// Truncated reports that the result text was cut to a byte cap before the
+	// model saw it (the marker in the text says so to the model; this says so
+	// to the log). CONTRACT: maps to tool_result.truncated (JSONL v1.6).
+	Truncated bool
 }
 
 // OutcomeKind enumerates the ways a tool call can end without a Go error.

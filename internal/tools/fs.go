@@ -19,9 +19,11 @@ import (
 // blow the model's context (and the token budget with it).
 const DefaultMaxReadBytes = 256 * 1024
 
-// truncationMarker is appended when tool output is cut. The model sees the
-// marker and can narrow its request instead of hallucinating a full read.
-const truncationMarker = "\n[output truncated by amele]"
+// DefaultMaxListBytes bounds fs_list output for the same reason: a directory
+// of rotated logs can hold tens of thousands of entries. It is smaller than
+// the read cap because a listing is an index, not content - a model that
+// needs more should narrow the path.
+const DefaultMaxListBytes = 64 * 1024
 
 // sandbox confines all filesystem access to a workspace root.
 //
@@ -81,6 +83,8 @@ func escapeErr(rel string, err error) error {
 type FSOptions struct {
 	// MaxReadBytes overrides DefaultMaxReadBytes when > 0.
 	MaxReadBytes int
+	// MaxListBytes overrides DefaultMaxListBytes when > 0.
+	MaxListBytes int
 }
 
 // NewFSTools builds the three builtin filesystem tools bound to workspace.
@@ -93,10 +97,14 @@ func NewFSTools(workspace string, opts FSOptions) ([]Tool, error) {
 	if maxRead <= 0 {
 		maxRead = DefaultMaxReadBytes
 	}
+	maxList := opts.MaxListBytes
+	if maxList <= 0 {
+		maxList = DefaultMaxListBytes
+	}
 	return []Tool{
 		&fsRead{sb: sb, maxBytes: maxRead},
 		&fsWrite{sb: sb},
-		&fsList{sb: sb},
+		&fsList{sb: sb, maxBytes: maxList},
 	}, nil
 }
 
@@ -157,21 +165,29 @@ func (t *fsRead) Def() llm.ToolDef {
 }
 
 func (t *fsRead) Invoke(ctx context.Context, rawArgs string) (string, error) {
+	out, _, err := t.InvokeOutcome(ctx, rawArgs)
+	return out, err
+}
+
+// InvokeOutcome is Invoke plus the truncation fact for the session log: the
+// marker tells the model its read was cut, and Outcome.Truncated tells the
+// operator the same thing without parsing the result text.
+func (t *fsRead) InvokeOutcome(ctx context.Context, rawArgs string) (string, Outcome, error) {
 	var args pathArgs
 	if err := decodeArgs(rawArgs, &args); err != nil {
-		return "", err
+		return "", Outcome{}, err
 	}
 	rel, err := t.sb.clean(args.Path)
 	if err != nil {
-		return "", err
+		return "", Outcome{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", Outcome{}, err
 	}
 
 	f, err := t.sb.root.Open(rel)
 	if err != nil {
-		return "", escapeErr(args.Path, fmt.Errorf("reading %q: %w", args.Path, err))
+		return "", Outcome{}, escapeErr(args.Path, fmt.Errorf("reading %q: %w", args.Path, err))
 	}
 	defer func() { _ = f.Close() }()
 
@@ -179,22 +195,20 @@ func (t *fsRead) Invoke(ctx context.Context, rawArgs string) (string, error) {
 	// deadline and a device file is never agent business.
 	info, err := f.Stat()
 	if err != nil {
-		return "", fmt.Errorf("reading %q: %w", args.Path, err)
+		return "", Outcome{}, fmt.Errorf("reading %q: %w", args.Path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%q is not a regular file", args.Path)
+		return "", Outcome{}, fmt.Errorf("%q is not a regular file", args.Path)
 	}
 
 	// Read at most maxBytes+1: the extra byte detects truncation without
 	// ever loading an arbitrarily large file into memory.
 	data, err := io.ReadAll(io.LimitReader(f, int64(t.maxBytes)+1))
 	if err != nil {
-		return "", fmt.Errorf("reading %q: %w", args.Path, err)
+		return "", Outcome{}, fmt.Errorf("reading %q: %w", args.Path, err)
 	}
-	if len(data) > t.maxBytes {
-		return string(data[:t.maxBytes]) + truncationMarker, nil
-	}
-	return string(data), nil
+	out, truncated := CapText(string(data), t.maxBytes)
+	return out, Outcome{Truncated: truncated}, nil
 }
 
 type fsWriteArgs struct {
@@ -261,7 +275,8 @@ func (t *fsWrite) Invoke(ctx context.Context, rawArgs string) (string, error) {
 }
 
 type fsList struct {
-	sb *sandbox
+	sb       *sandbox
+	maxBytes int
 }
 
 func (t *fsList) Def() llm.ToolDef {
@@ -277,26 +292,35 @@ func (t *fsList) Def() llm.ToolDef {
 }
 
 func (t *fsList) Invoke(ctx context.Context, rawArgs string) (string, error) {
+	out, _, err := t.InvokeOutcome(ctx, rawArgs)
+	return out, err
+}
+
+// InvokeOutcome is Invoke plus the truncation fact for the session log. The
+// listing is cut on an entry boundary rather than through CapText: half a
+// filename is worse than a missing one, and the count in the marker tells the
+// model exactly how much it did not see.
+func (t *fsList) InvokeOutcome(ctx context.Context, rawArgs string) (string, Outcome, error) {
 	var args pathArgs
 	if rawArgs != "" {
 		if err := decodeArgs(rawArgs, &args); err != nil {
-			return "", err
+			return "", Outcome{}, err
 		}
 	}
 	rel, err := t.sb.clean(args.Path)
 	if err != nil {
-		return "", err
+		return "", Outcome{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", Outcome{}, err
 	}
 
 	entries, err := fs.ReadDir(t.sb.root.FS(), rel)
 	if err != nil {
-		return "", escapeErr(args.Path, fmt.Errorf("listing %q: %w", args.Path, err))
+		return "", Outcome{}, escapeErr(args.Path, fmt.Errorf("listing %q: %w", args.Path, err))
 	}
 	if len(entries) == 0 {
-		return "(empty directory)", nil
+		return "(empty directory)", Outcome{}, nil
 	}
 	// The listing is bounded like every other tool output (fs_read,
 	// subprocess): a directory of rotated logs can hold tens of thousands
@@ -308,7 +332,7 @@ func (t *fsList) Invoke(ctx context.Context, rawArgs string) (string, error) {
 		if e.IsDir() {
 			name += "/"
 		}
-		if b.Len()+len(name)+1 > maxOutputBytes {
+		if b.Len()+len(name)+1 > t.maxBytes {
 			break
 		}
 		b.WriteString(name)
@@ -319,7 +343,7 @@ func (t *fsList) Invoke(ctx context.Context, rawArgs string) (string, error) {
 		// Stating the totals lets the model narrow its request instead of
 		// assuming it saw everything.
 		fmt.Fprintf(&b, "[output truncated by amele: %d of %d entries shown]", shown, len(entries))
-		return b.String(), nil
+		return b.String(), Outcome{Truncated: true}, nil
 	}
-	return strings.TrimSuffix(b.String(), "\n"), nil
+	return strings.TrimSuffix(b.String(), "\n"), Outcome{}, nil
 }
