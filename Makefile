@@ -8,7 +8,7 @@ COVER_BUDGET      := 80        # minimum % statement coverage over internal/
 GOFLAGS := -trimpath
 LDFLAGS := -s -w -X main.version=$(shell git describe --tags --always --dirty) -X main.commit=$(shell git rev-parse --short HEAD) -X main.date=$(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-.PHONY: build test race cover lint fmt budget dist clean all
+.PHONY: build test race cover lint lint-clean fmt budget dist clean all
 
 all: fmt lint test race cover budget
 
@@ -45,6 +45,15 @@ lint:
 	else \
 		echo "golangci-lint not installed locally (checked PATH and $$(go env GOPATH)/bin); CI enforces it"; \
 	fi
+
+# lint-clean drops golangci-lint's result cache before linting. The cache is
+# keyed by package path, so after a worktree under this checkout is removed
+# (or moved) a plain `make lint` can replay that worktree's stale findings
+# under paths that no longer exist; this target is the fix for that.
+lint-clean:
+	@if command -v golangci-lint >/dev/null 2>&1; then golangci-lint cache clean; \
+	elif [ -x "$$(go env GOPATH)/bin/golangci-lint" ]; then "$$(go env GOPATH)/bin/golangci-lint" cache clean; fi
+	@$(MAKE) --no-print-directory lint
 
 # budget builds the release binary and enforces the size ceiling.
 budget: build
