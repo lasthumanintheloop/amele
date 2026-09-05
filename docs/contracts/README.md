@@ -112,6 +112,27 @@ Within a frozen version, changes must be additive and backwards-compatible:
   retryable failure classes (429, 5xx, network) are NOT configurable, and the
   `--set` allowlist is unchanged.
 
+- **2026-08-25 - config schema: the Gemini wire family.** `provider.type`
+  gains the enum value `gemini` (the native Google `generateContent` API,
+  alongside `openai` and `anthropic`), and `provider` gains one optional block,
+  `vertex` (`project` and `location`, both required inside the block, plus an
+  optional `credentials` path), which points that wire at Vertex AI. Two
+  cross-key rules are enforced at load time rather than left to the server:
+  `dialect` is rejected with type `gemini` (a different wire family, so a
+  dialect there would name a mapping the request never takes), and
+  `reasoning.budget_tokens` and `reasoning.effort` are mutually exclusive on
+  that wire (the API refuses a request carrying both). `params` reserves the
+  gemini wire's own body keys on the active target (`contents`,
+  `systemInstruction`, `tools`, `toolConfig`, `generationConfig`,
+  `safetySettings`, `cachedContent`, in either spelling), and `vertex` is
+  refused together with `api_key`. Additive: the new enum value and the new
+  block are optional, `additionalProperties: false` still holds, and a config
+  that names neither behaves exactly as before - every new rule fires only on
+  a config that opts into the new wire. Migration: none required. The
+  `--set` allowlist is unchanged. The same change documented two facts on the
+  other surfaces without changing them: exit code 5 covers the third client
+  (exit-codes.md), and `amele explain` gains the Gemini wire rows and the two
+  Vertex rows (cli.md, additive).
 - **2026-08-31 - JSONL v1.5, opt-in reasoning content.** `llm_response` gains
   the optional `reasoning` field: the provider's reasoning payload itself,
   written only when the config sets `log_reasoning: true` and the turn carried
