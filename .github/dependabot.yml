@@ -1,0 +1,18 @@
+# Dependency update PRs. Grouped and weekly so the merge gate sees one PR per
+# ecosystem, not one per module; CI (mod verify, tests, size budget) decides.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-deps:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
