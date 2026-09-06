@@ -969,41 +969,63 @@ func TestDecodeArgsRejectsMalformed(t *testing.T) {
 // DefaultMaxOutputBytes was marked truncated even though nothing was dropped, and
 // truncated stderr carried no marker at all - the model saw a cut error
 // message as if it were complete.
+//
+// CONTRACT: it also pins what Outcome.Truncated MEANS - "the text handed to
+// the model was cut", not "some byte was dropped somewhere". Only the
+// non-zero-exit path renders stderr, so an overflowing stderr on a successful
+// command is not truncation; the "stderr over max, exit 0" row is the one that
+// catches a limiter that reports both streams unconditionally.
 func TestSubprocessTruncationBoundary(t *testing.T) {
 	// yes|head produces a deterministic byte count without a temp file.
-	spam := func(bytes int, stream string) []string {
-		return []string{"sh", "-c", fmt.Sprintf("yes x | head -c %d %s", bytes, stream)}
+	spam := func(bytes int, suffix string) []string {
+		return []string{"sh", "-c", fmt.Sprintf("yes x | head -c %d %s", bytes, suffix)}
 	}
 	tests := []struct {
-		name          string
-		command       []string
+		name string
+		// command is the argv the tool runs.
+		command []string
+		// wantMarker is whether the model-visible text ends with (stdout) or
+		// contains (stderr) the truncation marker.
+		wantMarker bool
+		// wantTruncated is the out-of-band flag the session log records.
 		wantTruncated bool
 	}{
-		{"exactly max", spam(DefaultMaxOutputBytes, ""), false},
-		{"one over max", spam(DefaultMaxOutputBytes+1, ""), true},
-		{"well under max", spam(10, ""), false},
+		{"exactly max", spam(DefaultMaxOutputBytes, ""), false, false},
+		{"one over max", spam(DefaultMaxOutputBytes+1, ""), true, true},
+		{"well under max", spam(10, ""), false, false},
+		// The model never sees stderr of a command that succeeded, so
+		// dropping bytes there cut nothing it read.
+		{"stderr over max, exit 0", spam(DefaultMaxOutputBytes+1000, ">&2"), false, false},
+		// ...but on a non-zero exit stderr IS the result, so the same
+		// overflow is a cut result and must be marked.
+		{"stderr over max, exit 1", spam(DefaultMaxOutputBytes+1000, ">&2; exit 1"), true, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			tool, _ := subprocessTool(t, config.SubprocessTool{
 				Name: "spam", Description: "d", Command: tt.command,
 			})
-			out, err := tool.Invoke(context.Background(), "")
+			out, outcome, err := tool.InvokeOutcome(context.Background(), "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := strings.HasSuffix(out, TruncationMarker); got != tt.wantTruncated {
+			if got := strings.Contains(out, TruncationMarker); got != tt.wantMarker {
 				t.Errorf("truncation marker: got %v, want %v (output %d bytes)",
-					got, tt.wantTruncated, len(out))
+					got, tt.wantMarker, len(out))
+			}
+			if outcome.Truncated != tt.wantTruncated {
+				t.Errorf("Outcome.Truncated = %v, want %v", outcome.Truncated, tt.wantTruncated)
 			}
 		})
 	}
 
-	// Truncated stderr must be marked too: it reaches the model on the
-	// non-zero-exit path, where a silently cut message is misleading.
+	// Truncated stderr must be MARKED, not merely bounded: it reaches the
+	// model on the non-zero-exit path, where a silently cut message is
+	// misleading. Asserted outside the table because it inspects the rendered
+	// sections rather than the two booleans.
 	tool, _ := subprocessTool(t, config.SubprocessTool{
 		Name: "noisy", Description: "d",
-		Command: []string{"sh", "-c", fmt.Sprintf("yes x | head -c %d >&2; exit 1", DefaultMaxOutputBytes+1000)},
+		Command: spam(DefaultMaxOutputBytes+1000, ">&2; exit 1"),
 	})
 	out, err := tool.Invoke(context.Background(), "")
 	if err != nil {
@@ -1012,8 +1034,8 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 	if !strings.Contains(out, "stderr:") {
 		t.Fatalf("stderr not reported: %q", out[:min(len(out), 200)])
 	}
-	if !strings.Contains(out, TruncationMarker) {
-		t.Error("truncated stderr carries no truncation marker")
+	if !strings.HasSuffix(out, TruncationMarker) {
+		t.Error("truncated stderr carries no truncation marker at the end of the result")
 	}
 	if len(out) > 2*DefaultMaxOutputBytes+1024 {
 		t.Errorf("combined output not bounded: %d bytes", len(out))

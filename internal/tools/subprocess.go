@@ -192,19 +192,21 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 	// whose output is EXACTLY maxOutput bytes long is complete, and claiming
 	// otherwise sends the model chasing data that does not exist.
 	out := stdoutLim.text()
-	// CONTRACT: the same fact out-of-band, for the session log. Either stream
-	// counts: stderr reaches the model on the non-zero-exit path, so a cut
-	// there is a cut result too.
-	truncated := stdoutLim.dropped || stderrLim.dropped
 
+	// CONTRACT: Outcome.Truncated is the same fact out-of-band, for the
+	// session log, and it means "the text handed to the model was cut" - not
+	// "some byte was dropped somewhere". Only stdout reaches the model on the
+	// success, timeout and aborted paths, so a stderr overflow on those is NOT
+	// truncation; the non-zero-exit path renders stderr too and widens the
+	// flag itself, right where it does so.
 	if err != nil {
 		if parent.Err() != nil {
 			return fmt.Sprintf("command aborted: the run was cancelled or hit its overall timeout\nstdout:\n%s", out),
-				Outcome{Kind: OutcomeAborted, Truncated: truncated}, nil
+				Outcome{Kind: OutcomeAborted, Truncated: stdoutLim.dropped}, nil
 		}
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Sprintf("command timed out after %s\nstdout:\n%s", timeout, out),
-				Outcome{Kind: OutcomeTimedOut, Truncated: truncated}, nil
+				Outcome{Kind: OutcomeTimedOut, Truncated: stdoutLim.dropped}, nil
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
@@ -216,11 +218,11 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 			// two streams cannot drift on the rune-safe cut.
 			errText := markTruncated(strings.TrimSpace(stderr.String()), stderrLim.dropped)
 			return fmt.Sprintf("exit status %d\nstdout:\n%s\nstderr:\n%s", exitErr.ExitCode(), out, errText),
-				Outcome{Kind: OutcomeExit, ExitCode: exitErr.ExitCode(), Truncated: truncated}, nil
+				Outcome{Kind: OutcomeExit, ExitCode: exitErr.ExitCode(), Truncated: stdoutLim.dropped || stderrLim.dropped}, nil
 		}
 		return "", Outcome{}, err
 	}
-	return out, Outcome{Truncated: truncated}, nil
+	return out, Outcome{Truncated: stdoutLim.dropped}, nil
 }
 
 // baseEnvVars are always passed to an allowlisted child process, whether
