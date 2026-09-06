@@ -129,6 +129,10 @@ type Deps struct {
 	// ExistingNames are the model-facing tool names already taken by builtins,
 	// subprocess tools and earlier servers. A collision is fatal (ErrToolset).
 	ExistingNames map[string]bool
+	// MaxResultBytes caps how much of one tool result the model may read;
+	// <= 0 means DefaultMaxResultBytes. It is the same number every other tool
+	// family gets from limits.max_tool_result_bytes.
+	MaxResultBytes int
 	// Version is amele's version, reported to the server at initialize. Empty
 	// means "dev".
 	Version string
@@ -544,6 +548,7 @@ func (s *Server) acceptTool(t *sdk.Tool, st *discoverState) error {
 		},
 		outputSchema: validator,
 		annotations:  annotations,
+		maxBytes:     s.deps.MaxResultBytes,
 	})
 	s.listed = append(s.listed, ListedTool{
 		Name:        named.Effective,

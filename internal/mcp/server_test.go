@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/tools"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -444,6 +445,28 @@ func TestDiscoverCaps(t *testing.T) {
 			t.Errorf("Skipped() = %+v, want bad/invalid output schema", sk)
 		}
 	})
+}
+
+// TestDiscoverPassesMaxResultBytesToTools proves the option travels: it is set
+// once on Deps and every Tool built at discovery must render its results with
+// it. Asserted end to end through a real call, because a field copied into the
+// struct but never handed to RenderResult would still pass a field-only check.
+func TestDiscoverPassesMaxResultBytesToTools(t *testing.T) {
+	deps := testDeps(nil)
+	deps.MaxResultBytes = 8
+	fc := &fakeConn{defs: []fakeTool{textTool("long", "a chatty tool", strings.Repeat("x", 20))}}
+	srv := connectFake(t, fc, testCfg("s", config.MCPToolFilter{}), deps)
+
+	text, out, err := toolNamed(t, srv, "s__long").InvokeOutcome(context.Background(), "")
+	if err != nil {
+		t.Fatalf("InvokeOutcome: %v", err)
+	}
+	if want := "xxxxxxxx" + tools.TruncationMarker; text != want {
+		t.Errorf("text = %q, want %q", text, want)
+	}
+	if !out.Truncated {
+		t.Error("Truncated = false, want true")
+	}
 }
 
 func TestDiscoverNameCollision(t *testing.T) {

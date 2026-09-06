@@ -156,7 +156,7 @@ func TestRenderResult(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			text, out := RenderResult(tc.res, tc.validator)
+			text, out := RenderResult(tc.res, tc.validator, 0)
 			if tc.name == "structured content violating the schema" {
 				if !strings.HasPrefix(text, tc.want) {
 					t.Errorf("text = %q, want prefix %q", text, tc.want)
@@ -172,29 +172,90 @@ func TestRenderResult(t *testing.T) {
 }
 
 func TestRenderResultCapsSize(t *testing.T) {
-	big := strings.Repeat("x", MaxResultBytes+100)
-	text, out := RenderResult(&sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: big}}}, nil)
-	if out.Kind != tools.OutcomeOK {
-		t.Errorf("outcome = %v, want OK", out.Kind)
+	// The cap is a parameter now, so the table drives it: the legacy value
+	// (0, meaning DefaultMaxResultBytes) and small explicit caps that make the
+	// boundary cases readable without allocating 64 KiB per row.
+	cases := []struct {
+		name     string
+		text     string
+		maxBytes int
+		wantBody string
+		wantCut  bool
+	}{
+		{
+			name:     "zero means the default cap",
+			text:     strings.Repeat("x", DefaultMaxResultBytes+100),
+			maxBytes: 0,
+			wantBody: strings.Repeat("x", DefaultMaxResultBytes),
+			wantCut:  true,
+		},
+		{
+			name:     "explicit cap cuts to that many bytes",
+			text:     strings.Repeat("x", 20),
+			maxBytes: 8,
+			wantBody: "xxxxxxxx",
+			wantCut:  true,
+		},
+		{
+			name:     "exactly the cap is returned whole and unmarked",
+			text:     "xxxxxxxx",
+			maxBytes: 8,
+			wantBody: "xxxxxxxx",
+			wantCut:  false,
+		},
+		{
+			// Five two-byte runes: a byte-exact cut at 5 would split the third,
+			// so only two runes (4 bytes) may survive.
+			name:     "cut moves back to a rune boundary",
+			text:     "ééééé",
+			maxBytes: 5,
+			wantBody: "éé",
+			wantCut:  true,
+		},
 	}
-	if !strings.HasSuffix(text, truncationMarker) {
-		t.Fatalf("text does not end with the truncation marker: %q", text[len(text)-40:])
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: tc.text}}}
+			text, out := RenderResult(res, nil, tc.maxBytes)
+			if out.Kind != tools.OutcomeOK {
+				t.Errorf("outcome = %v, want OK", out.Kind)
+			}
+			if out.Truncated != tc.wantCut {
+				t.Errorf("Truncated = %v, want %v", out.Truncated, tc.wantCut)
+			}
+			if got := strings.HasSuffix(text, tools.TruncationMarker); got != tc.wantCut {
+				t.Errorf("marker present = %v, want %v", got, tc.wantCut)
+			}
+			if body := strings.TrimSuffix(text, tools.TruncationMarker); body != tc.wantBody {
+				t.Errorf("body = %d bytes (%q), want %d bytes", len(body), truncateForMsg(body), len(tc.wantBody))
+			}
+		})
 	}
-	if got := len(text) - len(truncationMarker); got != MaxResultBytes {
-		t.Errorf("kept %d bytes, want %d", got, MaxResultBytes)
+}
+
+// truncateForMsg keeps a failure message readable when the body is a 64 KiB
+// wall of x's.
+func truncateForMsg(s string) string {
+	if len(s) <= 40 {
+		return s
 	}
+	return s[:40] + "..."
 }
 
 func TestRenderResultCutsOnARuneBoundary(t *testing.T) {
 	// Every rune is 2 bytes, so a byte-exact cut would land mid-rune.
-	big := strings.Repeat("ü", MaxResultBytes)
-	text, _ := RenderResult(&sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: big}}}, nil)
-	body := strings.TrimSuffix(text, truncationMarker)
+	big := strings.Repeat("ü", DefaultMaxResultBytes)
+	text, out := RenderResult(&sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: big}}}, nil, 0)
+	body := strings.TrimSuffix(text, tools.TruncationMarker)
 	if !utf8ValidString(body) {
 		t.Error("truncated text is not valid UTF-8")
 	}
-	if len(body) > MaxResultBytes {
-		t.Errorf("kept %d bytes, want <= %d", len(body), MaxResultBytes)
+	if len(body) > DefaultMaxResultBytes {
+		t.Errorf("kept %d bytes, want <= %d", len(body), DefaultMaxResultBytes)
+	}
+	if !out.Truncated {
+		t.Error("Truncated = false, want true")
 	}
 }
 

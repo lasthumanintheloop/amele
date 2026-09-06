@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/lasthumanintheloop/amele/internal/schema"
 	"github.com/lasthumanintheloop/amele/internal/tools"
@@ -12,15 +11,12 @@ import (
 )
 
 const (
-	// MaxResultBytes caps how much of a tool result the model ever sees. It is
-	// the same cap subprocess stdout gets (tools.DefaultMaxOutputBytes): a
-	// server the operator does not control must not be able to spend the whole
-	// context window in one call.
-	// CONTRACT: the returned text never exceeds MaxResultBytes + the marker.
-	MaxResultBytes = 64 * 1024
-	// truncationMarker is appended when a result is cut. The wording matches
-	// internal/tools so the model learns one signal, not two.
-	truncationMarker = "\n[output truncated by amele]"
+	// DefaultMaxResultBytes caps how much of a tool result the model ever sees
+	// when the caller names no cap of its own. It is the same cap subprocess
+	// stdout gets (tools.DefaultMaxOutputBytes): a server the operator does not
+	// control must not be able to spend the whole context window in one call.
+	// CONTRACT: the returned text never exceeds the cap + the marker.
+	DefaultMaxResultBytes = 64 * 1024
 	// emptyResultText is what a tool that returned nothing shows the model. An
 	// explicit phrase beats an empty string, which reads as a broken harness.
 	emptyResultText = "(empty result)"
@@ -51,12 +47,17 @@ const (
 //     (amele passes no image or audio bytes to the model), resources by URI;
 //   - IsError prefixes the text with "error: " and yields OutcomeToolError.
 //
+// maxBytes is how many bytes of result text the model may read; <= 0 means
+// DefaultMaxResultBytes, so a zero-valued caller still gets the legacy cap.
+// A result that was cut carries tools.TruncationMarker and reports
+// Outcome.Truncated, which is what the session log records.
+//
 // SECURITY: the text is untrusted server data (docs/threat-model.md S9). It is
-// neither parsed nor executed here, only capped at MaxResultBytes on a rune
+// neither parsed nor executed here, only capped at maxBytes on a rune
 // boundary so a hostile server cannot flood the context window.
 //
 // RenderResult is pure: it performs no I/O and no retries.
-func RenderResult(res *sdk.CallToolResult, validator *schema.Validator) (text string, out tools.Outcome) {
+func RenderResult(res *sdk.CallToolResult, validator *schema.Validator, maxBytes int) (text string, out tools.Outcome) {
 	if res == nil {
 		return emptyResultText, tools.Outcome{}
 	}
@@ -65,18 +66,28 @@ func RenderResult(res *sdk.CallToolResult, validator *schema.Validator) (text st
 			tools.Outcome{Kind: tools.OutcomeToolError}
 	}
 
+	// One cap for every exit below: an error body is untrusted server text too,
+	// so it gets bounded exactly like a successful one.
+	limit := maxBytes
+	if limit <= 0 {
+		limit = DefaultMaxResultBytes
+	}
+
 	body, ok := renderBody(res, validator)
 	if !ok {
 		// body already reads as an error message; do not prefix it twice.
-		return capText(body), tools.Outcome{Kind: tools.OutcomeToolError}
+		text, cut := tools.CapText(body, limit)
+		return text, tools.Outcome{Kind: tools.OutcomeToolError, Truncated: cut}
 	}
 	if res.IsError {
 		// The prefix applies to structured content too: an error result is for
 		// the model to read, not for a caller to parse, so the failure must be
 		// visible even when the body happens to be JSON.
-		return capText(errorPrefix + body), tools.Outcome{Kind: tools.OutcomeToolError}
+		text, cut := tools.CapText(errorPrefix+body, limit)
+		return text, tools.Outcome{Kind: tools.OutcomeToolError, Truncated: cut}
 	}
-	return capText(body), tools.Outcome{}
+	text, cut := tools.CapText(body, limit)
+	return text, tools.Outcome{Truncated: cut}
 }
 
 // renderBody produces the un-prefixed, un-capped text of a result. ok is false
@@ -163,18 +174,4 @@ func mimeOrUnknown(mime string) string {
 		return unknownMIME
 	}
 	return mime
-}
-
-// capText truncates s to MaxResultBytes and appends the marker. The cut moves back
-// to the start of a rune so a multi-byte character is never split in half -
-// half a rune is invalid UTF-8 and some providers reject the whole request.
-func capText(s string) string {
-	if len(s) <= MaxResultBytes {
-		return s
-	}
-	end := MaxResultBytes
-	for end > 0 && !utf8.RuneStart(s[end]) {
-		end--
-	}
-	return s[:end] + truncationMarker
 }

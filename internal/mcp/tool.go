@@ -69,6 +69,10 @@ type Tool struct {
 	original     string
 	outputSchema *schema.Validator
 	annotations  Annotations
+	// maxBytes is this server's result cap, copied from Deps at discovery so a
+	// call never has to reach back through the Server for it. <= 0 means
+	// DefaultMaxResultBytes.
+	maxBytes int
 }
 
 // Def returns the definition advertised to the provider. The returned value is
@@ -156,7 +160,7 @@ func (t *Tool) InvokeOutcome(ctx context.Context, rawArgs string) (string, tools
 	res, err := sess.CallTool(cctx, &sdk.CallToolParams{Name: t.original, Arguments: args})
 	switch {
 	case err == nil:
-		text, out := RenderResult(res, t.outputSchema)
+		text, out := RenderResult(res, t.outputSchema, t.maxBytes)
 		return text, out, nil
 	case ctx.Err() != nil:
 		// The RUN ended (timeout or signal), not this call's own budget.
