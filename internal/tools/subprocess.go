@@ -20,9 +20,17 @@ import (
 // set one; an unbounded child process would defeat the run's kill switches.
 const DefaultSubprocessTimeout = 60 * time.Second
 
-// maxOutputBytes bounds captured stdout/stderr per invocation, for the same
-// context-budget reason fs_read is bounded.
-const maxOutputBytes = 64 * 1024
+// DefaultMaxOutputBytes bounds captured stdout/stderr per invocation when the
+// config sets no cap of its own, for the same context-budget reason fs_read is
+// bounded.
+const DefaultMaxOutputBytes = 64 * 1024
+
+// SubprocessOptions tunes a subprocess tool beyond its config entry.
+type SubprocessOptions struct {
+	// MaxOutputBytes caps each captured stream; <= 0 means
+	// DefaultMaxOutputBytes.
+	MaxOutputBytes int
+}
 
 // Subprocess adapts one config.SubprocessTool into a Tool. The command is a
 // fixed argv vector executed directly (no shell), with the workspace as the
@@ -30,11 +38,24 @@ const maxOutputBytes = 64 * 1024
 type Subprocess struct {
 	def       config.SubprocessTool
 	workspace string
+	// maxOutput caps each captured stream, resolved once at construction so
+	// every invocation reads the same number.
+	maxOutput int
 }
 
 // NewSubprocess builds a subprocess tool from its validated config entry.
-func NewSubprocess(def config.SubprocessTool, workspace string) *Subprocess {
-	return &Subprocess{def: def, workspace: workspace}
+// A zero opts.MaxOutputBytes selects DefaultMaxOutputBytes.
+func NewSubprocess(def config.SubprocessTool, workspace string, opts SubprocessOptions) *Subprocess {
+	return &Subprocess{def: def, workspace: workspace, maxOutput: resolveOutputCap(opts.MaxOutputBytes)}
+}
+
+// resolveOutputCap maps "unset" onto the legacy default so every constructor
+// that takes an output cap reads the same way.
+func resolveOutputCap(n int) int {
+	if n <= 0 {
+		return DefaultMaxOutputBytes
+	}
+	return n
 }
 
 // subprocessArgs is what the model may supply per invocation.
@@ -92,7 +113,7 @@ func (s *Subprocess) InvokeOutcome(ctx context.Context, rawArgs string) (string,
 
 	// Cloned before appending so the config's argv is never extended in place.
 	argv := append(slices.Clone(s.def.Command), args.Args...)
-	out, outcome, err := runCommand(ctx, argv, s.workspace, args.Stdin, s.def.Env, s.def.Timeout.Std())
+	out, outcome, err := runCommand(ctx, argv, s.workspace, args.Stdin, s.def.Env, s.def.Timeout.Std(), s.maxOutput)
 	if err != nil {
 		return "", Outcome{}, fmt.Errorf("running %q: %w", s.def.Name, err)
 	}
@@ -105,10 +126,12 @@ func (s *Subprocess) InvokeOutcome(ctx context.Context, rawArgs string) (string,
 // shared by every tool that spawns something (the subprocess tools and the
 // builtin shell), so those properties cannot drift apart between them.
 //
-// timeout <= 0 means DefaultSubprocessTimeout. envAllow is the environment
-// allowlist for the child: nil or empty means the child inherits amele's
-// entire environment (the pre-allowlist behavior every existing config relies
-// on); non-empty means the environment is BUILT from the list - see
+// timeout <= 0 means DefaultSubprocessTimeout, and maxOutput <= 0 means
+// DefaultMaxOutputBytes; maxOutput bounds EACH captured stream, not their sum.
+//
+// envAllow is the environment allowlist for the child: nil or empty means the
+// child inherits amele's entire environment (the pre-allowlist behavior every
+// existing config relies on); non-empty means the environment is BUILT from the list - see
 // buildChildEnv. The returned error is reserved for harness-level failures
 // (the executable does not exist, fork failed); a non-zero exit, a timeout
 // and a run-level cancellation are all returned as result TEXT with a nil
@@ -119,10 +142,11 @@ func (s *Subprocess) InvokeOutcome(ctx context.Context, rawArgs string) (string,
 // the tool timeout, the run-level cancellation and the exit status are all
 // decided here - so classifying anywhere else would be a second, drifting
 // answer to the same question.
-func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow []string, timeout time.Duration) (string, Outcome, error) {
+func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow []string, timeout time.Duration, maxOutput int) (string, Outcome, error) {
 	if timeout <= 0 {
 		timeout = DefaultSubprocessTimeout
 	}
+	maxOutput = resolveOutputCap(maxOutput)
 	// Kept so a kill can be attributed correctly: the run's own deadline or
 	// a Ctrl-C also cancels the derived context, and blaming the tool
 	// timeout for those would send the operator debugging the wrong knob.
@@ -154,8 +178,8 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 	cmd.WaitDelay = 3 * time.Second
 
 	var stdout, stderr bytes.Buffer
-	stdoutLim := &limitedBuffer{buf: &stdout, max: maxOutputBytes}
-	stderrLim := &limitedBuffer{buf: &stderr, max: maxOutputBytes}
+	stdoutLim := &limitedBuffer{buf: &stdout, max: maxOutput}
+	stderrLim := &limitedBuffer{buf: &stderr, max: maxOutput}
 	cmd.Stdout = stdoutLim
 	cmd.Stderr = stderrLim
 
@@ -165,35 +189,38 @@ func runCommand(ctx context.Context, argv []string, dir, stdin string, envAllow 
 
 	// The marker states a fact ("output was cut"), so it is driven by bytes
 	// actually dropped rather than by "the buffer reached its cap": a command
-	// whose output is EXACTLY maxOutputBytes long is complete, and claiming
+	// whose output is EXACTLY maxOutput bytes long is complete, and claiming
 	// otherwise sends the model chasing data that does not exist.
 	out := stdoutLim.text()
+	// CONTRACT: the same fact out-of-band, for the session log. Either stream
+	// counts: stderr reaches the model on the non-zero-exit path, so a cut
+	// there is a cut result too.
+	truncated := stdoutLim.dropped || stderrLim.dropped
 
 	if err != nil {
 		if parent.Err() != nil {
 			return fmt.Sprintf("command aborted: the run was cancelled or hit its overall timeout\nstdout:\n%s", out),
-				Outcome{Kind: OutcomeAborted}, nil
+				Outcome{Kind: OutcomeAborted, Truncated: truncated}, nil
 		}
 		if ctx.Err() == context.DeadlineExceeded {
 			return fmt.Sprintf("command timed out after %s\nstdout:\n%s", timeout, out),
-				Outcome{Kind: OutcomeTimedOut}, nil
+				Outcome{Kind: OutcomeTimedOut, Truncated: truncated}, nil
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			// The process ran and failed: that is task-level information
 			// for the model, not a harness error.
 			// stderr is trimmed before the marker is appended so the marker
-			// stays the last thing the model reads on a cut error stream.
-			errText := strings.TrimSpace(stderr.String())
-			if stderrLim.dropped {
-				errText += TruncationMarker
-			}
+			// stays the last thing the model reads on a cut error stream. It
+			// goes through the same helper limitedBuffer.text() uses, so the
+			// two streams cannot drift on the rune-safe cut.
+			errText := markTruncated(strings.TrimSpace(stderr.String()), stderrLim.dropped)
 			return fmt.Sprintf("exit status %d\nstdout:\n%s\nstderr:\n%s", exitErr.ExitCode(), out, errText),
-				Outcome{Kind: OutcomeExit, ExitCode: exitErr.ExitCode()}, nil
+				Outcome{Kind: OutcomeExit, ExitCode: exitErr.ExitCode(), Truncated: truncated}, nil
 		}
 		return "", Outcome{}, err
 	}
-	return out, Outcome{}, nil
+	return out, Outcome{Truncated: truncated}, nil
 }
 
 // baseEnvVars are always passed to an allowlisted child process, whether
@@ -267,11 +294,8 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// text returns the captured output with the truncation marker appended iff
-// bytes were actually discarded.
+// text returns the captured output, cut back to a whole rune and marked with
+// TruncationMarker iff bytes were actually discarded.
 func (l *limitedBuffer) text() string {
-	if l.dropped {
-		return l.buf.String() + TruncationMarker
-	}
-	return l.buf.String()
+	return markTruncated(l.buf.String(), l.dropped)
 }

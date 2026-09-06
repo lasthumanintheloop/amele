@@ -24,7 +24,7 @@ func TestSubprocessRunsScriptOutsideWorkspace(t *testing.T) {
 		Name:        "hello",
 		Description: "d",
 		Command:     []string{script},
-	}, workspace)
+	}, workspace, SubprocessOptions{})
 	out, err := tool.Invoke(context.Background(), "")
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)

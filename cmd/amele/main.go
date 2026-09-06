@@ -3239,7 +3239,7 @@ func buildRegistry(cfg *config.Config) (*tools.Registry, error) {
 	// allow/deny patterns inside the block are accident prevention, not a
 	// security boundary; the boundary is the OS/container (docs/threat-model.md).
 	if cfg.Tools.Shell.Enabled {
-		shell, err := tools.NewShell(cfg.Tools.Shell, cfg.Workspace)
+		shell, err := tools.NewShell(cfg.Tools.Shell, cfg.Workspace, tools.ShellOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("initializing shell tool: %w", err)
 		}
@@ -3248,7 +3248,7 @@ func buildRegistry(cfg *config.Config) (*tools.Registry, error) {
 		}
 	}
 	for _, def := range cfg.Tools.Subprocess {
-		if err := registry.Register(tools.NewSubprocess(def, cfg.Workspace)); err != nil {
+		if err := registry.Register(tools.NewSubprocess(def, cfg.Workspace, tools.SubprocessOptions{})); err != nil {
 			return nil, err
 		}
 	}

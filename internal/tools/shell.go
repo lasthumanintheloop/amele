@@ -65,17 +65,27 @@ type Shell struct {
 	// child inherits amele's entire environment (config.ShellConfig.Env).
 	env     []string
 	timeout config.Duration
+	// maxOutput caps each captured stream, resolved once at construction.
+	maxOutput int
+}
+
+// ShellOptions tunes the builtin shell tool beyond its config entry.
+type ShellOptions struct {
+	// MaxOutputBytes caps each captured stream; <= 0 means
+	// DefaultMaxOutputBytes.
+	MaxOutputBytes int
 }
 
 // NewShell builds the builtin shell tool bound to workspace. It fails when no
 // `sh` is on PATH: the tool cannot work without one, and reporting it at
 // startup (exit 2) beats failing on the first model call halfway into a run.
+// A zero opts.MaxOutputBytes selects DefaultMaxOutputBytes.
 //
 // The caller decides whether to build it at all; NewShell does not consult
 // cfg.Enabled, because "should this tool exist" is a registry question
 // (cmd/amele buildRegistry) and keeping the check there means there is exactly
 // one place where the default-off contract lives.
-func NewShell(cfg config.ShellConfig, workspace string) (*Shell, error) {
+func NewShell(cfg config.ShellConfig, workspace string, opts ShellOptions) (*Shell, error) {
 	shPath, err := exec.LookPath("sh")
 	if err != nil {
 		return nil, fmt.Errorf("shell tool needs a POSIX shell on PATH: %w", err)
@@ -87,6 +97,7 @@ func NewShell(cfg config.ShellConfig, workspace string) (*Shell, error) {
 		deny:      slices.Clone(cfg.Deny),
 		env:       slices.Clone(cfg.Env),
 		timeout:   cfg.Timeout,
+		maxOutput: resolveOutputCap(opts.MaxOutputBytes),
 	}, nil
 }
 
@@ -143,7 +154,7 @@ func (s *Shell) InvokeOutcome(ctx context.Context, rawArgs string) (string, Outc
 		return reason, Outcome{Kind: OutcomeRejected}, nil
 	}
 
-	out, outcome, err := runCommand(ctx, []string{s.shPath, "-c", args.Command}, s.workspace, "", s.env, s.timeout.Std())
+	out, outcome, err := runCommand(ctx, []string{s.shPath, "-c", args.Command}, s.workspace, "", s.env, s.timeout.Std(), s.maxOutput)
 	if err != nil {
 		return "", Outcome{}, fmt.Errorf("running shell command: %w", err)
 	}

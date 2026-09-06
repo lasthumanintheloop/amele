@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 )
@@ -273,7 +274,7 @@ func TestFSBadArgs(t *testing.T) {
 func subprocessTool(t *testing.T, def config.SubprocessTool) (*Subprocess, string) {
 	t.Helper()
 	dir := t.TempDir()
-	return NewSubprocess(def, dir), dir
+	return NewSubprocess(def, dir, SubprocessOptions{}), dir
 }
 
 func TestSubprocessEcho(t *testing.T) {
@@ -424,15 +425,57 @@ func TestSubprocessOutputTruncation(t *testing.T) {
 		Name: "spam", Description: "d",
 		Command: []string{"sh", "-c", "yes x | head -c 200000"},
 	})
-	out, err := tool.Invoke(context.Background(), "")
+	out, outcome, err := tool.InvokeOutcome(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxOutputBytes+len(TruncationMarker) {
+	if len(out) > DefaultMaxOutputBytes+len(TruncationMarker) {
 		t.Errorf("output not bounded: %d bytes", len(out))
 	}
 	if !strings.HasSuffix(out, TruncationMarker) {
 		t.Error("missing truncation marker")
+	}
+	// The marker is what the model reads; Outcome.Truncated is what the
+	// session log records. They must agree on the same call.
+	if !outcome.Truncated {
+		t.Error("Outcome.Truncated = false, want true")
+	}
+}
+
+// TestSubprocessCapOption: the per-tool cap replaces the default, and a cut
+// that lands inside a multi-byte rune backs off to a whole character - half a
+// rune is invalid UTF-8 and some providers reject the whole request over it.
+func TestSubprocessCapOption(t *testing.T) {
+	def := config.SubprocessTool{
+		Name: "runes", Description: "d",
+		Command: []string{"sh", "-c", "printf '\u00e9%.0s' $(seq 1 100)"},
+	}
+	tool := NewSubprocess(def, t.TempDir(), SubprocessOptions{MaxOutputBytes: 101}) // 100 x 2-byte rune = 200 bytes
+	out, outcome, err := tool.InvokeOutcome(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Truncated {
+		t.Fatal("expected Truncated")
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid UTF-8 after cut: %q", out)
+	}
+	body := strings.TrimSuffix(out, TruncationMarker)
+	if len(body) != 100 { // 101 lands mid-rune, backs off to 100
+		t.Fatalf("kept %d bytes, want 100", len(body))
+	}
+}
+
+// TestSubprocessExactCapNotTruncated pins the boundary for the option path
+// too: output of exactly the cap is complete, so it carries no marker and no
+// Truncated flag.
+func TestSubprocessExactCapNotTruncated(t *testing.T) {
+	def := config.SubprocessTool{Name: "ten", Description: "d", Command: []string{"sh", "-c", "printf 0123456789"}}
+	tool := NewSubprocess(def, t.TempDir(), SubprocessOptions{MaxOutputBytes: 10})
+	out, outcome, err := tool.InvokeOutcome(context.Background(), "")
+	if err != nil || out != "0123456789" || outcome.Truncated {
+		t.Fatalf("out=%q truncated=%v err=%v", out, outcome.Truncated, err)
 	}
 }
 
@@ -466,7 +509,7 @@ func TestSubprocessRunsInWorkspace(t *testing.T) {
 func shellTool(t *testing.T, cfg config.ShellConfig) (*Shell, string) {
 	t.Helper()
 	dir := t.TempDir()
-	sh, err := NewShell(cfg, dir)
+	sh, err := NewShell(cfg, dir, ShellOptions{})
 	if err != nil {
 		t.Fatalf("NewShell: %v", err)
 	}
@@ -678,15 +721,42 @@ func TestShellBadArgs(t *testing.T) {
 
 func TestShellOutputTruncation(t *testing.T) {
 	sh, _ := shellTool(t, config.ShellConfig{Enabled: true})
-	out, err := sh.Invoke(context.Background(), `{"command": "yes x | head -c 200000"}`)
+	out, outcome, err := sh.InvokeOutcome(context.Background(), `{"command": "yes x | head -c 200000"}`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out) > maxOutputBytes+len(TruncationMarker) {
+	if len(out) > DefaultMaxOutputBytes+len(TruncationMarker) {
 		t.Errorf("output not bounded: %d bytes", len(out))
 	}
 	if !strings.HasSuffix(out, TruncationMarker) {
 		t.Error("missing truncation marker")
+	}
+	if !outcome.Truncated {
+		t.Error("Outcome.Truncated = false, want true")
+	}
+}
+
+// TestShellCapOption: the shell shares the subprocess run core, so its cap
+// option must reach the same rune-safe cut (a regression here would only show
+// up as invalid UTF-8 in a provider request).
+func TestShellCapOption(t *testing.T) {
+	dir := t.TempDir()
+	sh, err := NewShell(config.ShellConfig{Enabled: true}, dir, ShellOptions{MaxOutputBytes: 101})
+	if err != nil {
+		t.Fatalf("NewShell: %v", err)
+	}
+	out, outcome, err := sh.InvokeOutcome(context.Background(), `{"command": "printf '\u00e9%.0s' $(seq 1 100)"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.Truncated {
+		t.Fatal("expected Truncated")
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("invalid UTF-8 after cut: %q", out)
+	}
+	if body := strings.TrimSuffix(out, TruncationMarker); len(body) != 100 {
+		t.Fatalf("kept %d bytes, want 100", len(body))
 	}
 }
 
@@ -896,7 +966,7 @@ func TestDecodeArgsRejectsMalformed(t *testing.T) {
 
 // TestSubprocessTruncationBoundary is a regression test for an off-by-one:
 // truncation was inferred from "buffer is full", so output of EXACTLY
-// maxOutputBytes was marked truncated even though nothing was dropped, and
+// DefaultMaxOutputBytes was marked truncated even though nothing was dropped, and
 // truncated stderr carried no marker at all - the model saw a cut error
 // message as if it were complete.
 func TestSubprocessTruncationBoundary(t *testing.T) {
@@ -909,8 +979,8 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 		command       []string
 		wantTruncated bool
 	}{
-		{"exactly max", spam(maxOutputBytes, ""), false},
-		{"one over max", spam(maxOutputBytes+1, ""), true},
+		{"exactly max", spam(DefaultMaxOutputBytes, ""), false},
+		{"one over max", spam(DefaultMaxOutputBytes+1, ""), true},
 		{"well under max", spam(10, ""), false},
 	}
 	for _, tt := range tests {
@@ -933,7 +1003,7 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 	// non-zero-exit path, where a silently cut message is misleading.
 	tool, _ := subprocessTool(t, config.SubprocessTool{
 		Name: "noisy", Description: "d",
-		Command: []string{"sh", "-c", fmt.Sprintf("yes x | head -c %d >&2; exit 1", maxOutputBytes+1000)},
+		Command: []string{"sh", "-c", fmt.Sprintf("yes x | head -c %d >&2; exit 1", DefaultMaxOutputBytes+1000)},
 	})
 	out, err := tool.Invoke(context.Background(), "")
 	if err != nil {
@@ -945,7 +1015,7 @@ func TestSubprocessTruncationBoundary(t *testing.T) {
 	if !strings.Contains(out, TruncationMarker) {
 		t.Error("truncated stderr carries no truncation marker")
 	}
-	if len(out) > 2*maxOutputBytes+1024 {
+	if len(out) > 2*DefaultMaxOutputBytes+1024 {
 		t.Errorf("combined output not bounded: %d bytes", len(out))
 	}
 }

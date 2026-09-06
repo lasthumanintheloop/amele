@@ -13,9 +13,9 @@ import (
 
 const (
 	// MaxResultBytes caps how much of a tool result the model ever sees. It is
-	// the same cap subprocess stdout gets (tools.maxOutputBytes): a server the
-	// operator does not control must not be able to spend the whole context
-	// window in one call.
+	// the same cap subprocess stdout gets (tools.DefaultMaxOutputBytes): a
+	// server the operator does not control must not be able to spend the whole
+	// context window in one call.
 	// CONTRACT: the returned text never exceeds MaxResultBytes + the marker.
 	MaxResultBytes = 64 * 1024
 	// truncationMarker is appended when a result is cut. The wording matches

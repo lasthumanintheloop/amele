@@ -22,8 +22,10 @@ const DefaultMaxReadBytes = 256 * 1024
 // DefaultMaxListBytes bounds fs_list output for the same reason: a directory
 // of rotated logs can hold tens of thousands of entries. It is smaller than
 // the read cap because a listing is an index, not content - a model that
-// needs more should narrow the path.
-const DefaultMaxListBytes = 64 * 1024
+// needs more should narrow the path. It is defined as the subprocess stdout
+// cap rather than repeating the number: both answer "how much incidental tool
+// output may one call spend", and two copies of 64 KiB would drift.
+const DefaultMaxListBytes = DefaultMaxOutputBytes
 
 // sandbox confines all filesystem access to a workspace root.
 //

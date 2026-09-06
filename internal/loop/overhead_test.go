@@ -31,7 +31,7 @@ func TestBuiltinToolDefinitionBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	shell, err := tools.NewShell(config.ShellConfig{Enabled: true}, t.TempDir())
+	shell, err := tools.NewShell(config.ShellConfig{Enabled: true}, t.TempDir(), tools.ShellOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

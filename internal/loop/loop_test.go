@@ -38,7 +38,7 @@ func newLoop(t *testing.T, fake *llm.Fake, limits Limits) *Loop {
 	reg := tools.NewRegistry()
 	echo := tools.NewSubprocess(config.SubprocessTool{
 		Name: "echo_tool", Description: "echoes stdin", Command: []string{"cat"},
-	}, t.TempDir())
+	}, t.TempDir(), tools.SubprocessOptions{})
 	if err := reg.Register(echo); err != nil {
 		t.Fatal(err)
 	}
@@ -1071,7 +1071,7 @@ func newShellLoop(t *testing.T, fake *llm.Fake) *Loop {
 	sh, err := tools.NewShell(config.ShellConfig{
 		Deny:    []string{"rm *"},
 		Timeout: config.Duration(100 * time.Millisecond),
-	}, t.TempDir())
+	}, t.TempDir(), tools.ShellOptions{})
 	if err != nil {
 		t.Skipf("shell tool unavailable: %v", err)
 	}
