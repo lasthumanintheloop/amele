@@ -85,6 +85,10 @@ type Event struct {
 	Outcome     ToolOutcome `json:"outcome,omitempty"`
 	ResultBytes int         `json:"result_bytes,omitempty"`
 
+	// Truncated marks a tool_result whose text was cut to the tool-result byte
+	// cap before the model saw it (v1.6, additive). Omitted when false.
+	Truncated bool `json:"truncated,omitempty"`
+
 	// MCP events (v1.2). Server names one server; the rest is per event type.
 	// OK is a pointer for the same reason ExitCode is: `ok:false` is the
 	// interesting half of a connect attempt and omitempty would delete it.
@@ -637,6 +641,9 @@ type ToolResult struct {
 	// its status is known; nil otherwise. A pointer because "not applicable"
 	// and "exited 0" are different statements.
 	ExitCode *int
+	// Truncated marks that the text was cut to the cap; the marker in Result
+	// says so to the model, this says so to the reader.
+	Truncated bool
 }
 
 // ToolResult records a tool's outcome.
@@ -650,6 +657,7 @@ func (w *Writer) ToolResult(r ToolResult) {
 		Type: "tool_result", CallID: r.CallID, Tool: r.Tool,
 		Result: w.clip(r.Result), IsErr: r.IsErr,
 		Outcome: r.Outcome, ResultBytes: len(r.Result), ExitCode: r.ExitCode,
+		Truncated: r.Truncated,
 	})
 }
 

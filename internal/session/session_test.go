@@ -40,6 +40,10 @@ func TestWriterGolden(t *testing.T) {
 	w.ToolCall("call_1", "fs_read", `{"path":"app.log"}`)
 	// The secret arrives via tool output and must be redacted by value.
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "fs_read", Result: "line with sk-supersecret token", Outcome: OutcomeOK})
+	// A second result whose text was cut to the tool-result byte cap - this is
+	// the one line in the golden that carries "truncated":true, proving the
+	// untruncated call above still omits the key.
+	w.ToolResult(ToolResult{CallID: "call_2", Tool: "fs_read", Result: "clipped output", Outcome: OutcomeOK, Truncated: true})
 	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop"})
 	w.RunEnd("success", 0, 2, 1, 300, 1500*time.Millisecond)
 
@@ -444,6 +448,31 @@ func TestToolResultBytesArePreClip(t *testing.T) {
 	}
 	if logged, _ := ev["result"].(string); len(logged) > maxLoggedField+64 {
 		t.Errorf("the result itself must still be clipped, got %d bytes", len(logged))
+	}
+}
+
+// TestToolResultTruncatedFlag pins the v1.6 additive field: a tool_result
+// whose text was cut to the byte cap says so with "truncated":true, and one
+// that was not cut omits the key rather than writing "truncated":false.
+func TestToolResultTruncatedFlag(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.ToolResult(ToolResult{CallID: "c1", Tool: "fs_read", Result: "x", Outcome: OutcomeOK, Truncated: true})
+	w.ToolResult(ToolResult{CallID: "c2", Tool: "fs_read", Result: "y", Outcome: OutcomeOK})
+	w.RunEnd("success", 0, 1, 2, 2, time.Second)
+
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	if !strings.Contains(lines[0], `"truncated":true`) {
+		t.Fatalf("first event lacks truncated: %s", lines[0])
+	}
+	if strings.Contains(lines[1], "truncated") {
+		t.Fatalf("second event must omit truncated: %s", lines[1])
 	}
 }
 

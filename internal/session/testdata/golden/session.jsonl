@@ -2,5 +2,6 @@
 {"v":1,"type":"llm_response","ts":"2026-08-10T12:00:03Z","turn":1,"content":"let me read the log","tool_call_ids":["call_1"],"input_tokens":100,"output_tokens":20,"finish_reason":"tool_calls","reasoning_bytes":33}
 {"v":1,"type":"tool_call","ts":"2026-08-10T12:00:04Z","tool_call_id":"call_1","tool":"fs_read","args":"{\"path\":\"app.log\"}"}
 {"v":1,"type":"tool_result","ts":"2026-08-10T12:00:05Z","tool_call_id":"call_1","tool":"fs_read","result":"line with [REDACTED] token","outcome":"ok","result_bytes":30}
-{"v":1,"type":"llm_response","ts":"2026-08-10T12:00:06Z","turn":2,"content":"all clear","input_tokens":150,"output_tokens":30,"finish_reason":"stop"}
-{"v":1,"type":"run_end","ts":"2026-08-10T12:00:07Z","status":"success","exit_code":0,"turns":2,"tool_calls":1,"total_tokens":300,"duration_ms":1500}
+{"v":1,"type":"tool_result","ts":"2026-08-10T12:00:06Z","tool_call_id":"call_2","tool":"fs_read","result":"clipped output","outcome":"ok","result_bytes":14,"truncated":true}
+{"v":1,"type":"llm_response","ts":"2026-08-10T12:00:07Z","turn":2,"content":"all clear","input_tokens":150,"output_tokens":30,"finish_reason":"stop"}
+{"v":1,"type":"run_end","ts":"2026-08-10T12:00:08Z","status":"success","exit_code":0,"turns":2,"tool_calls":1,"total_tokens":300,"duration_ms":1500}
