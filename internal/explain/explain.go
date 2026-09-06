@@ -1400,6 +1400,18 @@ func budgetsSection(b *strings.Builder, cfg *config.Config, set overrides) {
 	} else {
 		fmt.Fprintf(b, "  timeout:    none%s\n", set.mark("limits.timeout"))
 	}
+	// The guard belongs here rather than with the log: it bounds bytes the
+	// MODEL reads, which is context and therefore tokens - a spend, not a
+	// disk-space decision. The nil case names the built-in caps instead of
+	// staying silent, because "unset" here does not mean "no cap" and a
+	// reviewer must be able to read the real numbers off the report.
+	if cfg.Limits.MaxToolResultBytes != nil {
+		fmt.Fprintf(b, "  max_tool_result_bytes: %d (every tool family, and the framed result)%s\n",
+			*cfg.Limits.MaxToolResultBytes, set.mark("limits.max_tool_result_bytes"))
+	} else {
+		fmt.Fprintf(b, "  max_tool_result_bytes: built-in per-tool caps (fs_read 256 KiB, subprocess/shell 64 KiB per stream, mcp 64 KiB)%s\n",
+			set.mark("limits.max_tool_result_bytes"))
+	}
 	// limits.max_logged_field is deliberately NOT here: it bounds bytes on
 	// disk, not what the run may spend, so it is reported with the log it
 	// belongs to (sessionSection).

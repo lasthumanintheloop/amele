@@ -27,10 +27,11 @@ func overrideBase() *Config {
 // round-trip from the command line into the field it names. A key that
 // silently does nothing would be the worst possible failure - the run would
 // proceed with the config's value while the operator believes otherwise.
-// The four provider tuning keys live in TestApplyOverridesProviderTuningKeys
-// and limits.max_logged_field in TestApplyOverridesMaxLoggedField, which cover
-// the same ground for them (their pointer fields need three cases each, which
-// would not fit this table's complexity budget).
+// The four provider tuning keys live in TestApplyOverridesProviderTuningKeys,
+// limits.max_logged_field in TestApplyOverridesMaxLoggedField and
+// limits.max_tool_result_bytes in TestApplyOverridesMaxToolResultBytes, which
+// cover the same ground for them (their pointer fields need three cases each,
+// which would not fit this table's complexity budget).
 func TestApplyOverridesAllowedKeys(t *testing.T) {
 	baseDir := t.TempDir()
 
@@ -108,7 +109,8 @@ func TestApplyOverridesAllowedKeys(t *testing.T) {
 // operators to a flag that does not exist.
 func TestSettableKeysCoversAllowlist(t *testing.T) {
 	want := []string{
-		"limits.max_logged_field", "limits.max_tokens", "limits.max_turns",
+		"limits.max_logged_field", "limits.max_tokens",
+		"limits.max_tool_result_bytes", "limits.max_turns",
 		"limits.timeout", "model", "output.max_schema_retries", "prompt",
 		"provider.max_output_tokens", "provider.reasoning.effort",
 		"provider.temperature", "provider.top_p", "session_dir",
@@ -331,6 +333,66 @@ func TestApplyOverridesMaxLoggedFieldNegativeFailsValidation(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "limits.max_logged_field") {
 		t.Errorf("error = %q, want it to name limits.max_logged_field", err)
+	}
+}
+
+// TestApplyOverridesMaxToolResultBytes walks the guard's pointer field from
+// the command line. It has only two settings, not three: unlike the log's
+// bound there is no "0 means unbounded" spelling, so the states are a number
+// and "cleared". Empty is a setting rather than a slip, like
+// limits.max_logged_field: it drops a cap the YAML set and puts this run back
+// on each tool family's built-in one.
+func TestApplyOverridesMaxToolResultBytes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		pair string
+		want *int // nil means the pointer must be cleared
+	}{
+		{"a byte cap", "limits.max_tool_result_bytes=2048", ptrInt(2048)},
+		{"the floor itself", "limits.max_tool_result_bytes=1024", ptrInt(1024)},
+		{"empty is back to the built-in caps", "limits.max_tool_result_bytes=", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := overrideBase()
+			// Start from a value the YAML could have set, so the empty case
+			// proves a clear rather than a no-op on an already-nil field.
+			cfg.Limits.MaxToolResultBytes = ptrInt(65536)
+
+			if err := ApplyOverrides(cfg, []string{tt.pair}, t.TempDir()); err != nil {
+				t.Fatalf("ApplyOverrides(%q): %v", tt.pair, err)
+			}
+			got := cfg.Limits.MaxToolResultBytes
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("max_tool_result_bytes = %d, want nil (back to the built-in caps)", *got)
+			case tt.want != nil && got == nil:
+				t.Errorf("max_tool_result_bytes = nil, want %d", *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Errorf("max_tool_result_bytes = %d, want %d", *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestApplyOverridesMaxToolResultBytesBelowFloorFailsValidation: the override
+// parses any integer, and Validate stays the single judge of the range - a cap
+// under 1 KiB is exit 2 from --set exactly as the same value written in YAML
+// is. Without this the flag would be the one way around the floor.
+func TestApplyOverridesMaxToolResultBytesBelowFloorFailsValidation(t *testing.T) {
+	dir := t.TempDir()
+	cfg := overrideBase()
+	cfg.Workspace = dir
+	cfg.Provider.BaseURL = "https://api.example.com/v1"
+
+	if err := ApplyOverrides(cfg, []string{"limits.max_tool_result_bytes=512"}, dir); err != nil {
+		t.Fatalf("ApplyOverrides must accept the parse and leave the range to Validate: %v", err)
+	}
+	err := cfg.Validate()
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Validate() = %v, want an ErrInvalid rejection", err)
+	}
+	if !strings.Contains(err.Error(), "limits.max_tool_result_bytes") {
+		t.Errorf("error = %q, want it to name limits.max_tool_result_bytes", err)
 	}
 }
 

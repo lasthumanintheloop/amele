@@ -49,9 +49,18 @@ import (
 // print_session_path - stay off the list deliberately: they decide WHAT is
 // persisted and what is printed, which is a data-governance statement the
 // audited YAML owns.
+//
+// SECURITY: limits.max_tool_result_bytes (2026-09-06) joins them on the same
+// reading. It is a BUDGET, not a capability: it bounds how many bytes of a
+// tool result reach the model, so the worst an operator can do with it is make
+// the model read more or less of a result it was already allowed to fetch.
+// WHICH tools exist and WHO may run them stay in the YAML, untouched by it,
+// and the key cannot disarm the guard - Validate refuses anything under 1 KiB
+// from a flag exactly as it does from the file.
 var settableKeys = []string{
 	"limits.max_logged_field",
 	"limits.max_tokens",
+	"limits.max_tool_result_bytes",
 	"limits.max_turns",
 	"limits.timeout",
 	"model",
@@ -233,6 +242,8 @@ func (c *Config) applyScalarOverride(key, value string) (handled bool, err error
 		return true, overrideInt(key, value, &c.Limits.MaxTokens)
 	case "limits.max_logged_field":
 		return true, overrideIntPtr(key, value, &c.Limits.MaxLoggedField)
+	case "limits.max_tool_result_bytes":
+		return true, overrideIntPtr(key, value, &c.Limits.MaxToolResultBytes)
 	case "output.max_schema_retries":
 		return true, overrideInt(key, value, &c.Output.MaxSchemaRetries)
 	case "provider.max_output_tokens":

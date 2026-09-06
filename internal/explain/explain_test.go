@@ -1257,6 +1257,55 @@ func TestRenderMaxLoggedFieldOverrideMarked(t *testing.T) {
 	}
 }
 
+// TestRenderMaxToolResultBytes pins both directions of the guard's BUDGETS
+// row. It belongs under BUDGETS rather than beside max_logged_field because it
+// bounds what the RUN spends - bytes the model reads, and therefore context and
+// tokens - not what lands on disk. Both directions are printed because the
+// default is not "no cap": a reviewer pre-flighting someone else's pack must be
+// able to read the built-in caps off the report without opening the source.
+func TestRenderMaxToolResultBytes(t *testing.T) {
+	const defaultRow = "  max_tool_result_bytes: built-in per-tool caps " +
+		"(fs_read 256 KiB, subprocess/shell 64 KiB per stream, mcp 64 KiB)\n"
+
+	cases := []struct {
+		name string
+		cap  *int
+		want string
+	}{
+		{"omitted names the built-in caps", nil, defaultRow},
+		{
+			"a set cap names its reach",
+			ptrInt(8192),
+			"  max_tool_result_bytes: 8192 (every tool family, and the framed result)\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			cfg.Limits.MaxToolResultBytes = tc.cap
+			got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("report missing %q:\n%s", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestRenderMaxToolResultBytesOverrideMarked: the key is on the --set
+// allowlist, so its line must carry the same provenance marker every other
+// settable budget line carries - the report's job is to say where each number
+// came from, and a cap raised on the cron line is exactly the number a
+// reviewer would otherwise attribute to the audited YAML.
+func TestRenderMaxToolResultBytesOverrideMarked(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Limits.MaxToolResultBytes = ptrInt(2048)
+	got := Render(cfg, registryWith(t, fsBuiltins...), []string{"limits.max_tool_result_bytes=2048"}, nil, alwaysFound, nil)
+	want := "  max_tool_result_bytes: 2048 (every tool family, and the framed result) (overridden via --set)\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("report missing %q:\n%s", want, got)
+	}
+}
+
 // TestRenderDataGovernanceKeys: log_reasoning and print_session_path are the
 // two keys --set cannot reach, which makes this report the only place an
 // operator pre-flighting someone else's pack can learn that the run writes the

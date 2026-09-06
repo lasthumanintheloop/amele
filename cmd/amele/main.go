@@ -216,7 +216,8 @@ FLAGS
                   more. Settable keys, and nothing else:
                     model, prompt, system_prompt_file, workspace, session_dir,
                     limits.max_turns, limits.max_tokens, limits.timeout,
-                    limits.max_logged_field, output.max_schema_retries,
+                    limits.max_logged_field, limits.max_tool_result_bytes,
+                    output.max_schema_retries,
                     provider.max_output_tokens, provider.reasoning.effort,
                     provider.temperature, provider.top_p
                   Tools, permissions, the provider's identity (type, base_url,
@@ -233,8 +234,10 @@ FLAGS
                   shell means what it means in that shell. system_prompt_file
                   is re-read and replaces whatever prompt the config carried.
                   An empty session_dir (--set session_dir=) turns session
-                  logging off, and an empty limits.max_logged_field drops back
-                  to the default clip. Default: nothing overridden.
+                  logging off, an empty limits.max_logged_field drops back to
+                  the default clip, and an empty limits.max_tool_result_bytes
+                  drops back to the built-in per-tool result caps.
+                  Default: nothing overridden.
   -w, --workspace DIR
                   Shortcut for --set workspace=DIR. Default: the config's
                   workspace (its own directory unless the YAML says otherwise).
