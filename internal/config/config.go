@@ -406,6 +406,16 @@ type Limits struct {
 	// because "unset" and "explicitly 0" are different statements, the
 	// same reason provider.temperature is one.
 	MaxLoggedField *int `yaml:"max_logged_field"`
+	// MaxToolResultBytes bounds how many bytes of any single tool result the
+	// model may read, across every tool family (fs, subprocess, shell, MCP)
+	// and on the framed result the loop hands back. nil means each family's
+	// built-in cap (fs_read 256 KiB, fs_list/subprocess/shell 64 KiB per
+	// stream, MCP 64 KiB) - byte-identical to every release before it. There
+	// is no "unbounded": a pipeline that wants big reads sets a big number,
+	// because a tool result with no bound is the one thing that can spend a
+	// whole context window in one call. A pointer for the same reason as
+	// MaxLoggedField: "unset" and a value are different statements.
+	MaxToolResultBytes *int `yaml:"max_tool_result_bytes"`
 }
 
 // OutputConfig constrains the run's final answer to a JSON Schema.
@@ -1041,6 +1051,12 @@ func (c *Config) Violations() []string {
 	// clamping would leave the operator believing a bound applies.
 	if c.Limits.MaxLoggedField != nil && *c.Limits.MaxLoggedField < 0 {
 		add("limits.max_logged_field must be >= 0 (0 means unbounded); omit the key for the default")
+	}
+	// CONTRACT: the guard has no off switch. Below 1 KiB a result cannot carry
+	// even an error message plus the marker, so the floor is refused rather
+	// than clamped.
+	if c.Limits.MaxToolResultBytes != nil && *c.Limits.MaxToolResultBytes < 1024 {
+		add("limits.max_tool_result_bytes must be >= 1024; omit the key for the built-in per-tool caps")
 	}
 
 	if info, err := os.Stat(c.Workspace); err != nil {

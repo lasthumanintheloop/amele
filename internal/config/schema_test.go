@@ -126,6 +126,43 @@ output:
 	}
 }
 
+// TestSchemaMaxToolResultBytesFloor pins runtime/schema agreement for the
+// tool-result guard: Validate refuses anything below 1 KiB (there is no "off"
+// setting), so the published schema must refuse it at editor time too - while
+// still accepting the whole-value ${VAR} form the headless idiom uses.
+func TestSchemaMaxToolResultBytesFloor(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const head = `
+model: test-model
+provider:
+  base_url: https://api.example.com/v1
+limits:
+  max_tool_result_bytes: `
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool // whether the document must validate
+	}{
+		{"below the floor is rejected", "512", false},
+		{"zero is rejected", "0", false},
+		{"the floor itself validates", "1024", true},
+		{"an env reference validates", "\"${CAP}\"", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, feedback, ok := validator.Validate(yamlToJSON(t, []byte(head+tt.value+"\n")))
+			if ok != tt.want {
+				t.Errorf("schema validation = %v, want %v:\n%s", ok, tt.want, feedback)
+			}
+		})
+	}
+}
+
 // TestSchemaProviderTypeGemini pins the published enum against the runtime:
 // `type: gemini` is a valid third wire value in the schema editors consume, and
 // a near-miss spelling is not.

@@ -245,6 +245,12 @@
           "minimum": 0,
           "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
           "description": "Per-field byte bound for session log events. Omitted means 8192; 0 means unbounded (the disk-safety cap is deliberately lifted). May also be a whole-value ${VAR} reference."
+        },
+        "max_tool_result_bytes": {
+          "type": ["integer", "string"],
+          "minimum": 1024,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "Byte cap on any single tool result the model reads, applied to every tool family and to the framed result. Omitted means the built-in per-tool caps (fs_read 256 KiB, others 64 KiB). Minimum 1024; there is no unbounded setting. May also be a whole-value ${VAR} reference."
         }
       }
     },

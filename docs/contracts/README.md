@@ -157,6 +157,16 @@ Within a frozen version, changes must be additive and backwards-compatible:
   (cli.md); `log_reasoning` and `print_session_path` are deliberately NOT
   settable - what a run persists is a data-governance decision the audited
   YAML owns - and no key was removed.
+- **2026-09-06 - config schema: `limits.max_tool_result_bytes`.** One optional
+  key (integer or a whole-value `${VAR}`, minimum 1024): the byte cap on any
+  single tool result the model reads, applied to every tool family and to
+  the framed result the loop hands back. Omitted keeps each family's
+  built-in cap byte-identically; there is deliberately no unbounded setting.
+  Additive: the key is optional and `additionalProperties: false` still
+  holds. Migration: none required. The `--set` allowlist gains
+  `limits.max_tool_result_bytes` (cli.md) - a budget, like
+  `limits.max_logged_field`: the worst an operator can do with it is make
+  the model read more or less of a result; no key was removed.
 
 ## Schema versioning note (`$id`)
 

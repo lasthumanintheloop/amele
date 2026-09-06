@@ -2781,6 +2781,113 @@ func TestLoadMaxLoggedFieldFromEnv(t *testing.T) {
 	}
 }
 
+// TestValidateMaxToolResultBytes pins the guard's floor. The key is a pointer
+// for the same reason max_logged_field is - "unset" (each tool family's
+// built-in cap) and a number are different statements - but unlike the log's
+// bound it has no "unbounded" spelling: 0 is not a legal value, it is a
+// request to switch the guard off, and the whole point of the guard is that a
+// single tool result cannot spend the context window.
+func TestValidateMaxToolResultBytes(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name    string
+		value   *int
+		wantSub string // "" means the config must validate
+	}{
+		{"omitted means the built-in per-tool caps", nil, ""},
+		{"the floor itself is legal", ptrInt(1024), ""},
+		{"a realistic bound", ptrInt(262144), ""},
+		{"below the floor is rejected", ptrInt(1023), "limits.max_tool_result_bytes"},
+		{"zero is not an off switch", ptrInt(0), "limits.max_tool_result_bytes"},
+		{"negative is rejected", ptrInt(-1), "limits.max_tool_result_bytes"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tuningBase(dir)
+			cfg.Limits.MaxToolResultBytes = tt.value
+			err := cfg.Validate()
+			if tt.wantSub == "" {
+				if err != nil {
+					t.Fatalf("config must validate, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("expected a violation")
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Errorf("error should wrap ErrInvalid: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantSub) {
+				t.Errorf("error %q does not mention %q", err, tt.wantSub)
+			}
+			// The message must state the floor and the way back to the
+			// defaults, so the operator can fix it without opening the schema.
+			if !strings.Contains(err.Error(), ">= 1024") {
+				t.Errorf("error %q does not state the floor", err)
+			}
+			if !strings.Contains(err.Error(), "omit the key") {
+				t.Errorf("error %q does not say how to get the built-in caps back", err)
+			}
+		})
+	}
+}
+
+// TestLoadMaxToolResultBytes pins the YAML surface: the key round-trips from
+// the file into the pointer field and validates.
+func TestLoadMaxToolResultBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML+"limits:\n  max_tool_result_bytes: 8192\n")
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.Limits.MaxToolResultBytes == nil || *cfg.Limits.MaxToolResultBytes != 8192 {
+		t.Errorf("max_tool_result_bytes = %v, want 8192", cfg.Limits.MaxToolResultBytes)
+	}
+}
+
+// TestLoadMaxToolResultBytesDefault pins the safe default: a config that says
+// nothing keeps nil, which the tool layer reads as "each family's built-in
+// cap" - byte-identical to every release before the key existed.
+func TestLoadMaxToolResultBytesDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML)
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Limits.MaxToolResultBytes != nil {
+		t.Errorf("max_tool_result_bytes default = %d, want nil (the built-in caps)", *cfg.Limits.MaxToolResultBytes)
+	}
+}
+
+// TestLoadMaxToolResultBytesFromEnv keeps the schema's claim honest: it
+// declares the key as ["integer","string"] so an editor accepts the ${VAR}
+// form, and that form must actually load into the pointer.
+func TestLoadMaxToolResultBytesFromEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, minimalYAML+"limits:\n  max_tool_result_bytes: ${CAP}\n")
+
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k", "CAP": "4096"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.Limits.MaxToolResultBytes == nil || *cfg.Limits.MaxToolResultBytes != 4096 {
+		t.Errorf("max_tool_result_bytes = %v, want 4096", cfg.Limits.MaxToolResultBytes)
+	}
+}
+
 // TestSessionContentKeysAreNotSettable pins the deliberate omission: WHAT the
 // session log persists is a data-governance decision, so it lives in the YAML
 // the operator reviews, not in a flag appended to a cron line. Only the size
