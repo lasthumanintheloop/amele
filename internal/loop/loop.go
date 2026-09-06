@@ -158,6 +158,15 @@ type Loop struct {
 	// conditions that must all hold before a turn actually runs concurrently.
 	// The zero value (false) keeps the pre-v0.2 strictly sequential loop.
 	ParallelTools bool
+	// MaxToolResultBytes is the ceiling on the text of any one tool result as
+	// the model receives it, whatever family produced it. Each family caps its
+	// own output already; this bound exists because the subprocess framing
+	// (stdout plus stderr plus status lines) could otherwise hand the model
+	// twice the per-stream cap. 0 means no ceiling - the pre-v0.3 behavior.
+	//
+	// CONTRACT: limits.max_tool_result_bytes; a cut here is reported as
+	// tool_result.truncated exactly like a cut inside the tool.
+	MaxToolResultBytes int
 	// Clock may be nil, meaning time.Now.
 	//
 	// CONCURRENCY: with ParallelTools enabled AND a Progress hook installed,
@@ -547,6 +556,11 @@ type callResult struct {
 	isErr    bool
 	outcome  session.ToolOutcome
 	exitCode *int
+	// truncated reports that the text the model receives is short of what the
+	// tool produced - the tool cut it, the run's ceiling cut it, or both. The
+	// dispatch paths that never ran a tool (denial, unknown tool, error) leave
+	// it false: their text is complete.
+	truncated bool
 	// progress is the preformatted progress line, or "" when no hook is
 	// installed (an unobserved run must not pay for the formatting).
 	progress string
@@ -850,14 +864,40 @@ func (l *Loop) runCall(ctx context.Context, turn int, call llm.ToolCall) callRes
 	// the additive `outcome`/`exit_code` fields instead, so a non-zero exit is
 	// visible without being renamed an error.
 	kind, exitCode := toolOutcome(outcome)
-	r := callResult{output: output, logged: output, outcome: kind, exitCode: exitCode}
+	// The ceiling is applied to the FINISHED text, after the tool's own cap and
+	// after whatever framing it added, and the clipped string is what both the
+	// model and the log get: the session file must show what the model read,
+	// not a fuller version of it.
+	output, truncated := l.capResult(output, outcome.Truncated)
+	r := callResult{output: output, logged: output, outcome: kind, exitCode: exitCode, truncated: truncated}
 	if l.Progress != nil {
 		// Guarded rather than left to eventf: the arguments - the second
 		// clock read - are evaluated before the call, so only the guard here
 		// keeps the read out of an unobserved run.
-		r.progress = l.eventf("turn %d: %s %s (%.1fs)", turn, name, outcome, l.now().Sub(started).Seconds())
+		suffix := ""
+		if truncated {
+			// Said on the operator's line too: a model that answered from half
+			// a file looks like a model that answered badly, and only this
+			// word tells the two apart while the run is still on screen.
+			suffix = " (truncated)"
+		}
+		r.progress = l.eventf("turn %d: %s %s (%.1fs)%s", turn, name, outcome, l.now().Sub(started).Seconds(), suffix)
 	}
 	return r
+}
+
+// capResult applies the run's tool-result ceiling to one finished result and
+// reports whether the model's copy of the text is short of what the tool
+// produced - either because the tool said so or because the ceiling cut it.
+//
+// It is a method rather than three lines inside runCall only to keep that
+// function under the cyclomatic budget (docs/engineering.md §5.1).
+func (l *Loop) capResult(output string, toolTruncated bool) (string, bool) {
+	if l.MaxToolResultBytes <= 0 {
+		return output, toolTruncated
+	}
+	output, cut := tools.CapText(output, l.MaxToolResultBytes)
+	return output, toolTruncated || cut
 }
 
 // publish writes a finished call's session event and progress line, in that
@@ -865,7 +905,7 @@ func (l *Loop) runCall(ctx context.Context, turn int, call llm.ToolCall) callRes
 // a dispatch becomes visible, which is what lets the concurrent path decide
 // WHEN that happens without duplicating any of the reporting.
 func (l *Loop) publish(call llm.ToolCall, r callResult) (string, error) {
-	l.logToolResult(call, r.logged, r.isErr, r.outcome, r.exitCode)
+	l.logToolResult(call, r.logged, r.isErr, r.outcome, r.exitCode, r.truncated)
 	if r.progress != "" && l.Progress != nil {
 		l.Progress(r.progress)
 	}
@@ -876,10 +916,10 @@ func (l *Loop) publish(call llm.ToolCall, r callResult) (string, error) {
 // exit from dispatch goes through it so no path can forget the observability
 // fields - a tool_result without an outcome would be indistinguishable from a
 // pre-v0.1.0 log line.
-func (l *Loop) logToolResult(call llm.ToolCall, result string, isErr bool, outcome session.ToolOutcome, exitCode *int) {
+func (l *Loop) logToolResult(call llm.ToolCall, result string, isErr bool, outcome session.ToolOutcome, exitCode *int, truncated bool) {
 	l.Session.ToolResult(session.ToolResult{
 		CallID: call.ID, Tool: call.Name, Result: result,
-		IsErr: isErr, Outcome: outcome, ExitCode: exitCode,
+		IsErr: isErr, Outcome: outcome, ExitCode: exitCode, Truncated: truncated,
 	})
 }
 
@@ -945,10 +985,11 @@ func toolOutcome(o tools.Outcome) (session.ToolOutcome, *int) {
 // its result text reports but its error return cannot (a rejected command, a
 // timeout, a non-zero exit) implements it to say which one happened.
 //
-// It is an OPTIONAL interface rather than a widening of tools.Tool because most
-// tools have nothing to say: the fs tools either do their job or return a Go
-// error, which the branch above already reports. Declaring it here, in the
-// consuming package (docs/engineering.md §5.1), keeps tools free of any assumption about
+// It is an OPTIONAL interface rather than a widening of tools.Tool because a
+// tool need not have anything to say: a tool that either does its job or
+// returns a Go error is fully described by the error branch in runCall, and the
+// zero Outcome reads as exactly that. Declaring it here, in the consuming
+// package (docs/engineering.md §5.1), keeps tools free of any assumption about
 // who is watching.
 type outcomeInvoker interface {
 	InvokeOutcome(ctx context.Context, rawArgs string) (string, tools.Outcome, error)

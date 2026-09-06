@@ -1513,3 +1513,173 @@ func TestToolOutcomeMapping(t *testing.T) {
 		})
 	}
 }
+
+// stubOutcomeTool is a registry tool that returns a fixed body and a fixed
+// Outcome. It exists because the ceiling is about the text the loop hands on,
+// not about how a tool produced it: a stub states "the tool returned N bytes
+// and said it had truncated" in one line, where a real child process would
+// need a platform-specific command to say the same thing.
+type stubOutcomeTool struct {
+	name string
+	body string
+	out  tools.Outcome
+}
+
+func (s stubOutcomeTool) Def() llm.ToolDef {
+	return llm.ToolDef{Name: s.name, Description: "stub tool with a fixed outcome"}
+}
+
+func (s stubOutcomeTool) Invoke(context.Context, string) (string, error) { return s.body, nil }
+
+func (s stubOutcomeTool) InvokeOutcome(context.Context, string) (string, tools.Outcome, error) {
+	return s.body, s.out, nil
+}
+
+// stubLoop wires a sequential loop over the fake provider and the given tools,
+// with no ceiling set (each test states its own).
+func stubLoop(t *testing.T, fake *llm.Fake, ts ...tools.Tool) *Loop {
+	t.Helper()
+	reg := tools.NewRegistry()
+	for _, tool := range ts {
+		if err := reg.Register(tool); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &Loop{
+		Provider: fake,
+		Registry: reg,
+		Limits:   Limits{MaxTurns: 5},
+		Model:    "test-model",
+	}
+}
+
+// callThenDone is the two-turn script every ceiling test runs: one tool call,
+// then a final answer.
+func callThenDone(tool string) *llm.Fake {
+	return &llm.Fake{Responses: []llm.Response{
+		llm.ToolCallResponse("c1", tool, `{}`, usage(1, 1)),
+		llm.TextResponse("done", usage(1, 1)),
+	}}
+}
+
+// lastToolMessage returns the content of the tool-result message in the last
+// request the fake provider received - what the MODEL actually read.
+func lastToolMessage(t *testing.T, fake *llm.Fake) string {
+	t.Helper()
+	req := fake.Requests[len(fake.Requests)-1]
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == llm.RoleTool {
+			return req.Messages[i].Content
+		}
+	}
+	t.Fatal("the last request carried no tool-result message")
+	return ""
+}
+
+// TestLoopCeilingClipsFramedResult: MaxToolResultBytes bounds the finished
+// result text whatever family produced it, and the log and the model see the
+// same clipped bytes.
+func TestLoopCeilingClipsFramedResult(t *testing.T) {
+	fake := callThenDone("stub_tool")
+	l := stubLoop(t, fake, stubOutcomeTool{name: "stub_tool", body: strings.Repeat("a", 2000)})
+	l.MaxToolResultBytes = 1024
+
+	events := toolResultEvents(t, context.Background(), l)
+	if len(events) != 1 {
+		t.Fatalf("tool_result events: got %d, want 1", len(events))
+	}
+	want := 1024 + len(tools.TruncationMarker)
+	if !events[0].Truncated || len(events[0].Result) != want {
+		t.Errorf("logged result: truncated=%v len=%d, want true and %d",
+			events[0].Truncated, len(events[0].Result), want)
+	}
+	if got := lastToolMessage(t, fake); len(got) != want {
+		t.Errorf("the model saw %d bytes, want %d", len(got), want)
+	}
+}
+
+// TestLoopPropagatesToolTruncation: with no ceiling of its own, the loop still
+// reports a cut the TOOL made - the flag is about the model's view of the text,
+// not about who did the cutting - and the progress line says so.
+func TestLoopPropagatesToolTruncation(t *testing.T) {
+	fake := callThenDone("stub_tool")
+	l := stubLoop(t, fake, stubOutcomeTool{
+		name: "stub_tool", body: "short", out: tools.Outcome{Truncated: true},
+	})
+	l.Clock = stepClock(time.Second)
+	progress := recordProgress(l)
+
+	events := toolResultEvents(t, context.Background(), l)
+	if len(events) != 1 {
+		t.Fatalf("tool_result events: got %d, want 1", len(events))
+	}
+	if !events[0].Truncated {
+		t.Error("the tool's own truncation did not reach the log")
+	}
+	if events[0].Result != "short" {
+		t.Errorf("result = %q, want %q (the loop must not re-cut it)", events[0].Result, "short")
+	}
+	want := "turn 1: stub_tool ok (1.0s) (truncated)"
+	if len(*progress) < 2 || (*progress)[1] != want {
+		t.Errorf("progress events:\n got %q\nwant %q at index 1", *progress, want)
+	}
+}
+
+// TestLoopNoCeilingIsByteIdentical: the zero value keeps the pre-v0.3 behavior
+// - a long result travels whole and unflagged.
+func TestLoopNoCeilingIsByteIdentical(t *testing.T) {
+	fake := callThenDone("stub_tool")
+	l := stubLoop(t, fake, stubOutcomeTool{name: "stub_tool", body: strings.Repeat("a", 2000)})
+
+	events := toolResultEvents(t, context.Background(), l)
+	if len(events) != 1 {
+		t.Fatalf("tool_result events: got %d, want 1", len(events))
+	}
+	if events[0].Truncated || len(events[0].Result) != 2000 {
+		t.Errorf("unexpected clip: truncated=%v len=%d", events[0].Truncated, len(events[0].Result))
+	}
+	if got := lastToolMessage(t, fake); got != strings.Repeat("a", 2000) {
+		t.Errorf("the model saw %d bytes, want the whole 2000", len(got))
+	}
+}
+
+// TestParallelDispatchKeepsTruncationFlag pins the second dispatch path: the
+// concurrent dispatcher publishes through the same publish, so a flag set on a
+// per-call goroutine must survive the hand-off to the log for EVERY call of the
+// turn, not just the first.
+func TestParallelDispatchKeepsTruncationFlag(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{
+		toolCallsResponse(call("c1", "stub_one"), call("c2", "stub_two")),
+		llm.TextResponse("done", usage(1, 1)),
+	}}
+	l := parallelLoop(t, fake,
+		stubOutcomeTool{name: "stub_one", body: strings.Repeat("a", 2000)},
+		stubOutcomeTool{name: "stub_two", body: "short", out: tools.Outcome{Truncated: true}},
+	)
+	l.MaxToolResultBytes = 1024
+
+	events, _, err := runWithEvents(t, context.Background(), l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results []session.Event
+	for _, ev := range events {
+		if ev.Type == "tool_result" {
+			results = append(results, ev)
+		}
+	}
+	if len(results) != 2 {
+		t.Fatalf("tool_result events: got %d, want 2", len(results))
+	}
+	for i, ev := range results {
+		if !ev.Truncated {
+			t.Errorf("result %d (%s): truncated = false, want true", i, ev.CallID)
+		}
+	}
+	if want := 1024 + len(tools.TruncationMarker); len(results[0].Result) != want {
+		t.Errorf("clipped result is %d bytes, want %d", len(results[0].Result), want)
+	}
+	if results[1].Result != "short" {
+		t.Errorf("result %q was re-cut; the ceiling is a bound, not a rewrite", results[1].Result)
+	}
+}
