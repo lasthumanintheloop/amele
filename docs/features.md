@@ -1,9 +1,9 @@
-# Structured output, permissions, shell, chat, parallel tool calls and fallback
+# Structured output, permissions, shell, chat, parallel tool calls, fallback and resume
 
-Beyond the core `run` + `validate`, six features round out the agent: structured
-output, permission profiles, a builtin `shell` tool, an interactive `chat`
-mode, parallel tool calls, and provider fallback. Everything below is configured
-in the same single YAML file.
+Beyond the core `run` + `validate`, seven features round out the agent:
+structured output, permission profiles, a builtin `shell` tool, an interactive
+`chat` mode, parallel tool calls, provider fallback, and resuming an
+interrupted run. Everything below is configured in the same single YAML file.
 
 Exit codes are unchanged and frozen
 ([contract](contracts/exit-codes.md)):
@@ -291,6 +291,52 @@ carriers dropped when a switch crosses wire families, and why a fallback that
 succeeds can mask a broken primary - are in
 [docs/providers.md](providers.md#provider-fallback).
 
+## Resuming a run (`--resume`)
+
+A run that dies in its fourth tool call has already paid for three. `--resume`
+rebuilds the conversation from that run's session log and continues it:
+
+```sh
+amele run agent.yaml --resume sessions/run-20260907T085501Z-4120.jsonl
+amele run agent.yaml --resume sessions/run-20260907T085501Z-4120.jsonl "skip the archive and summarize what you have"
+```
+
+The task comes from the log. Task text given alongside is a follow-up
+**instruction**, appended as the last user message verbatim - the config's
+`prompt` template is not applied to it, and stdin is never read on this path.
+A log whose run already produced a final answer needs such an instruction:
+without one there is nothing to continue and the resume is exit 2.
+
+One config key decides whether a run can be resumed later, and it has to be
+set *before* that run:
+
+```yaml
+limits:
+  max_logged_field: 0   # the whole record, not the 8 KiB-per-field default
+```
+
+Without it the log is clipped, a conversation rebuilt from clipped text is not
+the one the model had, and the resume is refused (exit 2) with a message
+naming that key. A `chat` log, a log with no `run_start`, a damaged file and a
+log whose `output.schema` retry left an unlogged turn are refused the same
+way; a log whose **last** line was torn off by a hard kill is not - the
+history ends at the last complete line, which is the crashed run this feature
+exists for.
+
+**Nothing is re-executed.** A tool call the interrupted run dispatched but
+never logged a result for is not repeated - the log records the request, not
+whether the side effect landed. The model is handed a result saying the call
+was interrupted and decides whether to ask again, and the new run's
+`run_start.resumed_pending` lists those ids so an operator can see which side
+effects are unaccounted for. The resumed run always writes a **new** session
+file (`resumed_from`, `resumed_turn`, `resumed_pending`), never appends to the
+old one, and numbers its turns from 1 again.
+
+`amele chat` has no `--resume`. The refusals, the exact messages and the rules
+for reasoning payloads are in the
+[CLI contract](contracts/cli.md#resuming-a-run---resume-path) and
+[docs/session-logging.md](session-logging.md#resuming-a-run).
+
 ## Session logs
 
 All of the above is recorded when `session_dir` is set (one JSONL file per run
@@ -349,3 +395,9 @@ the run stays where it started. Each switch itself is one `provider_fallback`
 event (`turn`, the redacted `error` that caused it, the 0-based `from`/`to`
 positions in the chain, and both ends' models and identities), and
 `run_end.fallbacks` counts them - absent when there were none.
+
+A run started with `--resume` says so on its `run_start`: `resumed_from` names
+the log it continued (redacted like every other field, but never clipped),
+`resumed_turn` the highest turn that log carried, and `resumed_pending` the
+tool calls it left unanswered. All three are absent from an ordinary run's
+log.

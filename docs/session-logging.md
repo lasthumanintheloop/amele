@@ -1,9 +1,10 @@
 # Session logging and secret redaction
 
 When `session_dir` is set, every run appends a JSONL event log (one file per
-run). The log doubles as the observability trail and the future replay/resume
-source, so it records the full conversation: task, assistant text, tool calls
-and results, token accounting.
+run). The log doubles as the observability trail and the resume source -
+`amele run --resume` reads it back and continues the run it recorded - so it
+records the full conversation: task, assistant text, tool calls and results,
+token accounting.
 
 ## Reading what a tool did
 
@@ -76,3 +77,56 @@ workspace: data          # relative to the config file - no interpolation
 ```
 
 Reserve `${VAR}` interpolation for values that actually are secrets.
+
+## Resuming a run
+
+`amele run agent.yaml --resume <log> [instruction]` rebuilds the conversation
+a session log recorded and carries on from it, so a run that died three tool
+calls in does not pay for those turns again. The full rules - what is refused,
+and with which message - are in the
+[CLI contract](contracts/cli.md#resuming-a-run---resume-path); what matters
+here is what the *logging* config has to say for a log to be resumable at all.
+
+**`limits.max_logged_field: 0` is the prerequisite.** By default every
+free-text field is clipped to 8 KiB, and a conversation rebuilt from clipped
+text is not the conversation the model had - so a log carrying the clip marker
+in a field the history needs is refused (exit 2) rather than silently resumed
+from, and the message names the key:
+
+```
+session log is clipped: result in turn 3 ends in the clip marker; write the log with limits.max_logged_field: 0 to make it resumable
+```
+
+Decide this before the run, not after it: nothing can put back bytes the log
+never stored.
+
+```yaml
+limits:
+  max_logged_field: 0   # the whole record, so the run can be resumed
+```
+
+**`log_reasoning: true` is what keeps a reasoning payload replayable.**
+Without it the resumed conversation is carrier-less - every provider accepts
+that, the turn is simply replayed without its thinking - and with it the
+payloads go back verbatim, but only when the log's `run_start.provider` is
+still the current config's provider and the old run never fell back to another
+backend: a provider signs or hash-checks its own reasoning bytes. Remember
+what the key persists (see the caveat above and
+[docs/deployment.md](deployment.md) §4): a reasoning trace is where a model
+paraphrases, and redaction works by value.
+
+**Redaction is not a fidelity gate.** A `[REDACTED]` inside a logged tool
+result is replayed to the model exactly as it stands, because that is the text
+the run being continued was reading - resuming shows the model nothing it was
+not already shown. The one exception is a reasoning carrier: a payload
+containing `[REDACTED]` is no longer the bytes the provider signed, so it is
+dropped instead of echoed back.
+
+**The resumed run writes its own file.** The log named by `--resume` is opened
+read-only and never appended to, turn numbering starts at 1 again, and the new
+file's `run_start` carries `resumed_from`, `resumed_turn` and (when the old
+run was killed mid-tool-call) `resumed_pending` - the call ids whose results
+never reached the log, which nothing re-executed. `resumed_from` is the one
+logged field that is redacted but never clipped, so a secret value inside the
+path is replaced there too and the logged string is then no longer the path to
+feed back to `--resume`.

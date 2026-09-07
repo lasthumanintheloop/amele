@@ -303,6 +303,30 @@ the same denied tool again. Only 1, 3, 5 and 6 are per-item. `xargs` itself
 stops on a child that exits 255, so a wrapper that wants "abort the whole
 fan-out on a config error" can spell that verdict `exit 255` instead of `78`.
 
+**Retry an item by resuming its own log.** Exit 5 is the requeue case above,
+and the cheapest requeue is not a fresh run: that item's session file already
+holds the turns that succeeded, so `--resume` can continue the conversation
+instead of buying it again.
+
+```sh
+amele run agent.yaml -q --set "session_dir=out/$item" \
+  --resume "$(ls -1 "out/$item"/run-*.jsonl | tail -n 1)" \
+  > "out/$item.json"
+```
+
+One condition, two consequences. The log must be a full record
+(`limits.max_logged_field: 0`, the combination below) or the resume is refused
+with exit 2 naming that key - decide it before the batch runs, not after it
+fails. No tool call is ever re-executed: a call the interrupted run dispatched
+but never logged a result for is answered with a message telling the model the
+outcome is unknown, and the new run's `run_start.resumed_pending` lists those
+ids, which is the list to reconcile by hand when the tools had side effects.
+And the retry writes a **new** file into the same directory rather than
+appending to the old one, so an item that was resumed twice has three logs in
+timestamp order, each naming its predecessor in `resumed_from` - which is why
+the `ls | tail -n 1` above picks the newest. Full rules:
+[CLI contract](contracts/cli.md#resuming-a-run---resume-path).
+
 **The full-record combination.** When a batch exists to be audited afterwards -
 an evaluation set, a regression sweep, a disputed decision - two config keys
 turn each session file into the complete record:
@@ -314,8 +338,9 @@ limits:
 log_reasoning: true     # the model's reasoning payload, not just its size
 ```
 
-Both are deliberate, and the second one is a **data-governance decision, not a
-verbosity setting**. Redaction still runs unconditionally - `${VAR}` values are
+The first is also what makes a run **resumable** at all, which is the second
+reason to set it on a batch that costs real money. Both are deliberate, and
+the second key is a **data-governance decision, not a verbosity setting**. Redaction still runs unconditionally - `${VAR}` values are
 replaced by value before anything is written, whatever the bound - but
 redaction is by value, and a reasoning trace is where a model *paraphrases*:
 "the key starts with sk-live and ends in 7f" survives a redactor that is

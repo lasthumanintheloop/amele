@@ -345,6 +345,22 @@ there is no trail at all (`amele explain` warns about this), and session
 write failures - a full disk - are deliberately silent rather than
 run-fatal, so the trail can degrade without signal (§5.6).
 
+The trail became an *input* as well when `--resume` shipped, and that
+direction moves no boundary. A session log is operator-owned - amele wrote it,
+`0600`, in the directory the trusted YAML named - and `--resume` treats it
+strictly as **data**: it parses JSON, executes nothing from the file, and
+re-runs no tool call. The tool results it replays are the same model-facing
+text the model already read, so resuming shows the model nothing it was not
+shown before; a call whose result never reached the log is answered with "the
+previous run was interrupted", never repeated, because the log records that a
+call was *requested*, not whether its side effect landed. Capability still
+comes from the current config alone - a log carries no system prompt, no tool
+definition and no permission - so resuming a log against a config can never
+grant more than running that config already would. The residual risk is the
+ordinary one of §1: a log an attacker could rewrite is text in the model's
+context, exactly like the tool output it was made of, and the filesystem
+permissions on `session_dir` are what keep it the operator's.
+
 ### 4.10 Quiet hardenings
 
 Smaller mechanisms that close specific injection avenues:

@@ -298,9 +298,19 @@ Direction, not dates. Details and discussion live in
   `reasoning` setting (effort / thinking budget) that survives tool loops
   across OpenAI, Anthropic, DeepSeek, GLM, Kimi, Groq and OpenRouter
   ([docs/providers.md](docs/providers.md)); configurable retry policy.
-- **v0.3 - cheap and durable.** Prompt caching (Anthropic `cache_control`,
-  cache-hit reporting for every dialect); provider fallback; guards against
-  oversized tool results; `--resume` for interrupted runs.
+- **v0.3 - cheap and durable** - **done**: prompt caching (amele places the
+  `cache_control` markers on the anthropic wire, and every dialect's cache
+  hits are reported per turn and per run -
+  [docs/providers.md](docs/providers.md#prompt-caching)); provider fallback -
+  up to four further targets, tried in order after the exit-5 class, sticky
+  once one answers
+  ([docs/features.md](docs/features.md#provider-fallback-providerfallback));
+  a guard against oversized tool results (`limits.max_tool_result_bytes`, one
+  byte cap for every tool family, with the cut recorded in the log -
+  [docs/features.md](docs/features.md#session-logs)); and `--resume`, which
+  rebuilds an interrupted run's conversation from its session log and
+  continues it without re-running a single tool call
+  ([docs/features.md](docs/features.md#resuming-a-run---resume)).
 - **v0.4 - a person at the keyboard.** Streaming output; a nicer `chat`
   (history, multi-line input); default config discovery; `amele doctor`.
 - **v1.0** - not a feature: the contracts have held long enough to promise
