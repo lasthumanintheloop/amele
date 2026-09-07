@@ -1126,8 +1126,12 @@ func TestHelpPageContent(t *testing.T) {
 	tests := []struct {
 		cmd  string
 		want []string
+		// unwanted is what the page must NOT say. A flag another command owns
+		// is the case it exists for: `chat` parses --resume only to refuse it,
+		// so a page that lists it would document an error as a feature.
+		unwanted []string
 	}{
-		{"run", []string{
+		{cmd: "run", want: []string{
 			"--model MODEL", "-h, --help", "-q, --quiet", "-v, --verbose",
 			"--set KEY=VALUE", "-w, --workspace DIR", "--resume PATH", "last entry for a key wins",
 			"amele: turn 3: model requested fs_read",
@@ -1136,34 +1140,34 @@ func TestHelpPageContent(t *testing.T) {
 			"amele run agent.yaml < app.log",
 			"| jq .score",
 		}},
-		{"chat", []string{
+		{cmd: "chat", want: []string{
 			"--model MODEL", "-h, --help", "-q, --quiet", "-v, --verbose",
 			"--set KEY=VALUE", "-w, --workspace DIR",
 			"1 MB", "Ctrl-D", "output.schema is not enforced in chat",
 			"amele chat agent.yaml", "amele chat agent.yaml < script.txt",
-		}},
-		{"validate", []string{
+		}, unwanted: []string{"--resume"}},
+		{cmd: "validate", want: []string{
 			"<config.yaml>: OK", "No network, no tokens, no session file",
 			"amele validate agent.yaml", "--set KEY=VALUE", "-w, --workspace DIR",
 		}},
-		{"explain", []string{
+		{cmd: "explain", want: []string{
 			"tool registry", "WARNINGS", "amele explain agent.yaml",
 			"--set KEY=VALUE", "(overridden via --set)",
 		}},
-		{"schema", []string{
+		{cmd: "schema", want: []string{
 			"config.schema.json", "amele schema > config.schema.json",
 		}},
-		{"init", []string{
+		{cmd: "init", want: []string{
 			"agent.yaml", "never overwritten", "AMELE_API_KEY",
 		}},
-		{"version", []string{
+		{cmd: "version", want: []string{
 			"commit", "built", "amele --version", "amele -V",
 		}},
-		{"completion", []string{
+		{cmd: "completion", want: []string{
 			"bash|zsh|fish", "bash", "zsh", "fish",
 			"amele completion bash > /etc/bash_completion.d/amele",
 		}},
-		{"help", []string{
+		{cmd: "help", want: []string{
 			"amele help run", "amele run --help",
 		}},
 	}
@@ -1173,6 +1177,11 @@ func TestHelpPageContent(t *testing.T) {
 			for _, want := range tt.want {
 				if !strings.Contains(stdout, want) {
 					t.Errorf("page for %q does not mention %q", tt.cmd, want)
+				}
+			}
+			for _, unwanted := range tt.unwanted {
+				if strings.Contains(stdout, unwanted) {
+					t.Errorf("page for %q mentions %q, which this command does not accept", tt.cmd, unwanted)
 				}
 			}
 		})
@@ -5203,6 +5212,9 @@ func TestE2EResumePendingToolCall(t *testing.T) {
 	if code != ExitOK {
 		t.Fatalf("exit %d, stderr: %s", code, stderr)
 	}
+	if len(*reqs) != 1 {
+		t.Fatalf("provider calls = %d, want 1", len(*reqs))
+	}
 	msgs := (*reqs)[0].Messages
 	last := msgs[len(msgs)-1]
 	if last.Role != "tool" || last.ToolCallID != "c9" {
@@ -5211,8 +5223,8 @@ func TestE2EResumePendingToolCall(t *testing.T) {
 	if last.Content != resume.PendingResultMessage {
 		t.Errorf("stand-in tool result = %q, want %q", last.Content, resume.PendingResultMessage)
 	}
-	if !strings.Contains(readSessionRaw(t, filepath.Dir(cfgPath)), `"resumed_pending":["c9"]`) {
-		t.Errorf("run_start does not list the unanswered call:\n%s", readSessionRaw(t, filepath.Dir(cfgPath)))
+	if raw := readSessionRaw(t, filepath.Dir(cfgPath)); !strings.Contains(raw, `"resumed_pending":["c9"]`) {
+		t.Errorf("run_start does not list the unanswered call:\n%s", raw)
 	}
 }
 
@@ -5289,6 +5301,9 @@ func TestE2EResumeCompletedRun(t *testing.T) {
 		if code != ExitOK {
 			t.Fatalf("exit %d, stderr: %s", code, stderr)
 		}
+		if len(*reqs) != 1 {
+			t.Fatalf("provider calls = %d, want 1", len(*reqs))
+		}
 		msgs := (*reqs)[0].Messages
 		last := msgs[len(msgs)-1]
 		if last.Role != "user" || last.Content != "and now summarize" {
@@ -5296,6 +5311,26 @@ func TestE2EResumeCompletedRun(t *testing.T) {
 		}
 		if strings.Contains(lastContent(msgs, "user"), "piped data") {
 			t.Errorf("a resumed run read stdin: %+v", msgs)
+		}
+	})
+
+	t.Run("a whitespace-only instruction is no instruction", func(t *testing.T) {
+		// The refusal is decided on the TRIMMED arguments, the same rule
+		// buildTask applies to a one-shot task: whitespace is not something to
+		// ask a model about, and a run that sent it would buy a round trip
+		// that says nothing. The server is scripted with NO bodies, so any
+		// provider call at all fails this test.
+		srv := scriptedServer(t)
+		cfgB, _ := writeResumeConfig(t, srv.URL, "")
+		code, stdout, stderr := execCLI(t, []string{"run", cfgB, "--resume", logPath, "   "}, "")
+		if code != ExitConfigError {
+			t.Fatalf("exit %d, want %d; stderr: %s", code, ExitConfigError, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("a refused resume wrote to stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "run already produced a final answer; pass an instruction to continue") {
+			t.Errorf("stderr = %q, want the instruction-needed refusal", stderr)
 		}
 	})
 }

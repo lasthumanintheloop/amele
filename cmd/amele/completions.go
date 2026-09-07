@@ -47,6 +47,12 @@ _amele_complete() {
 		--set|--model|-w|--workspace)
 			return 0
 			;;
+		--resume)
+			# This one names a session log, so hand the slot to the file
+			# completer rather than offering the flag list where a path goes.
+			COMPREPLY=( $(compgen -f -- "$cur") )
+			return 0
+			;;
 	esac
 
 	case "$cmd" in
@@ -55,7 +61,12 @@ _amele_complete() {
 				COMPREPLY=( $(_amele_yaml_files "$cur") )
 				return 0
 			fi
-			COMPREPLY=( $(compgen -W "$agent_flags" -- "$cur") )
+			# The two commands share every flag but one. --resume is offered
+			# here alone, because the other command parses it only to refuse
+			# it - completing it there would advertise an error as a feature.
+			local flags="$agent_flags"
+			[[ "$cmd" == run ]] && flags="$flags --resume"
+			COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
 			;;
 		validate|explain)
 			if [[ $COMP_CWORD -eq 2 ]]; then
@@ -151,7 +162,13 @@ _amele() {
 				# zsh, so no config file matched. Repeated -g accumulate.
 				_files -g '*.yaml' -g '*.yml'
 			else
-				_describe 'flag' agent_flags
+				# The two commands share every flag but one. --resume is
+				# offered here alone, because the other command parses it only
+				# to refuse it.
+				local -a flags
+				flags=("${agent_flags[@]}")
+				[[ "$cmd" == run ]] && flags+=('--resume')
+				_describe 'flag' flags
 			fi
 			;;
 		validate|explain)
@@ -231,6 +248,7 @@ complete -c amele -n "__fish_seen_subcommand_from run chat validate explain" -l 
 complete -c amele -n "__fish_seen_subcommand_from run chat validate explain" -s w -l workspace -d "Shortcut for --set workspace=DIR"
 complete -c amele -n "__fish_seen_subcommand_from run chat" -s q -l quiet -d "Suppress the summary line and non-error notes"
 complete -c amele -n "__fish_seen_subcommand_from run chat" -s v -l verbose -d "Print a progress line per loop event to stderr"
+complete -c amele -n "__fish_seen_subcommand_from run" -l resume -r -d "Continue the run recorded in this session log"
 complete -c amele -n "__fish_seen_subcommand_from $amele_commands" -s h -l help -d "Print the detailed help page"
 
 complete -c amele -n "__fish_seen_subcommand_from init" -a "(__fish_complete_suffix .yaml)"

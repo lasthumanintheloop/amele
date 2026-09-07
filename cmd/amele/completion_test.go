@@ -200,3 +200,46 @@ func TestFishConfigSlotIsPositionScoped(t *testing.T) {
 		t.Error("fish completion does not scope config-path completions to the config argument position")
 	}
 }
+
+// TestCompletionResumeIsRunOnly: --resume is registered on both agent
+// commands so `chat --resume x` can be answered with what is actually wrong
+// (cmdChat refuses it), but completing it under `chat` would advertise that
+// error as a feature. Every shell must therefore offer it for `run` alone.
+//
+// The assertion is per LINE rather than on a whole script: a completion rule
+// names its command on the same line as the flag it offers, in all three
+// shells, so "a line that mentions resume must not mention chat" is the shape
+// of the claim. Comments are skipped - they explain the rule, they are not it.
+func TestCompletionResumeIsRunOnly(t *testing.T) {
+	for _, shell := range completionShellsUnderTest {
+		t.Run(shell, func(t *testing.T) {
+			_, script, _ := execCLI(t, []string{"completion", shell}, "")
+			var offered bool
+			for _, line := range strings.Split(script, "\n") {
+				if strings.HasPrefix(strings.TrimSpace(line), "#") || !strings.Contains(line, "resume") {
+					continue
+				}
+				offered = true
+				if strings.Contains(line, "chat") {
+					t.Errorf("%s offers --resume where chat is completed too: %s", shell, line)
+				}
+			}
+			if !offered {
+				t.Errorf("%s script never offers --resume", shell)
+			}
+		})
+	}
+}
+
+// TestCompletionResumeTakesAnArgument: the flag's value is a session log
+// path. A completer that offered the flag list again after --resume would
+// suggest another flag where a file belongs.
+func TestCompletionResumeTakesAnArgument(t *testing.T) {
+	_, bashScript, _ := execCLI(t, []string{"completion", "bash"}, "")
+	if !strings.Contains(bashScript, "--resume)") {
+		t.Error("bash script has no case arm for the value that follows --resume")
+	}
+	if !strings.Contains(completionFish, `-l resume -r `) {
+		t.Error("fish script does not mark --resume as requiring an argument (-r)")
+	}
+}
