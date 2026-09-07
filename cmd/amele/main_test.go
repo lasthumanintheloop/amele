@@ -155,6 +155,8 @@ func env(t *testing.T) func(string) (string, bool) {
 			return "sk-test-secret-key", true
 		case "DB_PASSWORD":
 			return testInterpolatedValue, true
+		case "FALLBACK_KEY":
+			return testBackupValue, true
 		}
 		return "", false
 	}
@@ -2564,9 +2566,9 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	for _, typ := range []string{"", config.ProviderTypeOpenAI} {
 		cfg := &config.Config{Provider: pc}
 		cfg.Provider.Type = typ
-		provider, err := buildProvider(cfg, nil)
+		provider, err := buildProviderFrom(&cfg.Provider, nil)
 		if err != nil {
-			t.Fatalf("type %q: buildProvider: %v", typ, err)
+			t.Fatalf("type %q: buildProviderFrom: %v", typ, err)
 		}
 		client, ok := provider.(*llm.OpenAIClient)
 		if !ok {
@@ -2581,9 +2583,9 @@ func TestBuildProviderSelectsByType(t *testing.T) {
 	cfg.Provider.Type = config.ProviderTypeAnthropic
 	// A dialect is inert on this wire: it must not fail the construction.
 	cfg.Provider.Dialect = "deepseek"
-	provider, err := buildProvider(cfg, nil)
+	provider, err := buildProviderFrom(&cfg.Provider, nil)
 	if err != nil {
-		t.Fatalf("type anthropic: buildProvider: %v", err)
+		t.Fatalf("type anthropic: buildProviderFrom: %v", err)
 	}
 	client, ok := provider.(*llm.AnthropicClient)
 	if !ok {
@@ -2603,9 +2605,9 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 	base := config.ProviderConfig{BaseURL: "https://x.example.com", APIKey: "k"}
 
 	t.Run("no retry block leaves the client defaults", func(t *testing.T) {
-		openai, err := buildProvider(&config.Config{Provider: base}, nil)
+		openai, err := buildProviderFrom(&base, nil)
 		if err != nil {
-			t.Fatalf("buildProvider: %v", err)
+			t.Fatalf("buildProviderFrom: %v", err)
 		}
 		if c := openai.(*llm.OpenAIClient); c.MaxAttempts != 0 || c.InitialBackoff != 0 {
 			t.Errorf("openai retry knobs: got %d/%v, want the zero values", c.MaxAttempts, c.InitialBackoff)
@@ -2613,9 +2615,9 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 
 		anth := base
 		anth.Type = config.ProviderTypeAnthropic
-		client, err := buildProvider(&config.Config{Provider: anth}, nil)
+		client, err := buildProviderFrom(&anth, nil)
 		if err != nil {
-			t.Fatalf("buildProvider anthropic: %v", err)
+			t.Fatalf("buildProviderFrom anthropic: %v", err)
 		}
 		if c := client.(*llm.AnthropicClient); c.MaxAttempts != 0 || c.InitialBackoff != 0 {
 			t.Errorf("anthropic retry knobs: got %d/%v, want the zero values", c.MaxAttempts, c.InitialBackoff)
@@ -2627,9 +2629,9 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 
 		oaCfg := base
 		oaCfg.Retry = retry
-		openai, err := buildProvider(&config.Config{Provider: oaCfg}, nil)
+		openai, err := buildProviderFrom(&oaCfg, nil)
 		if err != nil {
-			t.Fatalf("buildProvider: %v", err)
+			t.Fatalf("buildProviderFrom: %v", err)
 		}
 		if c := openai.(*llm.OpenAIClient); c.MaxAttempts != 5 || c.InitialBackoff != 250*time.Millisecond {
 			t.Errorf("openai retry knobs not wired: %d/%v", c.MaxAttempts, c.InitialBackoff)
@@ -2638,9 +2640,9 @@ func TestBuildProviderWiresRetry(t *testing.T) {
 		anCfg := base
 		anCfg.Type = config.ProviderTypeAnthropic
 		anCfg.Retry = retry
-		client, err := buildProvider(&config.Config{Provider: anCfg}, nil)
+		client, err := buildProviderFrom(&anCfg, nil)
 		if err != nil {
-			t.Fatalf("buildProvider anthropic: %v", err)
+			t.Fatalf("buildProviderFrom anthropic: %v", err)
 		}
 		if c := client.(*llm.AnthropicClient); c.MaxAttempts != 5 || c.InitialBackoff != 250*time.Millisecond {
 			t.Errorf("anthropic retry knobs not wired: %d/%v", c.MaxAttempts, c.InitialBackoff)
@@ -4261,9 +4263,14 @@ func TestBuildAgentLoopWiring(t *testing.T) {
 		tools         config.ToolsConfig
 		perms         config.Permissions
 		limits        config.Limits
+		provider      *config.ProviderConfig
 		wantParallel  bool
 		wantAuto      bool
 		wantResultCap int
+		// wantIdentity is the primary backend's name; empty means the openai
+		// baseline the default provider block produces.
+		wantIdentity  string
+		wantFallbacks []wantBackend
 	}{
 		{name: "default", wantParallel: true, wantAuto: true},
 		{name: "opted out", tools: config.ToolsConfig{Parallel: &parallelOff}, wantParallel: false, wantAuto: true},
@@ -4283,16 +4290,38 @@ func TestBuildAgentLoopWiring(t *testing.T) {
 			limits:       config.Limits{MaxToolResultBytes: &capBytes},
 			wantParallel: true, wantAuto: true, wantResultCap: capBytes,
 		},
+		{
+			// The chain the run cannot re-derive either: a fallback entry is a
+			// whole target of its own, so the loop must receive a BUILT client,
+			// its own model and its own identity - a switch onto an entry
+			// carrying none of those would nil-panic mid-run, at the exact
+			// moment the operator was relying on it.
+			name: "one anthropic fallback",
+			provider: &config.ProviderConfig{
+				BaseURL: "https://api.example.com/v1", APIKey: "k",
+				Fallback: []config.FallbackTarget{{
+					Model:          "claude-backup",
+					ProviderConfig: config.ProviderConfig{Type: config.ProviderTypeAnthropic, APIKey: "k2"},
+				}},
+			},
+			wantParallel: true, wantAuto: true,
+			wantIdentity:  "openai",
+			wantFallbacks: []wantBackend{{model: "claude-backup", identity: "anthropic"}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			provider := config.ProviderConfig{BaseURL: "https://api.example.com/v1", APIKey: "k"}
+			if tt.provider != nil {
+				provider = *tt.provider
+			}
 			cfg := &config.Config{
 				Model:       "m",
 				Workspace:   t.TempDir(),
 				Tools:       tt.tools,
 				Permissions: tt.perms,
 				Limits:      tt.limits,
-				Provider:    config.ProviderConfig{BaseURL: "https://api.example.com/v1", APIKey: "k"},
+				Provider:    provider,
 			}
 			agent, _, _, err := buildAgent(cfg, nil, newLineReader(strings.NewReader("")), io.Discard, nil, false)
 			if err != nil {
@@ -4310,8 +4339,39 @@ func TestBuildAgentLoopWiring(t *testing.T) {
 			if got := agent.AutoApprove(llm.ToolCall{Name: "fs_read"}); got != tt.wantAuto {
 				t.Errorf("AutoApprove(fs_read) = %v, want %v", got, tt.wantAuto)
 			}
+			wantIdentity := tt.wantIdentity
+			if wantIdentity == "" {
+				wantIdentity = "openai"
+			}
+			if agent.Identity != wantIdentity {
+				t.Errorf("Identity = %q, want %q", agent.Identity, wantIdentity)
+			}
+			if len(agent.Fallbacks) != len(tt.wantFallbacks) {
+				t.Fatalf("Fallbacks = %d entries, want %d", len(agent.Fallbacks), len(tt.wantFallbacks))
+			}
+			for i, want := range tt.wantFallbacks {
+				got := agent.Fallbacks[i]
+				if got.Provider == nil {
+					t.Errorf("Fallbacks[%d] carries no client: the switch onto it would nil-panic", i)
+				}
+				if got.Model != want.model {
+					t.Errorf("Fallbacks[%d].Model = %q, want %q", i, got.Model, want.model)
+				}
+				if got.Identity != want.identity {
+					t.Errorf("Fallbacks[%d].Identity = %q, want %q", i, got.Identity, want.identity)
+				}
+			}
 		})
 	}
+}
+
+// wantBackend is the readable half of a built fallback backend: the model the
+// entry names and the identity it reports. The client itself is only checked
+// for being there at all - which client type a target builds is
+// TestBuildProviderSelectsByType's subject, not this one's.
+type wantBackend struct {
+	model    string
+	identity string
 }
 
 // textBodyWithReasoning is textBody plus a reasoning payload on the assistant
@@ -4726,3 +4786,167 @@ func TestBuildRegistryToolResultCap(t *testing.T) {
 // ptrTo is the address-of helper the config's optional-int fields need in
 // table literals, where a plain `&4096` is not legal Go.
 func ptrTo[T any](v T) *T { return &v }
+
+// The provider-fallback e2e block. The chain is wired in cmd (buildAgent
+// builds one client per target) and enforced in the loop, so only a run that
+// crosses both layers can prove that a failing primary actually ends in the
+// backup's answer on stdout.
+
+// testBackupValue is the credential the FALLBACK entry interpolates. It is a
+// distinctive, non-key-shaped string so a redaction test can grep the whole
+// session file for it, and deliberately different from the primary's key: a
+// log that redacted only the primary's would still leak this one. Named around
+// the backup rather than around what it is so gosec's G101 name heuristic does
+// not read a test fixture as a checked-in credential.
+const testBackupValue = "only-the-backup-target-knows-this"
+
+// failingProviderServer answers every request with 500, which is what the
+// clients classify as a retryable provider failure - so after the target's own
+// retries the loop sees llm.ErrProvider, the one error the chain moves on.
+func failingProviderServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream is down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// backupProviderServer answers with a normal completion whose text quotes the
+// Authorization header it received. Echoing the credential back is the point:
+// it puts the fallback entry's own key into model output, the exact path a
+// session log must scrub, so the redaction case tests the registry rather than
+// a value nobody ever wrote down.
+func backupProviderServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(textBody("from the backup, authorized with " + r.Header.Get("Authorization"))))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// writeFallbackConfig renders a config whose primary talks to primaryURL and
+// whose single fallback entry talks to backupURL under its own model and its
+// own credential.
+//
+// Both targets set retry.max_attempts: 1. A test must not pay the client's
+// backoff to reach the failover, and one attempt is also the honest shape of
+// the assertion: the chain moves only AFTER a target's own retries, so a run
+// that retried would prove the same thing more slowly.
+func writeFallbackConfig(t *testing.T, primaryURL, backupURL string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	yaml := fmt.Sprintf(`
+model: test-model
+provider:
+  base_url: %s/v1
+  api_key: ${TEST_KEY}
+  retry:
+    max_attempts: 1
+  fallback:
+    - model: backup-model
+      base_url: %s/v1
+      api_key: ${FALLBACK_KEY}
+      retry:
+        max_attempts: 1
+system_prompt: "You are a test agent."
+session_dir: sessions
+`, primaryURL, backupURL)
+	path := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, dir
+}
+
+// TestE2EProviderFallback drives the whole chain: a dead primary, a live
+// backup, and the log that has to explain what happened.
+func TestE2EProviderFallback(t *testing.T) {
+	t.Run("the backup answers", func(t *testing.T) {
+		cfgPath, dir := writeFallbackConfig(t, failingProviderServer(t).URL, backupProviderServer(t).URL)
+
+		code, stdout, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		if !strings.Contains(stdout, "from the backup") {
+			t.Errorf("stdout does not carry the backup's answer: %q", stdout)
+		}
+		raw := readSessionRaw(t, dir)
+		if !strings.Contains(raw, `"type":"provider_fallback"`) || !strings.Contains(raw, `"from":0,"to":1`) {
+			t.Errorf("the log does not record the move from the primary to entry 1:\n%s", raw)
+		}
+		// The answer must be attributed to the model that actually produced
+		// it, not to the `model` key run_start announced.
+		if !strings.Contains(raw, `"model":"backup-model"`) {
+			t.Errorf("llm_response is not attributed to the backup's model:\n%s", raw)
+		}
+		if !strings.Contains(raw, `"fallbacks":1`) {
+			t.Errorf("run_end does not count the switch:\n%s", raw)
+		}
+		if !strings.Contains(stderr, "tokens") {
+			t.Errorf("the run summary is missing: %q", stderr)
+		}
+	})
+
+	t.Run("every target fails", func(t *testing.T) {
+		cfgPath, dir := writeFallbackConfig(t, failingProviderServer(t).URL, failingProviderServer(t).URL)
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
+		// CONTRACT: an exhausted chain is still a provider failure - exit 5,
+		// the code that tells a cron job to try again later.
+		if code != ExitProviderError {
+			t.Fatalf("exit %d, want %d; stderr: %s", code, ExitProviderError, stderr)
+		}
+		raw := readSessionRaw(t, dir)
+		if !strings.Contains(raw, `"fallbacks":1`) {
+			t.Errorf("run_end must still count the switch it made:\n%s", raw)
+		}
+		if !strings.Contains(raw, `"status":"error"`) {
+			t.Errorf("run_end is not an error:\n%s", raw)
+		}
+	})
+
+	// SECURITY: a fallback's credential is a credential. The backup echoes its
+	// own Authorization header into the answer, so the value travels through
+	// model output into the log - and must arrive redacted.
+	t.Run("the backup's key never reaches the log", func(t *testing.T) {
+		cfgPath, dir := writeFallbackConfig(t, failingProviderServer(t).URL, backupProviderServer(t).URL)
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		raw := readSessionRaw(t, dir)
+		if strings.Contains(raw, testBackupValue) {
+			t.Errorf("the fallback's key reached the session file:\n%s", raw)
+		}
+		if !strings.Contains(raw, "[REDACTED]") {
+			t.Errorf("the echoed header was not redacted at all, so the test proved nothing:\n%s", raw)
+		}
+	})
+}
+
+// TestAgentSecretsCoversEveryFallbackTarget: the run's starting secret list
+// must hold every target's key, not just the primary's. The interpolation
+// registry already covers ${VAR} keys; this pins the LITERAL case, which is
+// exactly why the primary's own key is registered separately too.
+func TestAgentSecretsCoversEveryFallbackTarget(t *testing.T) {
+	cfg := &config.Config{
+		Model: "m",
+		Provider: config.ProviderConfig{
+			APIKey: "primary-literal-value",
+			Fallback: []config.FallbackTarget{
+				{Model: "b1", ProviderConfig: config.ProviderConfig{APIKey: "backup-one-literal-value"}},
+				{Model: "b2", ProviderConfig: config.ProviderConfig{APIKey: "backup-two-literal-value"}},
+			},
+		},
+	}
+	got := agentSecrets(cfg)
+	for _, want := range []string{"primary-literal-value", "backup-one-literal-value", "backup-two-literal-value"} {
+		if !slices.Contains(got, want) {
+			t.Errorf("agentSecrets() = %q, want it to contain %q", got, want)
+		}
+	}
+}

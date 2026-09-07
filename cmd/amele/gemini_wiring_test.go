@@ -95,9 +95,9 @@ func TestBuildProviderSelectsGemini(t *testing.T) {
 		MaxOutputTokens: 256,
 	}
 
-	provider, err := buildProvider(&config.Config{Model: "m", Provider: pc}, nil)
+	provider, err := buildProviderFrom(&pc, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	client, ok := provider.(*llm.GeminiClient)
 	if !ok {
@@ -114,9 +114,9 @@ func TestBuildProviderSelectsGemini(t *testing.T) {
 func TestBuildProviderGeminiWiresRetry(t *testing.T) {
 	base := config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}
 
-	provider, err := buildProvider(&config.Config{Provider: base}, nil)
+	provider, err := buildProviderFrom(&base, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	if c := provider.(*llm.GeminiClient); c.MaxAttempts != 0 || c.InitialBackoff != 0 {
 		t.Errorf("gemini retry knobs: got %d/%v, want the zero values", c.MaxAttempts, c.InitialBackoff)
@@ -124,9 +124,9 @@ func TestBuildProviderGeminiWiresRetry(t *testing.T) {
 
 	tuned := base
 	tuned.Retry = &config.RetryConfig{MaxAttempts: 5, InitialBackoff: config.Duration(250 * time.Millisecond)}
-	provider, err = buildProvider(&config.Config{Provider: tuned}, nil)
+	provider, err = buildProviderFrom(&tuned, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	if c := provider.(*llm.GeminiClient); c.MaxAttempts != 5 || c.InitialBackoff != 250*time.Millisecond {
 		t.Errorf("gemini retry knobs not wired: %d/%v", c.MaxAttempts, c.InitialBackoff)
@@ -177,13 +177,13 @@ func TestVertexConfigReachesTheVertexEndpoint(t *testing.T) {
 		//nolint:gosec // G101: a service-account key PATH, not a credential.
 		Vertex: &config.VertexConfig{Project: "my-project", Location: "europe-west4", Credentials: "/etc/amele/sa.json"},
 	}}
-	provider, err := buildProvider(cfg, nil)
+	provider, err := buildProviderFrom(&cfg.Provider, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	client, ok := provider.(*llm.GeminiClient)
 	if !ok {
-		t.Fatalf("buildProvider returned %T, want *llm.GeminiClient", provider)
+		t.Fatalf("buildProviderFrom returned %T, want *llm.GeminiClient", provider)
 	}
 	if client.Vertex == nil {
 		t.Fatal("the vertex block did not reach the client")
@@ -194,9 +194,9 @@ func TestVertexConfigReachesTheVertexEndpoint(t *testing.T) {
 
 	// A config without the block keeps the AI Studio backend.
 	plain := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}}
-	provider, err = buildProvider(plain, nil)
+	provider, err = buildProviderFrom(&plain.Provider, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	if c := provider.(*llm.GeminiClient); c.Vertex != nil {
 		t.Errorf("a keyed gemini config became a vertex client: %+v", c.Vertex)
@@ -434,13 +434,13 @@ func TestVertexTokenSourceIsWiredAndItsTokenRedacted(t *testing.T) {
 	}}
 	secrets := session.NewSecretSet(agentSecrets(cfg))
 
-	provider, err := buildProvider(cfg, secrets.Add)
+	provider, err := buildProviderFrom(&cfg.Provider, secrets.Add)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	client, ok := provider.(*llm.GeminiClient)
 	if !ok {
-		t.Fatalf("buildProvider returned %T, want *llm.GeminiClient", provider)
+		t.Fatalf("buildProviderFrom returned %T, want *llm.GeminiClient", provider)
 	}
 	if client.TokenSource == nil {
 		t.Fatal("a vertex config produced no token source")
@@ -478,9 +478,9 @@ func TestVertexTokenSourceIsWiredAndItsTokenRedacted(t *testing.T) {
 // endpoint that authenticates with x-goog-api-key.
 func TestAIStudioConfigGetsNoTokenSource(t *testing.T) {
 	cfg := &config.Config{Provider: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k"}}
-	provider, err := buildProvider(cfg, nil)
+	provider, err := buildProviderFrom(&cfg.Provider, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	if ts := provider.(*llm.GeminiClient).TokenSource; ts != nil {
 		t.Errorf("an AI Studio config carries a token source: %#v", ts)
@@ -497,9 +497,9 @@ func TestVertexCredentialsFileReachesTheTokenSource(t *testing.T) {
 		Type:   config.ProviderTypeGemini,
 		Vertex: &config.VertexConfig{Project: "p", Location: "us-central1", Credentials: path},
 	}}
-	provider, err := buildProvider(cfg, nil)
+	provider, err := buildProviderFrom(&cfg.Provider, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	source, ok := provider.(*llm.GeminiClient).TokenSource.(*llm.GoogleTokenSource)
 	if !ok {

@@ -91,15 +91,15 @@ func TestProviderTuning(t *testing.T) {
 			cfg := &config.Config{Model: "m"}
 			tt.mutate(cfg)
 
-			got, err := providerTuning(cfg)
+			got, err := providerTuningFrom(&cfg.Provider)
 			if tt.wantErr {
 				if err == nil {
-					t.Fatalf("providerTuning = %+v, want an error", got)
+					t.Fatalf("providerTuningFrom = %+v, want an error", got)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("providerTuning: %v", err)
+				t.Fatalf("providerTuningFrom: %v", err)
 			}
 			want := tt.want()
 			if got.MaxOutputTokens != want.maxOutputTokens {
@@ -135,9 +135,9 @@ func TestBuildProviderDialect(t *testing.T) {
 	cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
 		BaseURL: "https://api.deepseek.com", Dialect: "deepseek",
 	}}
-	provider, err := buildProvider(cfg, nil)
+	provider, err := buildProviderFrom(&cfg.Provider, nil)
 	if err != nil {
-		t.Fatalf("buildProvider: %v", err)
+		t.Fatalf("buildProviderFrom: %v", err)
 	}
 	client, ok := provider.(*llm.OpenAIClient)
 	if !ok {
@@ -168,9 +168,9 @@ func TestBuildProviderPromptCache(t *testing.T) {
 			cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
 				Type: config.ProviderTypeAnthropic, PromptCache: tc.value,
 			}}
-			provider, err := buildProvider(cfg, nil)
+			provider, err := buildProviderFrom(&cfg.Provider, nil)
 			if err != nil {
-				t.Fatalf("buildProvider: %v", err)
+				t.Fatalf("buildProviderFrom: %v", err)
 			}
 			client, ok := provider.(*llm.AnthropicClient)
 			if !ok {
@@ -195,7 +195,7 @@ func TestBuildProviderRejectsUnknownDialect(t *testing.T) {
 	cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
 		BaseURL: "https://example.test/v1", Dialect: "gemini",
 	}}
-	if _, err := buildProvider(cfg, nil); err == nil {
+	if _, err := buildProviderFrom(&cfg.Provider, nil); err == nil {
 		t.Fatal("an unknown dialect must be an error, not a silent openai fallback")
 	}
 }

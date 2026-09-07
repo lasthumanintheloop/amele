@@ -1989,7 +1989,8 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 		Status: status, ExitCode: code,
 		Turns: res.Turns, ToolCalls: res.ToolCalls,
 		TotalTokens: res.Usage.Total(), CacheReadTokens: res.Usage.CacheReadTokens,
-		Duration: res.Duration,
+		Fallbacks: res.Fallbacks,
+		Duration:  res.Duration,
 	})
 	if quiet {
 		return
@@ -2300,8 +2301,14 @@ type chatSession struct {
 	// cached is the cumulative prompt-cache read count across the session's
 	// exchanges. It is a subset of tokens, tracked separately only so the
 	// summary and run_end can report what the cache saved.
-	cached   int
-	duration time.Duration
+	cached int
+	// fallbacks is the cumulative count of provider switches across the
+	// session's exchanges. Each exchange reports only the switches IT made,
+	// and the loop's position is sticky across them (loop.Loop.active), so the
+	// sum is the number of moves the conversation made down the chain - which
+	// is what run_end reports, like every other number here.
+	fallbacks int
+	duration  time.Duration
 }
 
 // repl drives the conversation until EOF, an error, or an exhausted budget,
@@ -2379,6 +2386,7 @@ func (s *chatSession) nextTurn(ctx context.Context, line string) (string, error)
 	s.toolCalls += res.ToolCalls
 	s.tokens += res.Usage.Total()
 	s.cached += res.Usage.CacheReadTokens
+	s.fallbacks += res.Fallbacks
 	s.duration += res.Duration
 	if err != nil {
 		return "", err
@@ -2444,7 +2452,8 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 		Status: status, ExitCode: code,
 		Turns: s.turns, ToolCalls: s.toolCalls,
 		TotalTokens: s.tokens, CacheReadTokens: s.cached,
-		Duration: s.duration,
+		Fallbacks: s.fallbacks,
+		Duration:  s.duration,
 	})
 	if !s.quiet {
 		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, s.turns, s.toolCalls, s.tokens, s.cached, s.duration))
@@ -2548,6 +2557,16 @@ func (l *lineReader) ReadLine() (string, error) {
 // token) are registered on the same live set through runSecrets below.
 func agentSecrets(cfg *config.Config) []string {
 	secrets := append(cfg.InterpolatedSecrets(), cfg.Provider.APIKey)
+	// SECURITY: a fallback's credential is a credential. Every entry of the
+	// chain is registered even though the run may never reach it: the list is
+	// built before the first call, and a target the run DOES switch to would
+	// otherwise echo its own key back through an error body into an
+	// unprotected log. The ${VAR} form is already covered by
+	// InterpolatedSecrets above; this covers the literal, exactly as the
+	// primary's own key is covered on the line above.
+	for i := range cfg.Provider.Fallback {
+		secrets = append(secrets, cfg.Provider.Fallback[i].APIKey)
+	}
 	// An MCP header is a COMPOSED value ("Bearer " + ${TOKEN}): the
 	// environment value alone is already in the list above, but the assembled
 	// header is what a server echoes back in an error, so it is registered as
@@ -2648,11 +2667,15 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		}
 	}
 
-	provider, err := buildProvider(cfg, secrets.Add)
+	provider, err := buildProviderFrom(&cfg.Provider, secrets.Add)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	tuning, err := providerTuning(cfg)
+	tuning, err := providerTuningFrom(&cfg.Provider)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	backends, err := buildFallbacks(cfg, secrets.Add)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2679,6 +2702,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		Identity:           cfg.Provider.Identity(),
 		SystemPrompt:       cfg.SystemPrompt,
 		Tuning:             tuning,
+		Fallbacks:          backends,
 	}
 
 	if validator == nil {
@@ -2709,7 +2733,57 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 	return agent, func(*loop.Result) string { return canonical }, hints, nil
 }
 
-// buildProvider constructs the LLM client selected by provider.type. Validate
+// buildFallbacks builds one backend per provider.fallback entry, in the order
+// the file lists them. Nil for a config without the key, which is what the loop
+// reads as "there is no chain".
+//
+// Every entry is built HERE, before the run starts, rather than lazily at the
+// moment of a switch: a mistyped dialect in the third entry must fail the run
+// while it has cost nothing, not two minutes in when the primary has already
+// gone down and the fallback is the only thing left. That also guarantees the
+// loop never sees a backend with a nil Provider - the one shape that would turn
+// a failover into a panic.
+//
+// registerSecret is the run's live redactor sink, passed to each entry for the
+// same reason the primary gets it: a target that mints a credential (the Vertex
+// path) must register it in the one set every sink reads.
+func buildFallbacks(cfg *config.Config, registerSecret func(...string)) ([]loop.Backend, error) {
+	if len(cfg.Provider.Fallback) == 0 {
+		return nil, nil
+	}
+	backends := make([]loop.Backend, 0, len(cfg.Provider.Fallback))
+	for i := range cfg.Provider.Fallback {
+		entry := &cfg.Provider.Fallback[i]
+		provider, err := buildProviderFrom(&entry.ProviderConfig, registerSecret)
+		if err != nil {
+			return nil, fmt.Errorf("provider.fallback[%d]: %w", i, err)
+		}
+		tuning, err := providerTuningFrom(&entry.ProviderConfig)
+		if err != nil {
+			return nil, fmt.Errorf("provider.fallback[%d]: %w", i, err)
+		}
+		backends = append(backends, loop.Backend{
+			Provider: provider,
+			// The entry's own model, never the top-level one: a backup
+			// endpoint rarely serves the primary's model
+			// (config.FallbackTarget.Model).
+			Model:    entry.Model,
+			Tuning:   tuning,
+			Identity: entry.Identity(),
+		})
+	}
+	return backends, nil
+}
+
+// buildProviderFrom constructs the LLM client selected by ONE target's
+// provider.type - the primary block or one entry of provider.fallback, which
+// is a complete provider block of its own (config.FallbackTarget embeds
+// ProviderConfig). It takes the target rather than the whole config so the
+// chain's entries are built by exactly the code that builds the primary: a
+// backup that got a different client than the file describes would only be
+// discovered during an outage.
+//
+// Validate
 // has already constrained the type, so anything that is neither anthropic nor
 // gemini is the OpenAI-compatible default - including "", which is what every
 // pre-Type config carries.
@@ -2735,24 +2809,24 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 // invocation (runSecrets) and a client that minted credentials into a second
 // one would be writing them into a registry no sink reads. nil is allowed for
 // callers that keep no log; only the Vertex credential path uses it today.
-func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Provider, error) {
-	maxAttempts, initialBackoff := retryPolicy(cfg.Provider.Retry)
-	if cfg.Provider.Type == config.ProviderTypeAnthropic {
+func buildProviderFrom(p *config.ProviderConfig, registerSecret func(...string)) (llm.Provider, error) {
+	maxAttempts, initialBackoff := retryPolicy(p.Retry)
+	if p.Type == config.ProviderTypeAnthropic {
 		// The dialect names a variation of the OpenAI-compatible wire and is
 		// documented as ignored here (config.schema.json), so it is not parsed
 		// on this path: a leftover dialect must not fail a run that never
 		// speaks it.
 		return &llm.AnthropicClient{
-			BaseURL:         cfg.Provider.BaseURL,
-			APIKey:          cfg.Provider.APIKey,
-			RequestTimeout:  cfg.Provider.RequestTimeout.Std(),
+			BaseURL:         p.BaseURL,
+			APIKey:          p.APIKey,
+			RequestTimeout:  p.RequestTimeout.Std(),
 			MaxAttempts:     maxAttempts,
 			InitialBackoff:  initialBackoff,
-			MaxOutputTokens: cfg.Provider.MaxOutputTokens,
-			PromptCache:     promptCacheOn(cfg),
+			MaxOutputTokens: p.MaxOutputTokens,
+			PromptCache:     promptCacheOn(p),
 		}, nil
 	}
-	if cfg.Provider.Type == config.ProviderTypeGemini {
+	if p.Type == config.ProviderTypeGemini {
 		// The dialect is not parsed here either, for a stronger reason than on
 		// the anthropic path: a dialect with type gemini is a validate ERROR
 		// (internal/config.tuningDialect), so this line is unreachable with one
@@ -2764,28 +2838,28 @@ func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Prov
 		// the openai wire. Only the Messages API needs its cap on the client,
 		// because it requires the field on every request.
 		return &llm.GeminiClient{
-			BaseURL: cfg.Provider.BaseURL,
-			APIKey:  cfg.Provider.APIKey,
+			BaseURL: p.BaseURL,
+			APIKey:  p.APIKey,
 			// The vertex block travels as the client's target so the request is
 			// addressed to the endpoint the config names, and as the credential
 			// source that authenticates it. Both are nil without the block,
 			// which is what keeps the AI Studio path a keyed one.
-			Vertex:         vertexTarget(cfg.Provider.Vertex),
-			TokenSource:    vertexTokenSource(cfg.Provider.Vertex, registerSecret),
-			RequestTimeout: cfg.Provider.RequestTimeout.Std(),
+			Vertex:         vertexTarget(p.Vertex),
+			TokenSource:    vertexTokenSource(p.Vertex, registerSecret),
+			RequestTimeout: p.RequestTimeout.Std(),
 			MaxAttempts:    maxAttempts,
 			InitialBackoff: initialBackoff,
 		}, nil
 	}
-	dialect, err := llm.ParseDialect(cfg.Provider.Dialect)
+	dialect, err := llm.ParseDialect(p.Dialect)
 	if err != nil {
 		return nil, fmt.Errorf("provider.dialect: %w", err)
 	}
 	return &llm.OpenAIClient{
-		BaseURL:        cfg.Provider.BaseURL,
-		APIKey:         cfg.Provider.APIKey,
+		BaseURL:        p.BaseURL,
+		APIKey:         p.APIKey,
 		Dialect:        dialect,
-		RequestTimeout: cfg.Provider.RequestTimeout.Std(),
+		RequestTimeout: p.RequestTimeout.Std(),
 		MaxAttempts:    maxAttempts,
 		InitialBackoff: initialBackoff,
 	}, nil
@@ -2798,11 +2872,12 @@ func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Prov
 // this is the single place the distinction is spent: nil and true both ask for
 // the cache_control markers, false asks for the pre-v0.3 request bytes.
 //
-// Called only on the anthropic branch of buildProvider. The other wires cache
-// on their own and validate refuses the key there, so translating it for them
-// would describe a request field neither client writes.
-func promptCacheOn(cfg *config.Config) bool {
-	return cfg.Provider.PromptCache == nil || *cfg.Provider.PromptCache
+// Called only on the anthropic branch of buildProviderFrom, for whichever
+// target that branch is building. The other wires cache on their own and
+// validate refuses the key there, so translating it for them would describe a
+// request field neither client writes.
+func promptCacheOn(p *config.ProviderConfig) bool {
+	return p.PromptCache == nil || *p.PromptCache
 }
 
 // vertexTarget translates the optional provider.vertex block into the client's
@@ -2855,24 +2930,27 @@ func retryPolicy(r *config.RetryConfig) (maxAttempts int, initialBackoff time.Du
 	return r.MaxAttempts, r.InitialBackoff.Std()
 }
 
-// providerTuning translates the config's provider knobs into the neutral
-// request fields the loop forwards on every turn.
+// providerTuningFrom translates ONE target's provider knobs into the neutral
+// request fields the loop forwards on every turn. Each entry of the fallback
+// chain carries its own - a backup on a different vendor needs its own
+// reasoning level and its own params - so the tuning travels with the backend
+// rather than being read off the primary once.
 //
 // CONTRACT: this is the ONE place where provider.params (arbitrary YAML)
 // becomes JSON. Validate already proved the map is serializable and collides
 // with no field amele owns, so a failure here is not reachable through a
 // validated config - it is wrapped rather than ignored because a silently
 // dropped params map would leave the run missing a knob the file asked for.
-func providerTuning(cfg *config.Config) (loop.Tuning, error) {
-	extra, err := paramsJSON(cfg.Provider.Params)
+func providerTuningFrom(p *config.ProviderConfig) (loop.Tuning, error) {
+	extra, err := paramsJSON(p.Params)
 	if err != nil {
 		return loop.Tuning{}, fmt.Errorf("provider.params: %w", err)
 	}
 	return loop.Tuning{
-		MaxOutputTokens: cfg.Provider.MaxOutputTokens,
-		Reasoning:       reasoningSpec(cfg.Provider.Reasoning),
-		Temperature:     cfg.Provider.Temperature,
-		TopP:            cfg.Provider.TopP,
+		MaxOutputTokens: p.MaxOutputTokens,
+		Reasoning:       reasoningSpec(p.Reasoning),
+		Temperature:     p.Temperature,
+		TopP:            p.TopP,
 		Extra:           extra,
 	}, nil
 }
