@@ -25,9 +25,13 @@ The full field list is in
 [docs/contracts/jsonl-events.md](contracts/jsonl-events.md).
 
 There are two different cuts here, and only one of them reaches the model. A
-result that hit the tool-result byte cap is flagged `truncated` and ends in
-`[output truncated by amele]` (`fs_list` appends its entry counts to the same
-marker: `[output truncated by amele: N of M entries shown]`):
+result that hit the tool-result byte cap is flagged `truncated` and carries
+`[output truncated by amele]` in the text - at the end for most cuts, but
+mid-result when framing follows the cut stream (a failed subprocess whose
+stdout was cut renders its `stderr:` section after the marker), so a search
+for the marker is safer than a suffix test (`fs_list` appends its entry
+counts to the same marker: `[output truncated by amele: N of M entries
+shown]`):
 
 ```sh
 jq -r 'select(.type=="tool_result" and .truncated) | .tool' run-*.jsonl
