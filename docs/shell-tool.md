@@ -18,9 +18,16 @@ tools:
 Each call is a fresh shell: `cd`, variables and shell functions do not persist
 between calls. Stdout is returned to the model (capped at 64 KiB per stream,
 or at `limits.max_tool_result_bytes` when the config sets one; a cut result
-ends in `[output truncated by amele]` and is flagged `truncated` in the
+carries `[output truncated by amele]` - at the end, or mid-result when the
+`stderr:` section is rendered after it - and is flagged `truncated` in the
 session log); a non-zero exit is reported with its stderr as a tool result,
 not as a run failure. On timeout the whole process group is terminated.
+
+`limits.max_tool_result_bytes` is one number for both cuts: it caps each stream
+AND the framed result the loop hands back. On a failed command stdout is
+rendered first and can spend the entire budget, so the ceiling may cut the
+`stderr:` section away completely - raise the number when the stderr of a
+failing command is what you are after.
 
 ## Pattern matching
 

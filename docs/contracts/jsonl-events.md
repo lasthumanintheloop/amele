@@ -83,7 +83,7 @@ unknown-tool calls appear in the log too - that is the audit trail.
 | `outcome` | string | How the call ended, from the fixed enum below. Since v0.1.0; absent in logs written before it. |
 | `exit_code` | int | The command's exit status. Present **only** when a subprocess/shell tool actually ran and its status is known - i.e. together with `outcome: nonzero_exit`. A child killed by a signal reports `-1` here (Go's exit status for "died on a signal"), which is still `nonzero_exit`: the command ran, it just has no clean status. Since v0.1.0. |
 | `result_bytes` | int | Byte length of the result text the model read: measured AFTER any tool-result cap (see `truncated`) and BEFORE session clipping - and before redaction, which rewrites lengths. Compare with `result`: the log keeps `limits.max_logged_field` bytes per field (8 KiB unless the config says otherwise) while the model may have read considerably more - the subprocess/shell cap is 64 KiB **per stream** by default, so a failed command's result carries up to 64 KiB of stdout plus 64 KiB of stderr plus the `exit status`/`stdout:`/`stderr:` framing. Setting `limits.max_tool_result_bytes` replaces that number and additionally bounds the framed whole. This field is what makes the log's own loss visible. Absent for an empty result. Since v0.1.0. |
-| `truncated` | bool | Present (`true`) when the result text was cut to the tool-result byte cap before the model saw it - by the tool family's own cap or by `limits.max_tool_result_bytes`. The text ends in `[output truncated by amele]` in that case (fs_list appends its entry counts to the same marker: `[output truncated by amele: N of M entries shown]`); this field is the same fact for readers that do not want to parse it. `result_bytes` is the size AFTER the cut (what the model read). Absent means not cut, or a log written before v1.6. Since v1.6. |
+| `truncated` | bool | Present (`true`) when the result text was cut to the tool-result byte cap before the model saw it - by the tool family's own cap or by `limits.max_tool_result_bytes`. The text carries `[output truncated by amele]` in that case (fs_list appends its entry counts to the same marker: `[output truncated by amele: N of M entries shown]`) - at the end of the result for most cuts, but mid-result where framing follows the cut stream: a failed command whose stdout was cut renders its `stderr:` section after the marker. This field is the same fact for readers that do not want to parse it. `result_bytes` is the size AFTER the cut (what the model read). Absent means not cut, or a log written before v1.6. Since v1.6. |
 
 `truncated` describes the MODEL's copy of the result. The session log's own
 per-field clip (`limits.max_logged_field`, 8 KiB by default, marked in the
@@ -416,9 +416,12 @@ appeared. A run that never truncates writes exactly the bytes v1.5 wrote.
   (`limits.max_logged_field`) shortens what the file stores, after the model
   has read the text, and never sets this field. `result_bytes` is measured
   between the two cuts: after the tool-result cap, before the log clip;
-- the text itself already said so to the model - a truncated result ends in
+- the text itself already said so to the model - a truncated result carries
   `[output truncated by amele]`, and fs_list appends its entry counts to that
-  same marker (`[output truncated by amele: N of M entries shown]`). The field
+  same marker (`[output truncated by amele: N of M entries shown]`). The marker
+  ends the text for most cuts, but a search is safer than a suffix test: on a
+  failed command whose stdout was cut it sits mid-result, with the `stderr:`
+  section rendered after it. The field
   is that fact for a reader that does not want to string-match. The two agree
   in the MODEL's copy; in the FILE they often do not, because a result big
   enough to hit a 64 KiB cap is far past the default 8 KiB `max_logged_field`,

@@ -269,11 +269,13 @@ variables like `${HOME}`: see
 [docs/session-logging.md](session-logging.md).
 
 A `tool_result` whose text was cut before the model read it carries
-`truncated: true`, and the text itself ends in `[output truncated by amele]`
+`truncated: true`, and the text itself contains `[output truncated by amele]`
 (`fs_list` appends its entry counts to the same marker:
-`[output truncated by amele: N of M entries shown]`). The cap is per tool
-family - `fs_read` 256 KiB, subprocess and shell 64 KiB per stream, `fs_list`
-64 KiB of directory entries, MCP 64 KiB - unless
+`[output truncated by amele: N of M entries shown]`) - at the end of the
+result for most cuts, but mid-result where framing follows the cut stream: a
+failed command whose stdout was cut renders its `stderr:` section after the
+marker. The cap is per tool family - `fs_read` 256 KiB, subprocess and shell
+64 KiB per stream, `fs_list` 64 KiB of directory entries, MCP 64 KiB - unless
 `limits.max_tool_result_bytes` sets one number for all of them and for the
 framed result the loop hands back:
 
@@ -281,6 +283,11 @@ framed result the loop hands back:
 limits:
   max_tool_result_bytes: 16384   # every tool family; minimum 1024
 ```
+
+One number covers both cuts, and on a failed command the two compete: stdout is
+rendered first and may spend the whole budget, after which the loop's ceiling
+can cut the `stderr:` section away entirely. Raise the number when a failing
+command's stderr is the part you need.
 
 There is deliberately no unbounded setting - a tool result with no bound is
 the one thing that can spend a whole context window in a single call - so the

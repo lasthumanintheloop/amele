@@ -178,6 +178,7 @@ session log.
   amele: turn 3: model requested fs_read {"path":"app.log"}
   amele: turn 3: fs_read ok (1.2s)
   amele: turn 3: shell exit 3 (0.4s)
+  amele: turn 3: shell exit 1 (0.3s) (truncated)
   amele: turn 3: shell timed out (30.0s)
   amele: turn 3: shell rejected (0.0s)
   amele: turn 3: fs_read error: <message>
@@ -188,12 +189,14 @@ session log.
   the model produced in that turn. A tool call that ran but did not work is
   named as such instead of `ok`: `exit N` (the command failed), `timed out`
   (the tool's own timeout fired), `aborted` (the run ended under the command)
-  and `rejected` (the shell policy refused the command). These are the endings
-  the model receives as ordinary result text - the session log records that
-  text, and the wording of the `-v` line is human-facing, not a parsing
-  contract. Tool names, arguments and tool error text
-  are model-controlled, so before they reach the terminal they are stripped of
-  control and bidi-formatting characters, every value the config interpolated
+  and `rejected` (the shell policy refused the command). A trailing
+  `(truncated)` says the result text was cut to a byte cap before the model
+  read it - the same fact the session log records as `tool_result.truncated`.
+  These are the endings the model receives as ordinary result text - the
+  session log records that text, and the wording of the `-v` line is
+  human-facing, not a parsing contract. Tool names, arguments and tool error
+  text are model-controlled, so before they reach the terminal they are
+  stripped of control and bidi-formatting characters, every value the config interpolated
   from the environment (`${VAR}`, including the API key) is replaced with
   `[REDACTED]` - the same by-value redaction the session log applies, because a
   cron job's stderr is persisted just as durably - and the result is **clipped**
