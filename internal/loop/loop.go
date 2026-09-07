@@ -890,8 +890,11 @@ func (l *Loop) runCall(ctx context.Context, turn int, call llm.ToolCall) callRes
 // reports whether the model's copy of the text is short of what the tool
 // produced - either because the tool said so or because the ceiling cut it.
 //
-// It is a method rather than three lines inside runCall only to keep that
-// function under the cyclomatic budget (docs/engineering.md §5.1).
+// CONTRACT: it is the one place the two cuts are OR-ed. Keeping them together
+// in a named function is what makes it impossible for a path to hand the model
+// clipped text while logging truncated=false, or to carry a tool's own flag
+// while returning the tool's full text: the returned string and the returned
+// flag are decided in the same three lines, for every dispatch path.
 func (l *Loop) capResult(output string, toolTruncated bool) (string, bool) {
 	if l.MaxToolResultBytes <= 0 {
 		return output, toolTruncated

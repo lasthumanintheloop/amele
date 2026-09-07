@@ -2648,8 +2648,13 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		AutoApprove:   perm.AutoApproves(cfg.Permissions),
 		ParallelTools: cfg.Tools.IsParallel(),
 		Limits:        loop.Limits{MaxTurns: cfg.Limits.MaxTurns, MaxTokens: cfg.Limits.MaxTokens},
-		// The last line of defence: tools cap what they produce, this caps
-		// what ANY tool - MCP included - is allowed to put in the transcript.
+		// The last cut before the transcript: each family already caps what
+		// it produces, and this bounds the finished result - after the
+		// family's own cap and after whatever framing it added, which is
+		// what a per-stream cap alone cannot bound. Its reach is the output
+		// of a tool that RAN, MCP included; a dispatch that FAILED is
+		// reported to the model as the loop's own `error: <message>` text
+		// and does not pass through the ceiling (internal/loop.runCall).
 		MaxToolResultBytes: toolResultCap(cfg),
 		Model:              cfg.Model,
 		SystemPrompt:       cfg.SystemPrompt,
