@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.5). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.6). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -157,6 +157,17 @@ Within a frozen version, changes must be additive and backwards-compatible:
   (cli.md); `log_reasoning` and `print_session_path` are deliberately NOT
   settable - what a run persists is a data-governance decision the audited
   YAML owns - and no key was removed.
+- **2026-09-06 - JSONL v1.6, tool-result truncation.** `tool_result` gains
+  the optional `truncated` boolean: the text the model was handed was cut to
+  a byte cap - by the tool family's built-in cap (fs_read 256 KiB,
+  fs_list/subprocess/shell 64 KiB per stream, MCP 64 KiB) or by the new
+  `limits.max_tool_result_bytes` - jsonl-events.md v1.6. The marker in the
+  text said so to the model already; the field says so to a reader.
+  Additive: the wire `v` stays `1`, nothing was removed, renamed or re-typed,
+  and a run that never truncates writes exactly the bytes v1.5 wrote.
+  Migration: none required; absent means not cut, or a pre-v1.6 log. The
+  log's own per-field clip (`limits.max_logged_field`) is a different cut and
+  never sets the flag.
 - **2026-09-06 - config schema: `limits.max_tool_result_bytes`.** One optional
   key (integer or a whole-value `${VAR}`, minimum 1024): the byte cap on any
   single tool result the model reads, applied to every tool family and to

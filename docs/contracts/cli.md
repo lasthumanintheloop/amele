@@ -79,7 +79,8 @@ on `run`, `chat`, `validate` and `explain`.
   anything is spent.
 - **Settable keys (closed list).** `model`, `prompt`, `system_prompt_file`,
   `workspace`, `session_dir`, `limits.max_turns`, `limits.max_tokens`,
-  `limits.timeout`, `limits.max_logged_field`, `output.max_schema_retries`,
+  `limits.timeout`, `limits.max_logged_field`,
+  `limits.max_tool_result_bytes`, `output.max_schema_retries`,
   `provider.max_output_tokens`, `provider.reasoning.effort`,
   `provider.temperature`, `provider.top_p`. Any
   other key - including a typo - is exit 2 with
@@ -119,6 +120,17 @@ on `run`, `chat`, `validate` and `explain`.
   setting here, as for `session_dir`: `--set limits.max_logged_field=` drops a
   bound the file set and falls back to the built-in default (8192) for this
   run, and `=0` asks for an unbounded record.
+- **Addition (2026-09-06): `limits.max_tool_result_bytes`.** The byte bound on
+  any single tool result the model reads joined the allowlist for the same
+  reason `limits.max_logged_field` did: it is a budget. It changes how much of
+  a result the model reads, never WHICH tools exist or WHO may run them - the
+  YAML still owns that - and it cannot disarm the guard, because validation
+  refuses a value under 1024 from a flag exactly as it does from the file.
+  Empty is a setting here, as for `limits.max_logged_field`:
+  `--set limits.max_tool_result_bytes=` drops a bound the file set and falls
+  back to the built-in per-tool caps for this run (fs_read 256 KiB,
+  fs_list/subprocess/shell 64 KiB per stream, MCP 64 KiB). There is no
+  unbounded spelling: `=0` and anything else below 1024 are exit 2.
 - **Migration (2026-08-12): the allowlist shrank.** `lock` was settable when
   overrides shipped and no longer is: `--set lock=true|false` is now exit 2
   like any other non-settable key. It was the one entry that could *weaken* a
@@ -127,13 +139,15 @@ on `run`, `chat`, `validate` and `explain`.
   Set the field in YAML instead; nothing about `lock:` in the config changed.
   This is the only key ever removed from the list.
 - **Values.** Integers via `strconv` (`limits.max_turns`, `limits.max_tokens`,
-  `limits.max_logged_field`, `output.max_schema_retries`,
+  `limits.max_logged_field`, `limits.max_tool_result_bytes`,
+  `output.max_schema_retries`,
   `provider.max_output_tokens`); floating point via `strconv`
   (`provider.temperature`, `provider.top_p`); `limits.timeout` takes a Go
   duration (`30s`, `5m`); the rest are strings taken verbatim. An
   empty value is accepted where it means something: `--set session_dir=`
   disables session logging, `--set limits.max_logged_field=` drops back to the
-  default clip, and `--set provider.reasoning.effort=` drops back
+  default clip, `--set limits.max_tool_result_bytes=` drops back to the
+  built-in per-tool caps, and `--set provider.reasoning.effort=` drops back
   to the provider's own default. It is refused for `workspace` and
   `system_prompt_file`, which name nothing readable when empty, and for the two
   sampling keys, where it is not a number.
