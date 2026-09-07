@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.6). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.7). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -178,6 +178,17 @@ Within a frozen version, changes must be additive and backwards-compatible:
   `limits.max_tool_result_bytes` (cli.md) - a budget, like
   `limits.max_logged_field`: the worst an operator can do with it is make
   the model read more or less of a result; no key was removed.
+- **2026-09-07 - JSONL v1.7, prompt-cache accounting.** `llm_response` gains
+  `cache_read_tokens` and `cache_write_tokens` (both optional; the cached and
+  cache-written shares of that turn's input, as the provider reported them),
+  and `run_end` gains `cache_read_tokens` (the run's total) - jsonl-events.md
+  v1.7. `input_tokens` keeps its meaning, the turn's total billed input; on the
+  anthropic wire that total now includes the cached share the API reports
+  separately, which the pre-v1.7 client left out (no request carried cache
+  markers then, so nothing was left out in practice). Additive: the wire `v`
+  stays `1`, nothing was removed, renamed or re-typed, and a run with no cache
+  traffic writes exactly the bytes v1.6 wrote. Migration: none required;
+  absent means 0.
 - **2026-09-07 - config schema: `provider.prompt_cache`.** One optional boolean
   for the anthropic wire: when omitted or true the client places
   `cache_control: {type: ephemeral}` markers on the last tool definition,
@@ -187,13 +198,14 @@ Within a frozen version, changes must be additive and backwards-compatible:
   is automatic on those wires and the key would be a silently dropped field.
   Additive to the schema: the key is optional and `additionalProperties:
   false` still holds. **One behavior changed:** every anthropic config that
-  does not set the key now sends the markers, and its `llm_response.
-  input_tokens` counts the cached share it never reported before (jsonl-
-  events.md v1.7). Migration: none required for a multi-turn agent, where
-  the second turn already pays back the 1.25x write premium; a single-turn
-  config over the model's minimum cacheable prefix pays that premium with no
-  read to recoup it - set `provider.prompt_cache: false` there. Not on the
-  `--set` allowlist: it reshapes every request rather than retuning one.
+  does not set the key now sends the markers, and its
+  `llm_response.input_tokens` counts the cached share it never reported
+  before (jsonl-events.md v1.7). Migration: none required for a multi-turn
+  agent, where the second turn already pays back the 1.25x write premium; a
+  single-turn config over the model's minimum cacheable prefix pays that
+  premium with no read to recoup it - set `provider.prompt_cache: false`
+  there. Not on the `--set` allowlist: it reshapes every request rather than
+  retuning one.
 
 ## Schema versioning note (`$id`)
 

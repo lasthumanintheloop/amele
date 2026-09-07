@@ -1,9 +1,10 @@
 # JSONL event schema
 
-**v1.6 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.7 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
 `mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4), the
-opt-in `llm_response.reasoning` (v1.5) and `tool_result.truncated` (v1.6) added
+opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6) and the
+prompt-cache counts on `llm_response` and `run_end` (v1.7) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
@@ -31,7 +32,7 @@ Every line is one JSON object with three always-present fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `v` | int | Wire schema version. Always `1` for this document - the `v1.6` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
+| `v` | int | Wire schema version. Always `1` for this document - the `v1.7` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
 | `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
@@ -55,9 +56,11 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `turn` | int | 1-based turn number, strictly increasing within the run (see [Turn numbering](#turn-numbering)). |
 | `content` | string | The assistant's text for this turn (clipped + redacted). Absent when the model sent only tool calls. |
 | `tool_call_ids` | string[] | IDs of the tool calls requested in this same message; absent when there are none. Each ID reappears as `tool_call_id` on the matching `tool_call`/`tool_result` events. |
-| `input_tokens` | int | Provider-reported input tokens for **this** round-trip (not cumulative). |
+| `input_tokens` | int | Provider-reported input tokens for **this** round-trip (not cumulative), INCLUDING any share of the prompt that was served from the provider's cache. On the anthropic wire this is the SUM of `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` as the API reports them - the total billed input - since v1.7; before v1.7 the anthropic client wrote the API's `input_tokens` alone, which excludes the cached share (and no request carried cache markers, so the two numbers coincided). |
 | `output_tokens` | int | Provider-reported output tokens for this round-trip. |
 | `finish_reason` | string | The provider's finish reason verbatim (`stop`, `length`, `tool_calls`, `content_filter`, `error`, ...); may be absent when the provider omits it. |
+| `cache_read_tokens` | int | Input tokens served from the provider's prompt cache on this round-trip, as the provider reported them (Anthropic `cache_read_input_tokens`, OpenAI `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit_tokens`, Gemini `cachedContentTokenCount`). A subset of `input_tokens`. Absent means 0 - no cache hit, an endpoint that does not report one, or a log written before v1.7. Since v1.7. |
+| `cache_write_tokens` | int | Input tokens written into the cache on this round-trip (Anthropic `cache_creation_input_tokens`, OpenAI `cache_write_tokens`). A subset of `input_tokens`; absent means 0. Since v1.7. |
 | `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is not logged by default**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. `log_reasoning: true` opts it in (v1.5, the `reasoning` field below) through the same redact+clip path as every other free-text field; the rationale above is why that is a deliberate data-governance decision rather than a default. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn, and it answers it whether or not the content is logged. Since v1.4. |
 | `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Written **only** when the config sets `log_reasoning: true` **and** the turn carried a payload, so absence has three readings - the run did not opt in, the turn did no thinking, or the log predates v1.5 - and `reasoning_bytes` is what separates them: a positive `reasoning_bytes` with no `reasoning` means the content was not written (opted out, or a pre-v1.5 log), both absent means the turn carried no reasoning at all. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text - but a **clipped** value is a byte prefix plus the marker and will not parse at all (most visibly for the two array-shaped wires), so a consumer that needs to parse every turn sets `limits.max_logged_field: 0` and keeps the payload whole. Since v1.5. |
 
@@ -194,6 +197,7 @@ because the SDK models two of them as plain booleans:
 | `turns` | int | **Attempted** provider round-trips. An attempt is counted before its provider call, so when the final attempt fails (e.g. a provider error) `turns` can exceed the highest logged `turn` by one. |
 | `tool_calls` | int | Tool calls dispatched - equals the number of `tool_result` events. Denied-and-continued calls, unknown-tool recoveries and erroring tools all count; only a call whose denial aborts the run is logged (as a `tool_result`) but not counted. |
 | `total_tokens` | int | Cumulative input + output tokens. |
+| `cache_read_tokens` | int | Cumulative cache-read input tokens over the run. Absent means 0. Since v1.7. |
 | `mcp_errors` | int | MCP-attributable failures over the whole run (failed connects, lost responses, tool-listing failures). Absent means **0**. Since v1.2. |
 | `duration_ms` | int | Loop time in milliseconds, **not** process wall clock: `run` measures the agent loop only (config loading and the stdin read are excluded), and `chat` sums the per-exchange loop durations - time idle at the prompt is excluded. |
 
@@ -427,3 +431,55 @@ appeared. A run that never truncates writes exactly the bytes v1.5 wrote.
   enough to hit a 64 KiB cap is far past the default 8 KiB `max_logged_field`,
   so the stored `result` ends in `...[clipped]` and the marker is nowhere in
   it - which is exactly why the field exists.
+
+### v1.7 (amele v0.3.0) - prompt-cache accounting (additive, `v` stays `1`)
+
+Added two optional fields to `llm_response` - `cache_read_tokens` and
+`cache_write_tokens` - and one to `run_end`, `cache_read_tokens`. Nothing was
+removed, renamed or re-typed, no other event type changed a byte, and no new
+event type appeared. A run with no cache traffic writes exactly the bytes v1.6
+wrote.
+
+- `llm_response.cache_read_tokens` / `cache_write_tokens` (int, omitted when
+  0): the cached and the cache-written share of that turn's input, as the
+  provider reported them. Every wire that reports a read count is mapped onto
+  the first (Anthropic `cache_read_input_tokens`, OpenAI
+  `prompt_tokens_details.cached_tokens`, DeepSeek `prompt_cache_hit_tokens`,
+  Gemini `cachedContentTokenCount`); only two report a write count, so the
+  second is 0 on the rest, which is the honest reading rather than a gap;
+- `run_end.cache_read_tokens` (int, omitted when 0): the same read count
+  summed over the run. There is deliberately **no** `run_end.cache_write_tokens`
+  - a write count is a per-turn fact about where a breakpoint landed, while
+  "how much of this run came back from cache" is the cumulative number an
+  operator reads against the bill.
+
+`llm_response.input_tokens` keeps its meaning - the turn's total billed input
+- and that is what changed for one wire: on the anthropic wire the API reports
+the cached share in two counters *outside* its own `input_tokens`, so amele now
+sums all three. Before v1.7 it wrote the API's `input_tokens` alone; no request
+carried cache markers then, so the two numbers coincided and no historical log
+is misread by this.
+
+The run's stderr summary reports the same total: with a positive cache-read
+count the token figure gains a parenthetical, `41.0k tokens (28.0k cached)`
+(cli.md). A run with none prints the pre-v1.7 line unchanged.
+
+**Migration:** none required. Concretely:
+
+- absent `cache_read_tokens` / `cache_write_tokens` is a disjunction, not a
+  verdict: nothing was cached on that turn, the endpoint reports no such count,
+  or the log predates v1.7. It never means "unknown", and it never means the
+  provider has no cache;
+- both are SUBSETS of `input_tokens`, never additions to it. A consumer that
+  adds them to the total - or to `run_end.total_tokens` - double-charges the
+  cached share, and so would a budget built on it. `total_tokens` is unchanged:
+  cumulative input + output, with the cached share already inside the input;
+- "reported as a subset", not "guaranteed to be one": amele passes the
+  provider's numbers through rather than re-deriving them, so a broken report
+  can leave a count above `input_tokens`. A consumer computing a hit rate must
+  guard both for a zero denominator and for a ratio above 1;
+- on `run_end` the key lands before `status`, next to `mcp_errors`, because the
+  field is shared with `llm_response`:
+  `{"v":1,"type":"run_end","ts":"2026-09-07T12:00:08Z","cache_read_tokens":28000,"status":"success","exit_code":0,"turns":6,"tool_calls":4,"total_tokens":41000,"duration_ms":34200}`.
+  A JSON object's key order carries no meaning and never did here; the position
+  is noted only so a reader diffing recorded lines is not surprised by it.

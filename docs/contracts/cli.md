@@ -239,6 +239,9 @@ stdout gets nothing.
 lines, and - unless `-q` - the one-line summary:
 `✓ 8 turns, 3 tool calls, 41.0k tokens, 34.2s` (`✗` on failure; the two nouns
 turn singular at a count of exactly 1: `✓ 1 turn, 1 tool call, ...`).
+When any turn was served from the provider's prompt cache the token figure
+carries a suffix: `✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s`;
+a run with no cache reads prints the line exactly as before.
 With `print_session_path: true` in the config, one further note - `session log:
 <path>` - is printed once, as soon as the session file is open, naming the
 timestamped file this run is writing so it can be followed with `tail -f`. It
