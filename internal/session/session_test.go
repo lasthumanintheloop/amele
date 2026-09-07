@@ -1414,9 +1414,11 @@ func TestRunStartResumed(t *testing.T) {
 			absent:  []string{`"resumed_pending"`},
 		},
 		{
-			// Turn 0 cannot happen for a resumable log (a log with no answered
-			// turn is not resumable), so omitempty deleting it is harmless -
-			// but the path must still be recorded.
+			// Turn 0 is what a log whose run died before its first
+			// llm_response resumes from - the task is all there is to
+			// continue - so omitempty deleting the key is the honest
+			// encoding of "no turn came back", and the path must still be
+			// recorded.
 			name:    "zero turn writes no key",
 			resumed: &Resumed{From: "run-1.jsonl"},
 			want:    []string{`"resumed_from":"run-1.jsonl"`},

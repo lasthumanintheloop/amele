@@ -28,7 +28,9 @@
 // it, which is what a SIGKILL mid-write leaves behind - ends there: the events
 // before it are complete, and that is the position the resumed run continues
 // from. A line that does not parse anywhere else is a damaged file
-// (ErrMalformed).
+// (ErrMalformed), and so is a file whose only content is such a line: a torn
+// tail ends a history, so with no complete event before it there is no history
+// to end.
 //
 // Two llm_response events in a row where the first requested no tool calls mean
 // a user turn happened that the log does not record (today: the output.schema
@@ -153,9 +155,12 @@ var (
 	// schema version this build does not read.
 	ErrNotResumable = errors.New("session log is not resumable")
 	// ErrMalformed means the file does not obey the event contract: a line
-	// that is not JSON (including a torn last line after a hard kill), a tool
-	// event whose id no turn requested, or two runs concatenated into one
-	// file.
+	// that is not JSON, a tool event whose id no turn requested, or two runs
+	// concatenated into one file. A torn LAST line is the exception and not an
+	// error at all - the prefix a hard kill leaves mid-write ends the history
+	// there, which is the crashed run resume exists for - unless it is the
+	// only content the file has: a torn tail needs a history to end, so a file
+	// that is nothing but damage is reported as damage.
 	ErrMalformed = errors.New("session log is malformed")
 )
 
