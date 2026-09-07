@@ -300,8 +300,8 @@ never sets `truncated`.
 Each `llm_response` also records what the provider's prompt cache did for that
 turn: `cache_read_tokens` (input served from the cache) and
 `cache_write_tokens` (input billed to populate it), both a share of the turn's
-`input_tokens` rather than an addition to it, and both absent when the endpoint
-reported nothing. `run_end.cache_read_tokens` is the run's total. The same fact
+`input_tokens` rather than an addition to it, and both absent when nothing was
+cached, the endpoint reports no such count, or the log predates v1.7. `run_end.cache_read_tokens` is the run's total. The same fact
 reaches the terminal: when a run read anything back from a cache, the summary
 line's token figure carries a parenthetical -
 `✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s` - and a run with

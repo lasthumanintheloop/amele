@@ -324,10 +324,13 @@ wire. What the cache did is the separate pair, `cache_read_tokens` and
 ([JSONL contract](contracts/jsonl-events.md#llm_response---one-per-provider-round-trip)).
 The run's own summary line says it too, when there was anything to say:
 `✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s`. Read the two
-counts together when a run reports no saving: both 0 on every turn is the short
-prefix above, nothing was ever written; writes without reads is a prefix
-something invalidates between turns - the match is byte-for-byte, so a
-timestamp or a per-turn id inside the system prompt is enough to lose it.
+counts together when a run reports no saving, and only on an endpoint that
+reports the counters at all: both 0 on every turn is the short prefix above,
+nothing was ever written - or a host that answers this wire without sending
+`cache_read_input_tokens`/`cache_creation_input_tokens`, which says nothing
+about what it did; writes without reads is a prefix something invalidates
+between turns - the match is byte-for-byte, so a timestamp or a per-turn id
+inside the system prompt is enough to lose it.
 
 Anthropic-compatible endpoints reached through `base_url` (DeepSeek, GLM, Kimi
 above) receive the same markers, because the marker is a property of the wire
@@ -789,7 +792,7 @@ wire's markers and nothing else). So what you get is whatever OpenRouter caches
 automatically for the endpoint serving you, reported in the session log's
 `cache_read_tokens` when it reports anything at all. Explicit OpenRouter
 breakpoints are a follow-up - see
-[The Anthropic wire](#prompt-caching) for the route that does place them.
+[Prompt caching](#prompt-caching) for the route that does place them.
 
 ## Reasoning costs tokens twice
 
@@ -996,6 +999,7 @@ MODEL & PROVIDER
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "deepseek"
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
   max_output_tokens: 8192
   provider mapping (the wire fields this config will send):
     max_output_tokens: 8192 -> max_tokens: 8192
