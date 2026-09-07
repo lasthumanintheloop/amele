@@ -148,7 +148,8 @@ type anSystem struct {
 }
 
 // MarshalJSON implements json.Marshaler: a JSON string when uncached, a
-// one-element array of text blocks carrying the ephemeral breakpoint when not.
+// one-element array of text blocks carrying the ephemeral breakpoint when
+// cached.
 func (s anSystem) MarshalJSON() ([]byte, error) {
 	if !s.Cache {
 		return json.Marshal(s.Text)
@@ -882,6 +883,23 @@ func (out *anRequest) appendSystem(text string) {
 //     conversation so far. This one MOVES forward every turn: each new turn
 //     marks its own tail, so the previous turn's prefix is a cache hit and only
 //     the delta is written.
+//
+// The third mark can move because a breakpoint is not only a write mark: the
+// API also looks BACK from it for an existing entry, over roughly the last 20
+// content-block positions, where a run of consecutive tool_use blocks counts
+// as one position and so does a run of consecutive tool_result blocks. That
+// lookback is the whole reason one moving mark suffices instead of also
+// pinning the previous turn, and it is why a parallel tool fan-out - many
+// tool_use and tool_result blocks in two turns - cannot push the previous
+// entry out of the window. The corollary is the limit: a turn that appends
+// more than that lookback of NON-tool positions can miss the previous entry,
+// and the prefix is then rewritten rather than read. Anthropic's own
+// multi-turn recipe spends the fourth breakpoint on the previous message to
+// cover exactly that; leaving it unspent is a follow-up, not a claim that the
+// case cannot happen.
+//
+// Live-unverified (#17): the lookback and its tool-run collapsing come from
+// the platform documentation, not from a response amele has recorded.
 func (out *anRequest) placeCacheBreakpoints() {
 	if n := len(out.Tools); n > 0 {
 		out.Tools[n-1].CacheControl = ephemeralCacheControl()
