@@ -1071,8 +1071,18 @@ byte-for-byte. **Caveat, honestly stated:** stripping does not make every
 history portable. A thinking-enabled Anthropic model can still refuse a last
 assistant turn that requests tools without its signed block. That ends the run
 with the provider's own error, which is the truthful outcome - better than
-echoing a signature the new endpoint cannot verify. A chain whose entries all
-speak the same wire family never meets this at all.
+echoing a signature the new endpoint cannot verify.
+
+The same-identity side has its own caveat, and it is the wider one: `openai` is
+a *wire family*, not a vendor. OpenAI, vLLM, Ollama, Azure and every other
+OpenAI-compatible endpoint share that identity because they share the request
+shape, so a switch between two of them keeps the carriers - and may hand a
+`reasoning_content` to a vendor that never issued it. The outcome is the
+Anthropic caveat's: the new endpoint either ignores the field or refuses the
+request, and a refusal ends the run with the provider's own error, which is the
+truthful report. amele will not guess which of two same-shaped endpoints minted
+a payload; a chain that crosses vendors inside the `openai` identity is worth
+running once before you need it.
 
 **Every key is a key.** `api_key` in a fallback entry obeys the same rule as
 the primary's: `${VAR}` only, a literal is a validation error naming the entry

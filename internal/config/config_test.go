@@ -3180,6 +3180,36 @@ provider:
 	}
 }
 
+// TestNestedFallbackLiteralAPIKeyRejected: a nested fallback list is a
+// validate ERROR, but that error arrives after the secret probe and says
+// nothing about the credential the nested block committed. The file is what
+// leaks, not the shape around it - so the probe descends into the illegal
+// nesting and reports the key first, under its full path.
+func TestNestedFallbackLiteralAPIKeyRejected(t *testing.T) {
+	yaml := `model: m
+provider:
+  base_url: https://x/v1
+  api_key: ${API_KEY}
+  fallback:
+    - model: backup
+      base_url: https://backup/v1
+      api_key: ${BACKUP_KEY}
+      fallback:
+        - model: deeper
+          base_url: https://deeper/v1
+          api_key: sk-live-buriedsecret
+`
+	path := writeConfig(t, t.TempDir(), yaml)
+	_, err := Load(path, envMap(map[string]string{"API_KEY": "k", "BACKUP_KEY": "bk"}))
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a literal api_key in a NESTED fallback entry must be rejected: %v", err)
+	}
+	const want = "provider.fallback[0].fallback[0].api_key must be built only from environment references"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not name the buried entry: want it to contain %q", err, want)
+	}
+}
+
 // TestFallbackAPIKeyIsACredentialBinding pins that a ${VAR} referenced by a
 // fallback's api_key is marked as a credential, exactly as the primary's is:
 // the two hold the same kind of secret, and `explain` decides what it may print

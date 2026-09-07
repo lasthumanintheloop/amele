@@ -848,6 +848,14 @@ func rejectLiteralAPIKey(raw []byte) error {
 	// backup block is leaked exactly as completely as one in the primary.
 	type keyProbe struct {
 		APIKey string `yaml:"api_key"`
+		// Recursive on purpose. A nested fallback list is refused by Validate
+		// ("fallback entries cannot nest"), but that verdict arrives later than
+		// this probe - and `amele run` never reaches it, because a leaked key
+		// has to fail the LOAD. A secret is leaked by being in the file at all,
+		// whatever the shape around it, so the probe descends into a structure
+		// it knows is illegal rather than letting the shape error hide the
+		// credential.
+		Fallback []keyProbe `yaml:"fallback"`
 	}
 	// The primary's key is spelled out rather than embedded inline: yaml.v3
 	// skips an embedded field of an unexported type, which would have made the
@@ -864,14 +872,24 @@ func rejectLiteralAPIKey(raw []byte) error {
 	if isLiteralSecret(probe.Provider.APIKey) {
 		return literalSecretError(apiKeyPath)
 	}
-	for i, entry := range probe.Provider.Fallback {
-		if isLiteralSecret(entry.APIKey) {
+	// Depth-first, reporting the shallowest offender first: an operator fixes
+	// the block they can see before the one the schema will delete anyway.
+	var walk func(entries []keyProbe, prefix string) error
+	walk = func(entries []keyProbe, prefix string) error {
+		for i, entry := range entries {
 			// The path carries the index: with several entries, "fix the
 			// api_key" is only actionable if it says which block.
-			return literalSecretError(fmt.Sprintf("%s.fallback[%d].api_key", providerPath, i))
+			path := fmt.Sprintf("%s.fallback[%d]", prefix, i)
+			if isLiteralSecret(entry.APIKey) {
+				return literalSecretError(path + ".api_key")
+			}
+			if err := walk(entry.Fallback, path); err != nil {
+				return err
+			}
 		}
+		return nil
 	}
-	return nil
+	return walk(probe.Provider.Fallback, providerPath)
 }
 
 // isLiteralSecret reports whether value carries anything beyond ${VAR}

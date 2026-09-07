@@ -43,9 +43,12 @@ type Event struct {
 	// ("openai/deepseek", "gemini/vertex"). It answers "which endpoint
 	// produced this?" for a log whose model name alone cannot: two entries of
 	// a fallback chain may share a model, and a base_url is a secret-bearing
-	// URL the log has no business repeating. run_start carries it from v1.8
-	// on; on llm_response it appears only when the turn changed backend, so a
-	// run that never fell back keeps its historical bytes.
+	// URL the log has no business repeating. run_start carries it from v1.8 on
+	// WHENEVER THE CALLER NAMES ONE - the writer omits an empty identity like
+	// every other field, and the CLI always names one, so a file written by
+	// amele itself always has it. On llm_response it appears only when the
+	// turn changed backend, so a run that never fell back keeps its historical
+	// bytes.
 	Model    string `json:"model,omitempty"`
 	Provider string `json:"provider,omitempty"`
 	Task     string `json:"task,omitempty"`

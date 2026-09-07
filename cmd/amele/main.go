@@ -2783,10 +2783,9 @@ func buildFallbacks(cfg *config.Config, registerSecret func(...string)) ([]loop.
 // backup that got a different client than the file describes would only be
 // discovered during an outage.
 //
-// Validate
-// has already constrained the type, so anything that is neither anthropic nor
-// gemini is the OpenAI-compatible default - including "", which is what every
-// pre-Type config carries.
+// Validate has already constrained the type, so anything that is neither
+// anthropic nor gemini is the OpenAI-compatible default - including "", which
+// is what every pre-Type config carries.
 //
 // ResponseFormat is deliberately NOT decided here: buildAgent sets it on the
 // loop for every provider, and each client maps it to its own wire spelling -

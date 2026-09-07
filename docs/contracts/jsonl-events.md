@@ -291,12 +291,16 @@ failed over is counted and numbered, has no `llm_response`, and carries a
 `provider_fallback` event instead - so `turn` values stay strictly increasing
 across the `llm_response` events but are no longer contiguous. What falls
 short is the **count** of `llm_response` events, not the highest `turn`: it is
-`run_end.turns` minus one per switch, minus one more when the final attempt
-failed too. The highest logged `turn` still equals `run_end.turns`, except when
-the run ended on a failed attempt, where it is one less as above. The v1.8
-example below is the shape: `turns: 2` and `fallbacks: 1`, one `llm_response`
-(2 - 1), and its `turn` is 2 - the highest, because the run ended on an
-answered attempt.
+`run_end.turns` minus the attempts that ended in a provider error - each
+switch's failed attempt, plus a final failed attempt when the run ended that
+way. Counting the attempts rather than the switches is deliberate: when the
+switch IS the final attempt (`max_turns: 1` against a dead primary logs
+`turns: 1`, `fallbacks: 1` and no `llm_response` at all, because the retry
+never got a turn to run in) one attempt failed, not two. The highest logged
+`turn` equals `run_end.turns` when the last attempt was answered, and is lower
+otherwise. The v1.8 example below is the ordinary shape: `turns: 2` and
+`fallbacks: 1`, one failed attempt, so one `llm_response`, and its `turn` is 2
+- the highest, because the run ended on an answered attempt.
 
 ## Clipping and redaction
 
