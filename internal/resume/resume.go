@@ -57,7 +57,9 @@
 // they were when they were produced, so resuming shows the model nothing it was
 // not already shown. Secret values were replaced by "[REDACTED]" on the way
 // into the log; that is what the model reads back and it is NOT a fidelity
-// gate - the redacted text is the text of the run being continued.
+// gate - the redacted text is the text of the run being continued. The one
+// exception is a reasoning carrier: a provider verifies those bytes, so a
+// carrier that contains "[REDACTED]" is dropped instead of being echoed back.
 package resume
 
 import (
