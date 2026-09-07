@@ -731,14 +731,18 @@ func TestAnthropicCacheTokenAccounting(t *testing.T) {
 			100, 0, 0, false,
 		},
 		{
-			// Each reported count is clamped before the sum, and the sum
-			// itself saturates: the total stays positive and bounded rather
-			// than wrapping into "cheap".
-			"absurd cache counts saturate",
+			// Each reported count is clamped, the sum saturates, and the sum
+			// is then CLAMPED in turn: three counts already at the ceiling
+			// would otherwise add up to 3x it, and Usage promises every field
+			// inside [0, maxTokensPerResponse]. This is also the one case
+			// where the clamp breaks the "cache counts are a subset of the
+			// input total" reading, which is why nothing may divide by
+			// InputTokens unguarded (see the Usage godoc).
+			"absurd cache counts saturate and the sum is clamped",
 			`{"input_tokens": 9000000000000000000, "output_tokens": 5,
 			  "cache_creation_input_tokens": 9000000000000000000,
 			  "cache_read_input_tokens": 9000000000000000000}`,
-			3 * maxTokensPerResponse, maxTokensPerResponse, maxTokensPerResponse, false,
+			maxTokensPerResponse, maxTokensPerResponse, maxTokensPerResponse, false,
 		},
 		{
 			// The trustworthy rule stays on the two main counts only: a
@@ -776,9 +780,14 @@ func TestAnthropicCacheTokenAccounting(t *testing.T) {
 			if resp.UsageMissing != tt.wantMissing {
 				t.Errorf("UsageMissing: got %v, want %v", resp.UsageMissing, tt.wantMissing)
 			}
-			// CONTRACT: the cache counts are a SUBSET of the input total, so a
-			// report where they exceed it would double-count in every consumer.
-			if resp.Usage.CacheReadTokens+resp.Usage.CacheWriteTokens > resp.Usage.InputTokens {
+			// CONTRACT: this client SUMS the cache counts into the input
+			// total, so below the clamp ceiling they are always a subset of
+			// it - a client that forgot the sum would fail here even if the
+			// wantIn arithmetic above were ever loosened. At the ceiling the
+			// clamp itself breaks the relation, which the Usage godoc names
+			// as the reason no caller may divide by InputTokens unguarded.
+			if tt.wantIn < maxTokensPerResponse &&
+				resp.Usage.CacheReadTokens+resp.Usage.CacheWriteTokens > resp.Usage.InputTokens {
 				t.Errorf("cache counts exceed the input total: %+v", resp.Usage)
 			}
 		})

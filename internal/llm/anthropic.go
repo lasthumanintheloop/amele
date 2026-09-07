@@ -421,11 +421,19 @@ func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []
 		// input" everywhere - must add the two cache counters back in. Left
 		// out, limits.max_tokens would undercount every cached turn by exactly
 		// the cache share, and the better the cache worked the further the
-		// budget would drift from the truth. The sum saturates for the same
-		// reason each part is clamped: a total that wrapped negative would
-		// read as "under budget" forever.
-		usage.InputTokens = saturatingAdd(usage.InputTokens,
-			saturatingAdd(usage.CacheReadTokens, usage.CacheWriteTokens))
+		// budget would drift from the truth.
+		//
+		// The sum saturates and is then clamped, so InputTokens keeps the
+		// bound every other field has: three counts clamped to
+		// maxTokensPerResponse can still add up past it, and Usage promises
+		// callers a value inside [0, maxTokensPerResponse]. The clamp cannot
+		// shrink an honest report - maxTokensPerResponse is an order of
+		// magnitude above the largest context window - so it only ever bites
+		// a broken or hostile one.
+		usage.InputTokens = min(
+			saturatingAdd(usage.InputTokens,
+				saturatingAdd(usage.CacheReadTokens, usage.CacheWriteTokens)),
+			maxTokensPerResponse)
 		resp.Usage = usage
 		// The trustworthy signal stays keyed on input_tokens/output_tokens
 		// only: parseCacheTokens clamps a broken sub-count rather than

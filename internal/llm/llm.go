@@ -148,11 +148,10 @@ type Request struct {
 // Usage is the token accounting reported by the provider for one call.
 // CONTRACT: these provider-reported numbers are the primary budget unit of
 // amele (docs/engineering.md §7) - never substitute local estimates. Every field is
-// non-negative, and every count as REPORTED is bounded by maxTokensPerResponse:
-// providers do not get to decide the arithmetic the budget runs on (see
-// parseUsage). InputTokens may exceed that bound only because one wire reports
-// the billed input in several counters that are summed here (see the Anthropic
-// client); the sum saturates, so it is still positive and bounded.
+// non-negative and bounded by maxTokensPerResponse: providers do not get to
+// decide the arithmetic the budget runs on (see parseUsage). Where one wire
+// splits the billed input across several counters, InputTokens is their
+// CLAMPED sum, so the bound holds there too (see the Anthropic client).
 type Usage struct {
 	// InputTokens is the TOTAL billed input of the call, INCLUDING any part
 	// of the prompt that was served from the provider's cache. Wires differ
@@ -163,12 +162,18 @@ type Usage struct {
 	InputTokens  int
 	OutputTokens int
 
-	// CacheReadTokens and CacheWriteTokens are SUBSETS of InputTokens, never
-	// additional spend: the tokens served from a prompt cache and the tokens
-	// billed to populate one. They exist to report what caching did for a run
-	// (they are priced differently from ordinary input), so Total deliberately
+	// CacheReadTokens and CacheWriteTokens are the tokens served from a prompt
+	// cache and the tokens billed to populate one. They are REPORTED as
+	// subsets of InputTokens, never additional spend, so Total deliberately
 	// ignores them - adding them in would charge the cached share twice
 	// against limits.max_tokens.
+	//
+	// "Reported as", not "guaranteed to be": on the wires whose input count
+	// already includes the cached share, nothing here re-derives the total, so
+	// a broken provider report can leave these counts exceeding InputTokens.
+	// Clamping them to it would invent a number and hide the breakage, so it
+	// is left visible - and no caller may divide by InputTokens (a cache hit
+	// rate, say) without guarding both for zero and for a ratio above 1.
 	//
 	// Zero is the honest reading of "this wire did not report it": not every
 	// wire reports both counts (Gemini reports no write count at all), and

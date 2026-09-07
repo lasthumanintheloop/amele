@@ -237,20 +237,23 @@ type oaResponse struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
 		// PromptTokensDetails is the canonical spelling of the cached share of
-		// the prompt (OpenAI, and the gateways that copy it). It is a POINTER
-		// so "the provider sent the object" is distinguishable from "it sent
-		// no object at all" - only the latter falls back to the DeepSeek
-		// spelling below. cache_write_tokens is not OpenAI's own field; it is
-		// what several compatible gateways report there, and a wire that
-		// omits it decodes to zero.
+		// the prompt: OpenAI documents both cached_tokens and
+		// cache_write_tokens there for Chat Completions (prompt-caching
+		// guide), and the compatible gateways copy it. It is a POINTER so "the
+		// provider sent the object" is distinguishable from "it sent no object
+		// at all" - only the latter falls back to the DeepSeek spelling below.
+		// A wire that sends the object without cache_write_tokens decodes to
+		// zero, which is the honest reading.
 		PromptTokensDetails *struct {
 			CachedTokens     int64 `json:"cached_tokens"`
 			CacheWriteTokens int64 `json:"cache_write_tokens"`
 		} `json:"prompt_tokens_details"`
-		// PromptCacheHitTokens is DeepSeek's top-level spelling of the same
-		// read count. Its sibling prompt_cache_miss_tokens is deliberately not
-		// decoded: it is the non-cached remainder, which prompt_tokens already
-		// covers, so reading it would only invite double-counting.
+		// PromptCacheHitTokens is the FALLBACK spelling of the same read
+		// count: DeepSeek reports it at the top level of usage instead of
+		// sending a details object. Its sibling prompt_cache_miss_tokens is
+		// deliberately not decoded - it is the non-cached remainder, which
+		// prompt_tokens already covers, so reading it would only invite
+		// double-counting.
 		PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens"`
 	} `json:"usage"`
 }
