@@ -169,6 +169,9 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 				ExistingNames: existing,
 				Version:       version,
 				TokenStore:    store,
+				// Snapshotted into every discovered tool at Connect time, so
+				// it has to be set HERE and not after discovery.
+				MaxResultBytes: toolResultCap(cfg),
 				// A token refreshed mid-run must be scrubbed from every sink
 				// this invocation already redacts through, which is why the
 				// registry is the run's live SecretSet rather than a snapshot.

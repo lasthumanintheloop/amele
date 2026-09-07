@@ -2648,9 +2648,12 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		AutoApprove:   perm.AutoApproves(cfg.Permissions),
 		ParallelTools: cfg.Tools.IsParallel(),
 		Limits:        loop.Limits{MaxTurns: cfg.Limits.MaxTurns, MaxTokens: cfg.Limits.MaxTokens},
-		Model:         cfg.Model,
-		SystemPrompt:  cfg.SystemPrompt,
-		Tuning:        tuning,
+		// The last line of defence: tools cap what they produce, this caps
+		// what ANY tool - MCP included - is allowed to put in the transcript.
+		MaxToolResultBytes: toolResultCap(cfg),
+		Model:              cfg.Model,
+		SystemPrompt:       cfg.SystemPrompt,
+		Tuning:             tuning,
 	}
 
 	if validator == nil {
@@ -3221,11 +3224,25 @@ func readPipedInput(ctx context.Context, stdin io.Reader) (string, error) {
 	return string(data), nil
 }
 
+// toolResultCap resolves limits.max_tool_result_bytes for the tool constructors
+// and the loop: 0 keeps every family's built-in cap and disables the loop
+// ceiling, which is what a config without the key has always had.
+func toolResultCap(cfg *config.Config) int {
+	if cfg.Limits.MaxToolResultBytes == nil {
+		return 0
+	}
+	return *cfg.Limits.MaxToolResultBytes
+}
+
 // buildRegistry assembles the tool registry from the validated config.
 func buildRegistry(cfg *config.Config) (*tools.Registry, error) {
 	registry := tools.NewRegistry()
+	// CONTRACT: one number governs every tool family. Each constructor reads
+	// it as "0 means your own legacy cap", so an absent key leaves the pre-v1.6
+	// behaviour of all three families untouched.
+	capBytes := toolResultCap(cfg)
 	if cfg.Tools.FS {
-		fsTools, err := tools.NewFSTools(cfg.Workspace, tools.FSOptions{})
+		fsTools, err := tools.NewFSTools(cfg.Workspace, tools.FSOptions{MaxReadBytes: capBytes, MaxListBytes: capBytes})
 		if err != nil {
 			return nil, fmt.Errorf("initializing fs tools: %w", err)
 		}
@@ -3242,7 +3259,7 @@ func buildRegistry(cfg *config.Config) (*tools.Registry, error) {
 	// allow/deny patterns inside the block are accident prevention, not a
 	// security boundary; the boundary is the OS/container (docs/threat-model.md).
 	if cfg.Tools.Shell.Enabled {
-		shell, err := tools.NewShell(cfg.Tools.Shell, cfg.Workspace, tools.ShellOptions{})
+		shell, err := tools.NewShell(cfg.Tools.Shell, cfg.Workspace, tools.ShellOptions{MaxOutputBytes: capBytes})
 		if err != nil {
 			return nil, fmt.Errorf("initializing shell tool: %w", err)
 		}
@@ -3251,7 +3268,7 @@ func buildRegistry(cfg *config.Config) (*tools.Registry, error) {
 		}
 	}
 	for _, def := range cfg.Tools.Subprocess {
-		if err := registry.Register(tools.NewSubprocess(def, cfg.Workspace, tools.SubprocessOptions{})); err != nil {
+		if err := registry.Register(tools.NewSubprocess(def, cfg.Workspace, tools.SubprocessOptions{MaxOutputBytes: capBytes})); err != nil {
 			return nil, err
 		}
 	}

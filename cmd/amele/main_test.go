@@ -26,6 +26,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/runlock"
 	"github.com/lasthumanintheloop/amele/internal/schema"
 	"github.com/lasthumanintheloop/amele/internal/session"
+	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
 // capturedMessage is one conversation entry as it appeared on the wire.
@@ -4482,6 +4483,73 @@ func TestE2EPrintSessionPath(t *testing.T) {
 			files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
 			if len(files) != 1 || files[0] != path {
 				t.Errorf("noted path = %q, want the run's only session file %v", path, files)
+			}
+		})
+	}
+}
+
+// TestRunToolResultCap is the end-to-end proof that limits.max_tool_result_bytes
+// reaches the tool constructors AND the loop ceiling: a subprocess printing
+// 3000 bytes is logged whole when the key is absent, and cut to the cap plus
+// TruncationMarker when it is present. The two cases share one fixture on
+// purpose - the key is the ONLY difference between them, so a size change
+// coming from anywhere else would fail both instead of masquerading as the
+// feature working.
+func TestRunToolResultCap(t *testing.T) {
+	const outputBytes = 3000
+	const capBytes = 1024
+	// YAML double quotes would eat the escape, so the command is written with
+	// the backslash doubled: tr must receive a literal `\0`.
+	const toolYAML = `  subprocess:
+    - name: big_output
+      description: prints 3000 bytes on stdout
+      command: ["sh", "-c", "head -c 3000 /dev/zero | tr '\\0' a"]
+session_dir: sessions
+`
+	cases := []struct {
+		name      string
+		limits    string
+		wantBytes int
+		wantCut   bool
+	}{
+		{"capped", "limits:\n  max_tool_result_bytes: 1024\n", capBytes + len(tools.TruncationMarker), true},
+		{"uncapped", "", outputBytes, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := scriptedServer(t,
+				toolCallBody("big_output", `{}`),
+				textBody("done"),
+			)
+			cfgPath, dir := writeTestConfig(t, srv.URL, toolYAML+tc.limits)
+
+			code, _, stderr := execCLI(t, []string{"run", cfgPath, "emit the bytes"}, "")
+			if code != ExitOK {
+				t.Fatalf("exit %d, stderr: %s", code, stderr)
+			}
+
+			evt, ok := findEvent(sessionEvents(t, dir), "tool_result")
+			if !ok {
+				t.Fatal("session log has no tool_result event")
+			}
+			if evt.ResultBytes != tc.wantBytes {
+				t.Errorf("result_bytes = %d, want %d", evt.ResultBytes, tc.wantBytes)
+			}
+			if evt.Truncated != tc.wantCut {
+				t.Errorf("truncated = %v, want %v", evt.Truncated, tc.wantCut)
+			}
+			// `truncated` is omitempty: the uncapped run must not carry the
+			// key at all, which decoding alone cannot tell from `false`.
+			files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+			if err != nil || len(files) != 1 {
+				t.Fatalf("session files: %v, %v", files, err)
+			}
+			raw, err := os.ReadFile(files[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(string(raw), `"truncated"`); got != tc.wantCut {
+				t.Errorf("`truncated` key present = %v, want %v", got, tc.wantCut)
 			}
 		})
 	}
