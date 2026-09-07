@@ -1643,6 +1643,49 @@ func TestLoopNoCeilingIsByteIdentical(t *testing.T) {
 	}
 }
 
+// TestCeilingKeepsFSListCounts is the two-cap case an operator actually
+// creates: limits.max_tool_result_bytes sets the fs_list budget AND the loop
+// ceiling to the same number, so a listing that overshot its own budget would
+// be re-cut by the ceiling - leaving the model a shredded count marker
+// followed by the plain one. The counts are the whole point of the fs_list
+// variant, so they must survive both cuts.
+func TestCeilingKeepsFSListCounts(t *testing.T) {
+	const (
+		capBytes = 310
+		files    = 12
+		nameLen  = 39 // + the newline: 40 bytes per listed entry
+	)
+	dir := t.TempDir()
+	for i := 0; i < files; i++ {
+		name := fmt.Sprintf("%02d-%s.log", i, strings.Repeat("x", nameLen-len("00-.log")))
+		if err := os.WriteFile(filepath.Join(dir, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fsTools, err := tools.NewFSTools(dir, tools.FSOptions{MaxListBytes: capBytes})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fake := callThenDone("fs_list")
+	l := stubLoop(t, fake, fsTools...)
+	l.MaxToolResultBytes = capBytes
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	got := lastToolMessage(t, fake)
+	if len(got) > capBytes {
+		t.Errorf("the model read %d bytes, over the %d-byte cap", len(got), capBytes)
+	}
+	if !strings.HasSuffix(got, fmt.Sprintf("of %d entries shown]", files)) {
+		t.Errorf("the count marker did not survive the ceiling: %q", got)
+	}
+	if n := strings.Count(got, "[output truncated by amele"); n != 1 {
+		t.Errorf("%d truncation markers, want 1 (the ceiling cut a listing that was already at its budget): %q", n, got)
+	}
+}
+
 // TestParallelDispatchKeepsTruncationFlag pins the second dispatch path: the
 // concurrent dispatcher publishes through the same publish, so a flag set on a
 // per-call goroutine must survive the hand-off to the log for EVERY call of the

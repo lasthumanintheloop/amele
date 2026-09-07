@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -146,6 +147,25 @@ func TestFSReadTruncation(t *testing.T) {
 	}
 }
 
+// TestFSReadHugeCap: the +1 truncation probe must not overflow. maxBytes+1 as
+// an int64 wraps negative at the top of the range, and a negative
+// io.LimitReader yields nothing - so the largest possible cap used to read
+// every file as empty, the one cap that can never truncate anything.
+func TestFSReadHugeCap(t *testing.T) {
+	// math.MaxInt rather than math.MaxInt64: the literal must fit an int on
+	// every platform amele cross-compiles to. On 64-bit - where the overflow
+	// was reachable - the two are the same number.
+	dir, fs := newFS(t, FSOptions{MaxReadBytes: math.MaxInt})
+	const content = "hello world" // 11 bytes
+	if err := os.WriteFile(filepath.Join(dir, "small.txt"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, outcome := invokeOutcome(t, fs["fs_read"], `{"path": "small.txt"}`)
+	if out != content || outcome.Truncated {
+		t.Errorf("read = %q truncated=%v, want %q and false", out, outcome.Truncated, content)
+	}
+}
+
 // TestFSListCap: the listing budget is an option, not a constant borrowed
 // from the subprocess tool, and the cut is reported out of band as well as in
 // the marker.
@@ -162,7 +182,11 @@ func TestFSListCap(t *testing.T) {
 	}
 
 	t.Run("small budget cuts on an entry boundary", func(t *testing.T) {
-		dir, fs := newFS(t, FSOptions{MaxListBytes: 40})
+		// The budget has to clear the count marker itself (~51 bytes) for
+		// this case to be about entries at all; see the last subtest for what
+		// happens below that floor.
+		const maxList = 80
+		dir, fs := newFS(t, FSOptions{MaxListBytes: maxList})
 		fill(t, dir)
 		out, outcome := invokeOutcome(t, fs["fs_list"], `{}`)
 		if !outcome.Truncated {
@@ -173,6 +197,29 @@ func TestFSListCap(t *testing.T) {
 		}
 		if !strings.Contains(out, fmt.Sprintf("of %d entries", entries)) {
 			t.Errorf("marker should state the total, got %q", out)
+		}
+		// The marker is part of the budget, not an extra on top of it: when
+		// limits.max_tool_result_bytes is set, the loop ceiling is the SAME
+		// number, and a listing that overshot here would be re-cut there -
+		// destroying the counts this marker exists to carry.
+		if len(out) > maxList {
+			t.Errorf("truncated listing is %d bytes, over the %d-byte budget: %q", len(out), maxList, out)
+		}
+	})
+
+	t.Run("budget below the marker still states the counts", func(t *testing.T) {
+		// A cap smaller than the marker cannot be honored by anything that
+		// still tells the model it was cut - CapText has the same floor. The
+		// counts win: a listing that silently showed nothing would be read as
+		// an empty directory.
+		dir, fs := newFS(t, FSOptions{MaxListBytes: 10})
+		fill(t, dir)
+		out, outcome := invokeOutcome(t, fs["fs_list"], `{}`)
+		if !outcome.Truncated {
+			t.Error("Outcome.Truncated = false, want true")
+		}
+		if want := fmt.Sprintf("[output truncated by amele: 0 of %d entries shown]", entries); out != want {
+			t.Errorf("listing = %q, want %q", out, want)
 		}
 	})
 

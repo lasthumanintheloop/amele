@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -204,8 +205,15 @@ func (t *fsRead) InvokeOutcome(ctx context.Context, rawArgs string) (string, Out
 	}
 
 	// Read at most maxBytes+1: the extra byte detects truncation without
-	// ever loading an arbitrarily large file into memory.
-	data, err := io.ReadAll(io.LimitReader(f, int64(t.maxBytes)+1))
+	// ever loading an arbitrarily large file into memory. The +1 is
+	// saturated because it overflows at the top of the int range, and a
+	// negative io.LimitReader reads NOTHING - the largest possible cap, the
+	// one that can never truncate anything, used to return every file empty.
+	limit := int64(math.MaxInt64)
+	if int64(t.maxBytes) < math.MaxInt64 {
+		limit = int64(t.maxBytes) + 1
+	}
+	data, err := io.ReadAll(io.LimitReader(f, limit))
 	if err != nil {
 		return "", Outcome{}, fmt.Errorf("reading %q: %w", args.Path, err)
 	}
@@ -327,6 +335,18 @@ func (t *fsList) InvokeOutcome(ctx context.Context, rawArgs string) (string, Out
 	// The listing is bounded like every other tool output (fs_read,
 	// subprocess): a directory of rotated logs can hold tens of thousands
 	// of entries, and one unbounded result would flood the model's context.
+	//
+	// The marker is part of the budget, not an extra on top of it: room for
+	// it is reserved BEFORE any entry is written. When
+	// limits.max_tool_result_bytes is set, the loop ceiling is the same
+	// number as this budget, and a listing that overshot here would be
+	// re-cut there by CapText - which knows nothing about entry counts and
+	// would leave the model half a marker followed by the plain one. The
+	// reservation uses the total for both counts, an upper bound on the
+	// digits `shown` can take. A budget under the marker's own length cannot
+	// be honored at all (CapText has the same floor); the counts win there,
+	// because a silently empty listing reads as an empty directory.
+	reserve := len(fmt.Sprintf("[output truncated by amele: %d of %d entries shown]", len(entries), len(entries)))
 	var b strings.Builder
 	shown := 0
 	for _, e := range entries {
@@ -334,7 +354,7 @@ func (t *fsList) InvokeOutcome(ctx context.Context, rawArgs string) (string, Out
 		if e.IsDir() {
 			name += "/"
 		}
-		if b.Len()+len(name)+1 > t.maxBytes {
+		if b.Len()+len(name)+1+reserve > t.maxBytes {
 			break
 		}
 		b.WriteString(name)
