@@ -3055,6 +3055,32 @@ func TestProviderFallbackValidation(t *testing.T) {
 			want:    "provider.fallback[1].base_url is required",
 		},
 		{
+			// The tail of this message names the `type` key that made the
+			// suffix illegal, and that key is the ENTRY's - pointing at
+			// provider.type would send the operator to a block that is fine.
+			name: "an anthropic entry keeps its version suffix rule, under its own path",
+			targets: []FallbackTarget{{
+				Model: "claude-backup",
+				ProviderConfig: ProviderConfig{
+					Type:    ProviderTypeAnthropic,
+					BaseURL: "https://backup.example.com/v1",
+				},
+			}},
+			want: `provider.fallback[0].base_url "https://backup.example.com/v1" must not end with /v1 when provider.fallback[0].type is anthropic: the client appends /v1/messages itself`,
+		},
+		{
+			name: "a gemini entry keeps its version suffix rule, under its own path",
+			targets: []FallbackTarget{{
+				Model: "gemini-3-pro",
+				ProviderConfig: ProviderConfig{
+					Type:    ProviderTypeGemini,
+					APIKey:  "k",
+					BaseURL: "https://backup.example.com/v1beta",
+				},
+			}},
+			want: `provider.fallback[0].base_url "https://backup.example.com/v1beta" must not end with /v1beta or /v1 when provider.fallback[0].type is gemini: the client appends /v1beta/models/{model}:generateContent itself`,
+		},
+		{
 			name: "a gemini entry refuses a dialect, under its own path",
 			targets: []FallbackTarget{{
 				Model: "gemini-3-pro",
@@ -3208,6 +3234,14 @@ func TestPrimaryOnlyViolationsUnchangedByFallback(t *testing.T) {
 			"retry attempts out of range",
 			func(c *Config) { c.Provider.Retry = &RetryConfig{MaxAttempts: 11} },
 			"provider.retry.max_attempts must be between 1 and 10 (got 11; omit for the default 3, or set 1 to disable retrying)",
+		},
+		{
+			"version suffix on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = "https://api.anthropic.com/v1"
+			},
+			`provider.base_url "https://api.anthropic.com/v1" must not end with /v1 when provider.type is anthropic: the client appends /v1/messages itself`,
 		},
 	}
 	for _, tt := range tests {

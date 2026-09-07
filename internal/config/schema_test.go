@@ -391,6 +391,15 @@ func collectYAMLPathsWithin(t reflect.Type, prefix string, out map[string]bool, 
 			// An embedded struct tagged ",inline" contributes its fields at the
 			// SAME path, with no key of its own - that is what lets a fallback
 			// entry be written exactly like the primary provider block.
+			//
+			// The enclosing-type guard below is deliberately NOT applied here:
+			// an inline embed is the same node, not a child, so skipping it
+			// would drop the entry's whole shape rather than one key. That is
+			// safe only while no inline embed is SELF-referential (no type
+			// embeds itself, directly or through a chain). ProviderConfig
+			// reaches FallbackTarget through a named `fallback` key, which the
+			// guard does cover - so the cycle is always cut one level down, at
+			// a key the schema deliberately omits, and the walk terminates.
 			collectYAMLPathsWithin(field.Type, prefix, out, within)
 			continue
 		}
@@ -837,4 +846,108 @@ provider:
 			}
 		})
 	}
+}
+
+// TestProviderTargetDefMirrorsProviderBlock pins CONSTRAINT parity between the
+// primary provider block and the $defs.providerTarget a fallback entry is
+// validated by. TestSchemaStructTwoWaySync only compares property NAMES, so it
+// cannot see the drift that matters most here: a bound tightened on one copy
+// and not the other (say the temperature ceiling, or the retry maximum) would
+// make an editor accept in a fallback entry exactly what it red-squiggles in
+// the primary, for a rule the runtime applies identically to both.
+//
+// Descriptions are stripped before the comparison at every depth: the def
+// deliberately points at the primary ("As provider.top_p.") instead of copying
+// the prose, so the long text has one home. Everything else - types, enums,
+// minima, maxima, patterns, required lists, additionalProperties - must match
+// exactly.
+//
+// The key sets are allowed to differ by exactly one key each way: the primary
+// carries `fallback` (entries cannot nest, so the def omits it) and the def
+// carries `model` (the primary's model is the top-level key).
+func TestProviderTargetDefMirrorsProviderBlock(t *testing.T) {
+	var doc map[string]any
+	if err := json.Unmarshal(SchemaJSONBytes(), &doc); err != nil {
+		t.Fatalf("parsing embedded schema: %v", err)
+	}
+
+	primary := schemaNode(t, doc, "properties", "provider", "properties")
+	target := schemaNode(t, doc, "$defs", "providerTarget", "properties")
+
+	onlyPrimary := slices.Sorted(maps.Keys(primary))
+	onlyPrimary = slices.DeleteFunc(onlyPrimary, func(k string) bool { _, ok := target[k]; return ok })
+	if !slices.Equal(onlyPrimary, []string{"fallback"}) {
+		t.Errorf("keys in provider but not in $defs.providerTarget = %v, want exactly [fallback]", onlyPrimary)
+	}
+	onlyTarget := slices.Sorted(maps.Keys(target))
+	onlyTarget = slices.DeleteFunc(onlyTarget, func(k string) bool { _, ok := primary[k]; return ok })
+	if !slices.Equal(onlyTarget, []string{"model"}) {
+		t.Errorf("keys in $defs.providerTarget but not in provider = %v, want exactly [model]", onlyTarget)
+	}
+
+	for _, key := range slices.Sorted(maps.Keys(primary)) {
+		if key == "fallback" {
+			continue
+		}
+		t.Run(key, func(t *testing.T) {
+			want := mustJSON(t, withoutDescriptions(primary[key]))
+			got := mustJSON(t, withoutDescriptions(target[key]))
+			if got != want {
+				t.Errorf("$defs.providerTarget.properties.%s differs from provider.properties.%s\n got: %s\nwant: %s", key, key, got, want)
+			}
+		})
+	}
+}
+
+// schemaNode walks a decoded schema document down a chain of object keys,
+// failing the test if any step is missing or is not an object - a wrong path
+// must fail loudly rather than compare two empty maps successfully.
+func schemaNode(t *testing.T, doc map[string]any, path ...string) map[string]any {
+	t.Helper()
+	node := doc
+	for i, key := range path {
+		next, ok := node[key].(map[string]any)
+		if !ok {
+			t.Fatalf("schema has no object at %s", strings.Join(path[:i+1], "."))
+		}
+		node = next
+	}
+	return node
+}
+
+// withoutDescriptions returns v with every "description" key removed, at every
+// depth. The fallback def points at the primary's prose instead of copying it,
+// so descriptions are the one thing the two copies are meant to differ in.
+func withoutDescriptions(v any) any {
+	switch val := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(val))
+		for k, item := range val {
+			if k == "description" {
+				continue
+			}
+			out[k] = withoutDescriptions(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = withoutDescriptions(item)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+// mustJSON renders v as JSON for comparison. encoding/json sorts object keys,
+// so two structurally equal subschemas produce the same bytes whatever order
+// they were written in.
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshaling subschema: %v", err)
+	}
+	return string(raw)
 }

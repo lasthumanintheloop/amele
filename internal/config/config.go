@@ -1664,7 +1664,7 @@ func (p *ProviderConfig) hostOrVersionProblem(prefix string) string {
 	// already an error of its own, and the endpoint it describes is not the one
 	// this base_url would serve, so the version rule stays the right complaint.
 	if p.Vertex == nil || p.Type != ProviderTypeGemini {
-		return versionedBaseURLProblem(p.Type, p.BaseURL)
+		return versionedBaseURLProblem(prefix, p.Type, p.BaseURL)
 	}
 	u, err := url.Parse(p.BaseURL)
 	if err != nil || strings.Trim(u.Path, "/") == "" {
@@ -1685,19 +1685,24 @@ func (p *ProviderConfig) hostOrVersionProblem(prefix string) string {
 // suffix that then travels twice. The result is a 404 on the first real request
 // of an unattended run, which reads as a broken endpoint rather than as the
 // config error it is, so it is caught here instead.
-func versionedBaseURLProblem(providerType, baseURL string) string {
+//
+// prefix names the block being checked, so the message points the operator at
+// the `type` key that made the suffix illegal - the entry's own when a fallback
+// target is at fault, not the primary's. The wording is otherwise frozen: with
+// prefix "provider" the two lines are byte-identical to what they were before
+// fallback existed, and tests pin them.
+func versionedBaseURLProblem(prefix, providerType, baseURL string) string {
 	trimmed := strings.TrimRight(baseURL, "/")
 	switch providerType {
 	case ProviderTypeAnthropic:
 		if strings.HasSuffix(trimmed, "/v1") {
-			// Wording frozen: this line is pinned by tests.
-			return "must not end with /v1 when provider.type is anthropic: the client appends /v1/messages itself"
+			return "must not end with /v1 when " + prefix + ".type is anthropic: the client appends /v1/messages itself"
 		}
 	case ProviderTypeGemini:
 		// /v1 is refused beside /v1beta because it is the habit the operator
 		// brings, not because this client would ever append it.
 		if strings.HasSuffix(trimmed, "/v1beta") || strings.HasSuffix(trimmed, "/v1") {
-			return "must not end with /v1beta or /v1 when provider.type is gemini: the client appends /v1beta/models/{model}:generateContent itself"
+			return "must not end with /v1beta or /v1 when " + prefix + ".type is gemini: the client appends /v1beta/models/{model}:generateContent itself"
 		}
 	}
 	return ""
