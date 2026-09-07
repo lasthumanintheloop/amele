@@ -959,7 +959,7 @@ hint, never correctness.
 | a 400 naming both `thinkingLevel` and `thinkingBudget` (gemini) | set only one of `provider.reasoning.effort` or `budget_tokens` |
 | `... budget 0 is invalid` / `cannot disable thinking` (gemini) | this model cannot disable thinking; remove `reasoning.effort: none` |
 | `Unknown name ...` (gemini) | the gemini API rejects unknown fields; if this key came from `provider.params`, remove it |
-| a 400 saying a part is missing a `thought_signature` (gemini) | amele must echo signatures automatically - this is a bug, please report it with the session log |
+| a 400 saying a part is missing a `thought_signature` (gemini) | a resumed run replays without signatures when its log carried no reasoning carrier (`log_reasoning` off, a changed model or provider, or a fallback); otherwise amele echoes signatures automatically - this is a bug, please report it with the session log |
 
 ### The gpt-5.6 chat/completions restriction
 

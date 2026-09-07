@@ -384,7 +384,13 @@ const (
 )
 
 const (
-	adviceGemSignatureBug   = "amele must echo signatures automatically - this is a bug, please report it with the session log"
+	// Two causes, and the operator can act on only one of them: a resumed run
+	// that replays a conversation whose log kept no reasoning carriers sends
+	// steps without signatures legitimately, so the advice names that case
+	// before it asks for a bug report.
+	adviceGemSignatureBug = "a resumed run replays without signatures when its log carried no reasoning carrier " +
+		"(log_reasoning off, a changed model or provider, or a fallback); otherwise amele echoes signatures " +
+		"automatically - this is a bug, please report it with the session log"
 	adviceGemThinkingBoth   = "set only one of provider.reasoning.effort or budget_tokens"
 	adviceGemCannotDisable  = "this model cannot disable thinking; remove reasoning.effort: none"
 	adviceGemUnknownField   = "the gemini API rejects unknown fields; if this key came from provider.params, remove it"

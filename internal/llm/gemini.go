@@ -488,15 +488,22 @@ var geminiErrorSignatures = []errorSignature{
 	{
 		// A signed step reached the API without its signature. amele echoes
 		// the raw parts array precisely so this cannot happen
-		// (gemContent.MarshalJSON), which makes this 400 evidence of a bug
-		// HERE rather than a config mistake - so the advice asks for a report
-		// instead of naming a knob the operator could turn.
+		// (gemContent.MarshalJSON), which leaves exactly two causes, and the
+		// advice has to name both: a --resume run whose log carried no
+		// reasoning carrier legitimately replays the conversation without
+		// signatures (log_reasoning was off, the model or the provider
+		// changed, or the old run fell back - internal/resume Options), and
+		// that is a config story with an action behind it. Anything else is a
+		// bug HERE rather than a config mistake, so the second half still asks
+		// for a report.
 		//
 		// The backticks are part of the match: they are how the API quotes the
 		// field, and requiring them keeps the entry off a 400 that merely
 		// mentions signatures in prose.
-		match:  func(e *statusError) bool { return strings.Contains(e.snippet, "missing a `thought_signature`") },
-		advice: "amele must echo signatures automatically - this is a bug, please report it with the session log",
+		match: func(e *statusError) bool { return strings.Contains(e.snippet, "missing a `thought_signature`") },
+		advice: "a resumed run replays without signatures when its log carried no reasoning carrier " +
+			"(log_reasoning off, a changed model or provider, or a fallback); otherwise amele echoes signatures " +
+			"automatically - this is a bug, please report it with the session log",
 	},
 	{
 		// Both thinking fields in one request. Unreachable through validate,
