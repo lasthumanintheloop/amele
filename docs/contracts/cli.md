@@ -453,6 +453,18 @@ up yet.
   token, never a byte of the key file, which is not read at all. Neither row
   appears on the AI Studio half, which has no project, location or Google
   credential to report.
+- **Prompt cache row** (additive, 2026-09-07): the `MODEL & PROVIDER` block
+  carries a `prompt cache:` row on **every** wire, unconditionally - unlike the
+  mapping rows above, which appear only when a config sets something, because
+  what a run pays for its unchanged prefix is a fact about the run rather than
+  the state of one key. There are exactly three texts. On the anthropic wire
+  with the key unset or true (the default):
+  `prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)`;
+  on that wire with `provider.prompt_cache: false`:
+  `prompt cache:    disabled (provider.prompt_cache: false)`; on every other
+  wire, where the endpoint decides on its own and the key is a config error:
+  `prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)`.
+  Existing reports gain exactly that one line.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
   ✗ MISSING), every executable the config needs on `PATH` (✓ found /
