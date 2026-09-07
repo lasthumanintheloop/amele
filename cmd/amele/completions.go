@@ -150,6 +150,14 @@ _amele() {
 	fi
 
 	local cmd="${words[2]}"
+
+	# The value slot of --resume is a session log path, so hand it to the file
+	# completer rather than offering the flag list where a path goes (bash's
+	# --resume) arm does the same). The other value-taking flags (--set,
+	# --model, -w) have no static list either, but re-offering flags there is
+	# the behaviour this script has always had and is left alone.
+	[[ "${words[CURRENT-1]}" == --resume ]] && { _files; return }
+
 	local -a agent_flags inspect_flags
 	agent_flags=('--model' '--set' '-w' '--workspace' '-q' '--quiet' '-v' '--verbose' '-h' '--help')
 	inspect_flags=('--set' '-w' '--workspace' '-h' '--help')

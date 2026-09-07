@@ -242,4 +242,17 @@ func TestCompletionResumeTakesAnArgument(t *testing.T) {
 	if !strings.Contains(completionFish, `-l resume -r `) {
 		t.Error("fish script does not mark --resume as requiring an argument (-r)")
 	}
+	// zsh has no equivalent of fish's -r, so the value slot is a rule of its
+	// own: one line that hands the previous-word check to _files. Asserted at
+	// string level, like the bash arm above - the scripts are hand-written and
+	// there is no shell to run them in here.
+	var zshArm bool
+	for _, line := range strings.Split(completionZsh, "\n") {
+		if strings.Contains(line, "--resume") && strings.Contains(line, "_files") {
+			zshArm = true
+		}
+	}
+	if !zshArm {
+		t.Error("zsh script does not complete a file where --resume's value goes")
+	}
 }
