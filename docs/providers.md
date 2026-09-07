@@ -495,9 +495,13 @@ produces, and a tool loop that sends a step back without its signature is a 400.
 amele stores the model turn's **entire raw `parts` array** and re-emits it
 verbatim as the next request's model content - never parsed, never reordered,
 never rebuilt - so the signature stays on the part it belongs to by
-construction. If you ever see a `missing a thought_signature` 400 from amele,
-that is a bug in amele: it says so in the error advice, and the session log is
-what to attach to the report.
+construction. A `missing a thought_signature` 400 therefore has exactly two
+causes, and the error advice names both. One is legitimate: a `--resume` run
+whose session log carried no reasoning carrier replays the conversation without
+signatures by design - `log_reasoning` was off, the model or the provider
+changed between the runs, or the old run fell back (see the [CLI
+contract](contracts/cli.md#resuming-a-run---resume-path)). Anything else is a
+bug in amele, and the session log is what to attach to the report.
 
 **Tool schemas are sanitized, and the strip is announced.** A
 `FunctionDeclaration.parameters` is an OpenAPI-3.0 **subset**, not JSON Schema,

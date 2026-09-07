@@ -346,15 +346,38 @@ faithful to send.
 
 **Reasoning carriers** - the opaque payloads logged by `log_reasoning: true` -
 are restored only when the log's `run_start.provider` equals the current
-config's provider identity **and** the old run never fell back to another
-backend: a provider signs or hash-checks its own reasoning payload, so
-replaying one into a different backend is at best rejected. A carrier
-containing `[REDACTED]` is dropped for the same reason - those are no longer
-the bytes the provider signed. Without `log_reasoning: true` the rebuilt
-conversation simply carries no thinking payloads, which providers accept: the
-turn is replayed without it. Redaction is otherwise **not** a fidelity gate -
-a `[REDACTED]` inside a tool result is replayed as it stands, because that is
-the text the run being continued was reading.
+config's provider identity, its `run_start.model` equals the model this run
+will call, **and** the old run never fell back to another backend: a provider
+signs or hash-checks its own reasoning payload, and it signs it for the model
+that produced it, so replaying one anywhere else is at best rejected. Changing
+the model on a resume - `--model`, `--set model=`, or an edited YAML - is
+therefore a carrier-less replay by design. A carrier containing `[REDACTED]`
+is dropped for the same reason: those are no longer the bytes the provider
+signed.
+
+A carrier-less history is **not** guaranteed to be accepted. A thinking-enabled
+`anthropic` or `gemini` run replayed without the payloads its turns were
+produced with can be refused by the provider - a 400, which is exit **5**; see
+[docs/providers.md](../providers.md) on signatures and thought signatures, whose
+advice for that 400 names this case. What makes such a run resumable in
+practice is `log_reasoning: true` in the config that wrote the log, the same
+model, the same provider identity, and no fallback in the log. A config that
+does not enable thinking has no carriers to lose and is unaffected.
+
+Redaction is otherwise **not** a fidelity gate - a `[REDACTED]` inside a tool
+result is replayed as it stands, because that is the text the run being
+continued was reading.
+
+With **`-v`**, a resumed run prints one line to stderr before its first turn,
+saying what came back:
+
+```
+amele: resuming out/item/run-1.jsonl: 3 turns of claude-sonnet-4 on anthropic; 1 pending tool call(s); reasoning carriers restored
+```
+
+The verdict is `restored` or `not restored`; the line is redacted and clipped
+like every other `-v` line, and its wording is human-facing, not a parsing
+contract.
 
 **The resumed run writes a NEW session log.** The file named by `--resume` is
 opened read-only and never appended to, and the new file numbers its turns
@@ -364,6 +387,14 @@ one logged field that is redacted but never clipped), `resumed_turn` (the
 highest turn the old log carried) and `resumed_pending` (the interrupted call
 ids above, absent when there are none). The task it records is the OLD run's
 task, so the two files read as one story.
+
+**`resumed_from` is a pointer, not an inclusion.** The history a resume
+rebuilds is the turns of the log named on the command line, and only those. A
+log that was itself produced by a resume records its own run's turns; the
+conversation it continued lives in the file it points at, and is not pulled
+back in. So a chain of resumes is a chain of *shortening* conversations, and
+the log to name for a second retry is usually the original one - see
+[docs/deployment.md](../deployment.md) §4.
 
 **The other run-level guards come first.** `lock: true` keys on the config
 path, not on the log, so resuming a config whose original run is still alive

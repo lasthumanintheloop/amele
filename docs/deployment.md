@@ -311,11 +311,11 @@ instead of buying it again.
 
 ```sh
 amele run agent.yaml -q --set "session_dir=out/$item" \
-  --resume "$(ls -1 "out/$item"/run-*.jsonl | tail -n 1)" \
+  --resume "$(ls -1 "out/$item"/run-*.jsonl | head -n 1)" \
   > "out/$item.json"
 ```
 
-One condition, two consequences. The log must be a full record
+One condition, three consequences. The log must be a full record
 (`limits.max_logged_field: 0`, the combination below) or the resume is refused
 with exit 2 naming that key - decide it before the batch runs, not after it
 fails. No tool call is ever re-executed: a call the interrupted run dispatched
@@ -324,8 +324,16 @@ outcome is unknown, and the new run's `run_start.resumed_pending` lists those
 ids, which is the list to reconcile by hand when the tools had side effects.
 And the retry writes a **new** file into the same directory rather than
 appending to the old one, so an item that was resumed twice has three logs in
-timestamp order, each naming its predecessor in `resumed_from` - which is why
-the `ls | tail -n 1` above picks the newest. Full rules:
+timestamp order, each naming its predecessor in `resumed_from`.
+
+**Which log to name on the second retry: the first one.** `resumed_from` is a
+pointer, not an inclusion - a resume rebuilds the turns of the log it is given
+and nothing the file points at. The second log therefore records only the
+turns the *retry* ran, so resuming it continues a conversation that has lost
+everything the original attempt did; a chain of resumes is a chain of
+shortening conversations. Naming the item's **original** log keeps the run
+that did the real work, which is why the `ls | head -n 1` above picks the
+oldest file rather than the newest. Full rules:
 [CLI contract](contracts/cli.md#resuming-a-run---resume-path).
 
 **The full-record combination.** When a batch exists to be audited afterwards -

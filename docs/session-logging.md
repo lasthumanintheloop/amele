@@ -105,12 +105,20 @@ limits:
   max_logged_field: 0   # the whole record, so the run can be resumed
 ```
 
-**`log_reasoning: true` is what keeps a reasoning payload replayable.**
-Without it the resumed conversation is carrier-less - every provider accepts
-that, the turn is simply replayed without its thinking - and with it the
-payloads go back verbatim, but only when the log's `run_start.provider` is
-still the current config's provider and the old run never fell back to another
-backend: a provider signs or hash-checks its own reasoning bytes. Remember
+**`log_reasoning: true` is what keeps a reasoning payload replayable.** With
+it the payloads go back verbatim - but only when the log's
+`run_start.provider` is still the current config's provider identity, its
+`run_start.model` is still the model being called, and the old run never fell
+back to another backend: a provider signs or hash-checks its own reasoning
+bytes, for the model that produced them.
+
+Without it the resumed conversation is carrier-less, and that is not something
+every provider accepts: a thinking-enabled `anthropic` or `gemini` run whose
+turns are replayed without the payloads they were produced with can be refused
+outright (a 400, exit 5 - see [docs/providers.md](providers.md) on
+signatures). For those configs the resumable combination is `log_reasoning:
+true` plus the same model, the same provider identity and no fallback in the
+log; a config that does not enable thinking has no carriers to lose. Remember
 what the key persists (see the caveat above and
 [docs/deployment.md](deployment.md) §4): a reasoning trace is where a model
 paraphrases, and redaction works by value.
