@@ -1821,7 +1821,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		defer cancel()
 	}
 
-	task, history, resumed, taskErr := prepareRun(ctx, cfg, parsed, taskArgs, stdin)
+	task, history, replay, taskErr := prepareRun(ctx, cfg, parsed, taskArgs, stdin)
 	// Reading stdin is already part of the run, so an interruption there is an
 	// interrupted RUN, not a config error: it is carried past the agent
 	// construction below and reported through the normal ending path.
@@ -1861,7 +1861,8 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// (docs/contracts/jsonl-events.md, Ordering). loop.Run's contract already
 	// hands that choice to callers driving their own history - `chat` has
 	// always done it - so the run below goes through RunMessages.
-	logRunStart(agent, cfg, task, resumed)
+	logResumeNote(stderr, parsed, replay, secrets)
+	logRunStart(agent, cfg, task, parsed.resume, replay)
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
@@ -1983,13 +1984,14 @@ func interruptedError(cause error) error {
 // and the prompt template never runs.
 //
 // It returns the task the session log should record, the history the loop is
-// driven with, the origin fields for a resumed run (nil for a normal one), and
-// the error that stops the run. CONTRACT: every error here is exit 2 at the
-// call site, EXCEPT a context error from the stdin read, which is an
-// interrupted run - cmdRun makes that split, exactly as it did when it called
-// buildTask itself.
+// driven with, the rebuilt log for a resumed run (nil for a normal one - it is
+// what the run_start origin fields and the -v note are derived from), and the
+// error that stops the run. CONTRACT: every error here is exit 2 at the call
+// site, EXCEPT a context error from the stdin read, which is an interrupted
+// run - cmdRun makes that split, exactly as it did when it called buildTask
+// itself.
 func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskArgs string,
-	stdin io.Reader) (string, []llm.Message, *session.Resumed, error) {
+	stdin io.Reader) (string, []llm.Message, *resume.Replay, error) {
 	if parsed.resume == "" {
 		task, err := buildTask(ctx, cfg, taskArgs, stdin)
 		if err != nil {
@@ -2023,9 +2025,7 @@ func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskA
 	// The task is the OLD run's task: it is what the conversation is about,
 	// and repeating it in the new log is what lets the two be read as one
 	// story. The origin fields say the rest.
-	return replay.Task, resumeHistory(cfg, replay, instruction), &session.Resumed{
-		From: parsed.resume, Turn: replay.LastTurn, Pending: replay.Pending,
-	}, nil
+	return replay.Task, resumeHistory(cfg, replay, instruction), replay, nil
 }
 
 // errResumeCompleted is the refusal for a log whose run already answered.
@@ -2068,13 +2068,45 @@ func resumeHistory(cfg *config.Config, replay *resume.Replay, instruction string
 // CONTRACT (docs/contracts/jsonl-events.md): a resumed run writes run_start
 // with the three v1.9 origin fields and a normal run writes none of them, so
 // absence keeps meaning "this run started from nothing" - including in every
-// log written before the fields existed.
-func logRunStart(agent *loop.Loop, cfg *config.Config, task string, resumed *session.Resumed) {
-	if resumed == nil {
+// log written before the fields existed. The path is recorded exactly as the
+// operator typed it, because that is the string that names the file again.
+func logRunStart(agent *loop.Loop, cfg *config.Config, task, from string, replay *resume.Replay) {
+	if replay == nil {
 		agent.Session.RunStart(cfg.Model, cfg.Provider.Identity(), task)
 		return
 	}
-	agent.Session.RunStartResumed(cfg.Model, cfg.Provider.Identity(), task, *resumed)
+	agent.Session.RunStartResumed(cfg.Model, cfg.Provider.Identity(), task, session.Resumed{
+		From: from, Turn: replay.LastTurn, Pending: replay.Pending,
+	})
+}
+
+// logResumeNote prints the one -v line that says what a resumed run starts
+// from, before the first turn is spent on it: how much conversation came back,
+// which model and backend produced it, how many tool calls it carries no
+// result for, and whether the reasoning carriers survived the provider/model
+// gate (internal/resume Options). None of that is visible from the summary
+// line, and the carrier verdict in particular explains a signature 400 that
+// would otherwise look like a bug.
+//
+// Both guards live here rather than at the call site: a helper that decides
+// whether it has anything to say keeps cmdRun's branch count where it is.
+//
+// SECURITY: the same two hazards progressLogger documents. The model, the
+// provider identity and the path all come from operator-owned input that gets
+// persisted (a cron job's stderr), so the line is redacted through the run's
+// live secret registry and stripped of terminal control bytes exactly like a
+// progress line.
+func logResumeNote(stderr io.Writer, parsed agentArgs, replay *resume.Replay, secrets *session.SecretSet) {
+	if !parsed.verbose || replay == nil {
+		return
+	}
+	carriers := "not restored"
+	if replay.Carriers {
+		carriers = "restored"
+	}
+	note := fmt.Sprintf("resuming %s: %d turns of %s on %s; %d pending tool call(s); reasoning carriers %s",
+		parsed.resume, replay.LastTurn, replay.Model, replay.Provider, len(replay.Pending), carriers)
+	_, _ = fmt.Fprintf(stderr, "amele: %s\n", safeForTerminal(secrets.Redact(note), maxProgressLine))
 }
 
 // openingHistory builds the one-shot conversation `run` starts from: the

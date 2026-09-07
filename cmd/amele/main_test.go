@@ -5228,6 +5228,64 @@ func TestE2EResumePendingToolCall(t *testing.T) {
 	}
 }
 
+// TestE2EResumeVerboseNote: with -v, a resumed run says on stderr what it is
+// starting from before it spends a turn on it. The facts it names are the ones
+// an operator cannot see any other way without reading the log by hand: how
+// much conversation came back, whose model and backend produced it, how many
+// tool calls it carries no result for, and whether the reasoning carriers
+// survived the provider/model gate.
+func TestE2EResumeVerboseNote(t *testing.T) {
+	t.Run("the note names the log, its turns and the carrier verdict", func(t *testing.T) {
+		logPath := interruptedRunLog(t)
+		srv, _ := capturingServer(t, textBody("the note says to remember the milk"))
+		cfgPath, _ := writeResumeConfig(t, srv.URL, "")
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "-v", "--resume", logPath}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		// The log carries no reasoning (log_reasoning is off by default), so
+		// the verdict is "not restored" even though provider and model match.
+		want := fmt.Sprintf("amele: resuming %s: 1 turns of test-model on openai; "+
+			"0 pending tool call(s); reasoning carriers not restored", logPath)
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr = %q, want it to carry %q", stderr, want)
+		}
+	})
+
+	t.Run("the unanswered calls are counted", func(t *testing.T) {
+		logPath := writeSessionLog(t,
+			session.Event{Type: "run_start", Model: "test-model", Provider: "openai", Task: "sweep the logs"},
+			session.Event{Type: "llm_response", Turn: 1, ToolCallIDs: []string{"c9"}, FinishReason: "tool_calls"},
+			session.Event{Type: "tool_call", CallID: "c9", Tool: "fs_read", Args: `{"path":"app.log"}`},
+		)
+		srv, _ := capturingServer(t, textBody("nothing to report"))
+		cfgPath, _ := writeResumeConfig(t, srv.URL, "")
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "-v", "--resume", logPath}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "1 pending tool call(s)") {
+			t.Errorf("stderr = %q, want it to count the unanswered call", stderr)
+		}
+	})
+
+	t.Run("without -v there is no note", func(t *testing.T) {
+		logPath := interruptedRunLog(t)
+		srv, _ := capturingServer(t, textBody("done"))
+		cfgPath, _ := writeResumeConfig(t, srv.URL, "")
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "--resume", logPath}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		if strings.Contains(stderr, "resuming") {
+			t.Errorf("stderr = %q, want no resume note without -v", stderr)
+		}
+	})
+}
+
 // TestE2EResumeRefusesClippedLog: the default log clips a large tool result,
 // and a conversation rebuilt from clipped text is a DIFFERENT conversation
 // than the one the model had. The refusal must name the config key that makes
