@@ -1981,11 +1981,14 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 		// operator-facing line.
 		_, _ = fmt.Fprintln(stderr, redact(runErr.Error()))
 	}
-	agent.Session.RunEnd(status, code, res.Turns, res.ToolCalls, res.Usage.Total(), res.Duration)
+	// CONTRACT: Usage.Total() is input+output with the cached share already
+	// inside input; the cache-read count rides beside it as a subset, never as
+	// an addition (docs/contracts/jsonl-events.md).
+	agent.Session.RunEnd(status, code, res.Turns, res.ToolCalls, res.Usage.Total(), res.Usage.CacheReadTokens, res.Duration)
 	if quiet {
 		return
 	}
-	_, _ = fmt.Fprintln(stderr, session.Summary(runErr == nil, res.Turns, res.ToolCalls, res.Usage.Total(), res.Duration))
+	_, _ = fmt.Fprintln(stderr, session.Summary(runErr == nil, res.Turns, res.ToolCalls, res.Usage.Total(), res.Usage.CacheReadTokens, res.Duration))
 	// The native-downgrade warning follows the summary, once per run: in
 	// schema mode the operator must learn when provider-native enforcement was
 	// unavailable and the validate+retry layer carried output.schema alone. It
@@ -2288,7 +2291,11 @@ type chatSession struct {
 	turns     int
 	toolCalls int
 	tokens    int
-	duration  time.Duration
+	// cached is the cumulative prompt-cache read count across the session's
+	// exchanges. It is a subset of tokens, tracked separately only so the
+	// summary and run_end can report what the cache saved.
+	cached   int
+	duration time.Duration
 }
 
 // repl drives the conversation until EOF, an error, or an exhausted budget,
@@ -2365,6 +2372,7 @@ func (s *chatSession) nextTurn(ctx context.Context, line string) (string, error)
 	s.turns += res.Turns
 	s.toolCalls += res.ToolCalls
 	s.tokens += res.Usage.Total()
+	s.cached += res.Usage.CacheReadTokens
 	s.duration += res.Duration
 	if err != nil {
 		return "", err
@@ -2426,9 +2434,9 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 		// SECURITY: same rule as reportRun - the error may quote remote text.
 		_, _ = fmt.Fprintln(stderr, s.secrets.Redact(err.Error()))
 	}
-	s.agent.Session.RunEnd(status, code, s.turns, s.toolCalls, s.tokens, s.duration)
+	s.agent.Session.RunEnd(status, code, s.turns, s.toolCalls, s.tokens, s.cached, s.duration)
 	if !s.quiet {
-		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, s.turns, s.toolCalls, s.tokens, s.duration))
+		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, s.turns, s.toolCalls, s.tokens, s.cached, s.duration))
 	}
 	return code
 }

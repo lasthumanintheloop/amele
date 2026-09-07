@@ -49,6 +49,17 @@ type Event struct {
 	InputTokens  int      `json:"input_tokens,omitempty"`
 	OutputTokens int      `json:"output_tokens,omitempty"`
 	FinishReason string   `json:"finish_reason,omitempty"`
+	// CacheReadTokens and CacheWriteTokens are the prompt-cache share of the
+	// turn's input (v1.7, additive; absent means none). Both are a SUBSET of
+	// InputTokens, never an addition to it - a reader that sums them into the
+	// total double-charges the run, and so would a budget.
+	//
+	// The pair is shared with run_end, which carries CacheReadTokens ONLY: a
+	// write count is a per-turn fact about where a cache breakpoint landed,
+	// while "how much of this run came back from cache" is the cumulative
+	// number an operator reads against the bill.
+	CacheReadTokens  int `json:"cache_read_tokens,omitempty"`
+	CacheWriteTokens int `json:"cache_write_tokens,omitempty"`
 	// ReasoningBytes is the size of the provider's reasoning payload for this
 	// turn (v1.4, additive; absent means none). It is recorded whether or not
 	// the content itself is logged, so "why did this turn cost that much?"
@@ -520,6 +531,12 @@ type LLMResponse struct {
 	OutputTokens int
 	// FinishReason is the provider's stop reason, verbatim.
 	FinishReason string
+	// CacheReadTokens and CacheWriteTokens are the prompt-cache share of this
+	// turn's InputTokens (see Event.CacheReadTokens): tokens served from the
+	// provider's cache, and tokens the provider charged to write a new cache
+	// entry. Both are inside InputTokens, so neither is added to any total.
+	CacheReadTokens  int
+	CacheWriteTokens int
 	// ReasoningBytes is the SIZE of the turn's reasoning payload - a length,
 	// not a payload: the caller passes len(message.Reasoning) and the size is
 	// recorded whether or not the content is (see Event.ReasoningBytes). Zero
@@ -532,7 +549,8 @@ type LLMResponse struct {
 }
 
 // LLMResponse records a model turn: content (clipped and redacted), the IDs of
-// any tool calls it requested, the token accounting, and the size of the
+// any tool calls it requested, the token accounting (including the turn's
+// prompt-cache share, when the provider reported one), and the size of the
 // turn's reasoning payload. The reasoning content itself is written only when
 // the writer was opened with LogReasoning, through the same redact+clip path.
 func (w *Writer) LLMResponse(r LLMResponse) {
@@ -541,6 +559,7 @@ func (w *Writer) LLMResponse(r LLMResponse) {
 		Content: w.clip(r.Content), ToolCallIDs: r.ToolCallIDs,
 		InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
 		FinishReason: r.FinishReason, ReasoningBytes: r.ReasoningBytes,
+		CacheReadTokens: r.CacheReadTokens, CacheWriteTokens: r.CacheWriteTokens,
 	}
 	// SECURITY: the opt-in is checked here, so the default path cannot write a
 	// reasoning byte no matter what the caller passes.
@@ -786,7 +805,11 @@ func (w *Writer) SetMCPErrors(n int) {
 }
 
 // RunEnd records the final status and totals, then closes the file.
-func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalTokens int, duration time.Duration) {
+//
+// cacheReadTokens is the run's cumulative prompt-cache read count. It is a
+// SUBSET of totalTokens (which is already input+output), so it is reported
+// beside the total, never added to it; zero writes no key at all.
+func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalTokens, cacheReadTokens int, duration time.Duration) {
 	if w == nil {
 		return
 	}
@@ -798,7 +821,8 @@ func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalToke
 	w.emit(Event{
 		Type: "run_end", Status: status, ExitCode: &exitCode,
 		Turns: turns, ToolCalls: toolCalls, TotalTokens: totalTokens,
-		DurationMS: duration.Milliseconds(), MCPErrors: mcpErrors,
+		CacheReadTokens: cacheReadTokens,
+		DurationMS:      duration.Milliseconds(), MCPErrors: mcpErrors,
 	})
 	_ = w.w.Close()
 }
@@ -807,14 +831,24 @@ func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalToke
 // run: `✓ 8 turns, 3 tool calls, 41k tokens, 34.2s`. The turn and tool-call
 // nouns are singular for a count of exactly 1 (`✓ 1 turn, 1 tool call, ...`);
 // tokens and seconds are units, which stay as they are at any count.
-func Summary(ok bool, turns, toolCalls, totalTokens int, duration time.Duration) string {
+//
+// cachedTokens is the share of totalTokens that came back from a prompt cache.
+// When it is positive the token figure gains a parenthetical -
+// `41.0k tokens (28.0k cached)` - and when it is zero the line is byte-for-byte
+// the one every pre-v0.3 run printed: an operator grepping the old shape, and
+// a provider that reports no cache counts at all, must see no change.
+func Summary(ok bool, turns, toolCalls, totalTokens, cachedTokens int, duration time.Duration) string {
 	mark := "✓"
 	if !ok {
 		mark = "✗"
 	}
-	return fmt.Sprintf("%s %d %s, %d %s, %s tokens, %.1fs",
+	cached := ""
+	if cachedTokens > 0 {
+		cached = fmt.Sprintf(" (%s cached)", formatTokens(cachedTokens))
+	}
+	return fmt.Sprintf("%s %d %s, %d %s, %s tokens%s, %.1fs",
 		mark, turns, plural(turns, "turn"), toolCalls, plural(toolCalls, "tool call"),
-		formatTokens(totalTokens), duration.Seconds())
+		formatTokens(totalTokens), cached, duration.Seconds())
 }
 
 // plural returns noun as-is for a count of exactly 1 and the "+s" form

@@ -166,6 +166,57 @@ func TestRunMaxTokens(t *testing.T) {
 	}
 }
 
+// TestRunMaxTokensCountsCachedTokens: tokens served from a provider's prompt
+// cache are a SUBSET of the reported input tokens, not an extra pool, so they
+// spend limits.max_tokens exactly like uncached input does. A budget that
+// silently exempted them would let a cache-friendly agent run past the ceiling
+// the operator set. The provider here reports 900 input tokens of which 800
+// were cache reads, plus 50 output: 950 against a 900 budget must stop.
+func TestRunMaxTokensCountsCachedTokens(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{
+		llm.TextResponse("answer", llm.Usage{InputTokens: 900, CacheReadTokens: 800, OutputTokens: 50}),
+	}}
+	l := newLoop(t, fake, Limits{MaxTokens: 900})
+
+	res, err := l.Run(context.Background(), "task")
+	if !errors.Is(err, ErrBudgetExceeded) {
+		t.Fatalf("want ErrBudgetExceeded, got %v", err)
+	}
+	// Total() is input+output with the cached share already inside input:
+	// counting the 800 again would read as 1750.
+	if res.Usage.Total() != 950 {
+		t.Errorf("usage: %+v, want Total 950", res.Usage)
+	}
+}
+
+// TestRunLogsCacheTokens: the per-turn cache counts the provider reported must
+// reach the session log, which is where "why was this run cheap?" is answered
+// after the fact.
+func TestRunLogsCacheTokens(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &llm.Fake{Responses: []llm.Response{
+		llm.TextResponse("answer", llm.Usage{InputTokens: 1000, CacheReadTokens: 800, CacheWriteTokens: 150, OutputTokens: 20}),
+	}}
+	l := newLoop(t, fake, Limits{})
+	l.Session = w
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"cache_read_tokens":800`, `"cache_write_tokens":150`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("session log missing %s:\n%s", want, data)
+		}
+	}
+}
+
 // TestRunUsageSaturates: accumulating token counts across turns must not wrap
 // the accumulator negative, which would read as "under budget" and defeat the
 // fail-closed token limit. The loop must accumulate through the saturating

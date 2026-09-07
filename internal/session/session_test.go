@@ -44,8 +44,11 @@ func TestWriterGolden(t *testing.T) {
 	// the one line in the golden that carries "truncated":true, proving the
 	// untruncated call above still omits the key.
 	w.ToolResult(ToolResult{CallID: "call_2", Tool: "fs_read", Result: "clipped output", Outcome: OutcomeOK, Truncated: true})
-	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop"})
-	w.RunEnd("success", 0, 2, 1, 300, 1500*time.Millisecond)
+	// The second turn's prompt was partly served from the provider's cache,
+	// so this is the one line in the golden carrying the v1.7 cache keys -
+	// which makes turn 1 above the proof that a cache-less turn omits them.
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop", CacheReadTokens: 120, CacheWriteTokens: 25})
+	w.RunEnd("success", 0, 2, 1, 300, 0, 1500*time.Millisecond)
 
 	got, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -100,7 +103,7 @@ func TestWriterAppendsUnconditionally(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w.RunEnd("success", 0, 1, 0, 10, time.Second)
+	w.RunEnd("success", 0, 1, 0, 10, 0, time.Second)
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -152,6 +155,88 @@ func TestLLMResponseReasoningBytes(t *testing.T) {
 	}
 }
 
+// TestLLMResponseCacheTokens pins the llm_response half of the v1.7 cache
+// accounting: a turn whose prompt was partly served from a provider cache
+// reports both counts, and a turn that touched no cache omits both keys
+// entirely (omitempty), so a pre-v1.7 consumer sees byte-for-byte the line it
+// already knew.
+func TestLLMResponseCacheTokens(t *testing.T) {
+	dir := t.TempDir()
+	w, err := New(dir, Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.LLMResponse(LLMResponse{
+		Turn: 1, Content: "cached turn", InputTokens: 1000, OutputTokens: 20,
+		FinishReason: "stop", CacheReadTokens: 800, CacheWriteTokens: 150,
+	})
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "cold turn", InputTokens: 1000, OutputTokens: 20, FinishReason: "stop"})
+
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("want 2 events, got:\n%s", data)
+	}
+	for _, want := range []string{`"cache_read_tokens":800`, `"cache_write_tokens":150`} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("cached turn does not carry %s:\n%s", want, lines[0])
+		}
+	}
+	for _, absent := range []string{"cache_read_tokens", "cache_write_tokens"} {
+		if strings.Contains(lines[1], absent) {
+			t.Errorf("a turn that read no cache must omit %s:\n%s", absent, lines[1])
+		}
+	}
+}
+
+// TestRunEndCacheReadTokens pins the run_end half of v1.7: the run's
+// cumulative cache-READ total, and only that one - a write count is a
+// per-turn fact about where a breakpoint landed, while "how much of this run
+// came from cache" is the number an operator bills against. Zero is absent,
+// which is also the pre-v1.7 shape.
+func TestRunEndCacheReadTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		cacheRead int
+		want      string // "" means the key must be absent
+	}{
+		{"no cache reads", 0, ""},
+		{"cache reads", 5, `"cache_read_tokens":5`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := w.Path()
+			w.RunEnd("success", 0, 1, 0, 1000, tt.cacheRead, time.Second)
+
+			data, err := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
+			if err != nil {
+				t.Fatal(err)
+			}
+			line := strings.TrimSpace(string(data))
+			if tt.want == "" {
+				if strings.Contains(line, "cache_read_tokens") {
+					t.Errorf("a run with no cache reads must omit the key:\n%s", line)
+				}
+				return
+			}
+			if !strings.Contains(line, tt.want) {
+				t.Errorf("run_end does not carry %s:\n%s", tt.want, line)
+			}
+			// The write count is per-turn only; run_end must never carry it.
+			if strings.Contains(line, "cache_write_tokens") {
+				t.Errorf("run_end must not carry a cache write total:\n%s", line)
+			}
+		})
+	}
+}
+
 func TestRedaction(t *testing.T) {
 	dir := t.TempDir()
 	w, err := New(dir, Options{Clock: fixedClock(), Secrets: []string{"sk-verysecret", "tiny"}})
@@ -162,7 +247,7 @@ func TestRedaction(t *testing.T) {
 	// The model may echo a secret in its answer text; that path must be
 	// redacted too now that content is logged.
 	w.LLMResponse(LLMResponse{Turn: 2, Content: "the key is sk-verysecret", InputTokens: 1, OutputTokens: 1, FinishReason: "stop"})
-	w.RunEnd("success", 0, 1, 1, 10, time.Second)
+	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
 	if strings.Contains(string(data), "sk-verysecret") {
@@ -185,7 +270,7 @@ func TestClipLongFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "t", Result: strings.Repeat("x", maxLoggedField*2), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 10, time.Second)
+	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
 	if len(data) > maxLoggedField+1024 {
@@ -209,7 +294,7 @@ func TestReplaySource(t *testing.T) {
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "reading the log now", ToolCallIDs: []string{"call_9"}, InputTokens: 10, OutputTokens: 5, FinishReason: "tool_calls"})
 	w.ToolCall("call_9", "fs_read", `{"path":"x"}`)
 	w.ToolResult(ToolResult{CallID: "call_9", Tool: "fs_read", Result: "data", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 15, time.Second)
+	w.RunEnd("success", 0, 1, 1, 15, 0, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
@@ -247,7 +332,7 @@ func TestClipRuneBoundary(t *testing.T) {
 	// "€" is 3 bytes; maxLoggedField is not a multiple of 3, so a naive
 	// byte-index cut lands mid-rune.
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: strings.Repeat("€", maxLoggedField), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 1, time.Second)
+	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
 
 	data, _ := os.ReadFile(w.Path())
 	var ev Event
@@ -272,7 +357,7 @@ func TestNilWriterIsSafe(t *testing.T) {
 	w.MCPToolsListed(MCPToolsListed{Server: "s", Tools: []MCPToolListed{{Name: "s__t"}}})
 	w.MCPDisconnect(MCPDisconnect{Server: "s", Reason: "run_end"})
 	w.SetMCPErrors(2)
-	w.RunEnd("success", 0, 1, 1, 1, time.Second)
+	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
 	if w.Path() != "" {
 		t.Error("nil writer path should be empty")
 	}
@@ -298,20 +383,35 @@ func TestSummary(t *testing.T) {
 		turns     int
 		toolCalls int
 		tokens    int
+		cached    int
 		want      string
 	}{
-		{"plural", true, 8, 3, 41234, "✓ 8 turns, 3 tool calls, 41.2k tokens, 34.0s"},
-		{"failure mark", false, 8, 3, 900, "✗ 8 turns, 3 tool calls, 900 tokens, 34.0s"},
-		{"millions of tokens", true, 8, 3, 2_500_000, "✓ 8 turns, 3 tool calls, 2.5M tokens, 34.0s"},
+		{"plural", true, 8, 3, 41234, 0, "✓ 8 turns, 3 tool calls, 41.2k tokens, 34.0s"},
+		{"failure mark", false, 8, 3, 900, 0, "✗ 8 turns, 3 tool calls, 900 tokens, 34.0s"},
+		{"millions of tokens", true, 8, 3, 2_500_000, 0, "✓ 8 turns, 3 tool calls, 2.5M tokens, 34.0s"},
 		// The one-turn run is the common case for a cron agent that answers
 		// without calling a tool, so "1 turns, 0 tool calls" was the line
 		// operators read most often.
-		{"single turn", true, 1, 1, 12, "✓ 1 turn, 1 tool call, 12 tokens, 34.0s"},
-		{"zero counts stay plural", true, 0, 0, 0, "✓ 0 turns, 0 tool calls, 0 tokens, 34.0s"},
+		{"single turn", true, 1, 1, 12, 0, "✓ 1 turn, 1 tool call, 12 tokens, 34.0s"},
+		{"zero counts stay plural", true, 0, 0, 0, 0, "✓ 0 turns, 0 tool calls, 0 tokens, 34.0s"},
+		// The cached parenthetical: present only when the run actually read
+		// from a cache, so an uncached run prints the pre-v0.3 line unchanged
+		// (the four rows above are that claim).
+		{"cached share", true, 8, 3, 41000, 28000, "✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s"},
+		// Small cached counts stay bare integers, like the token total does.
+		{"small cached share", true, 1, 0, 1200, 999, "✓ 1 turn, 0 tool calls, 1.2k tokens (999 cached), 34.2s"},
+		// A failed run still reports what its cache reads saved.
+		{"cached on failure", false, 2, 0, 5000, 1000, "✗ 2 turns, 0 tool calls, 5.0k tokens (1.0k cached), 34.2s"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Summary(tt.ok, tt.turns, tt.toolCalls, tt.tokens, 34*time.Second)
+			// The cached rows want a fractional second in the line, so the
+			// duration differs per row: 34.0s for the uncached legacy rows.
+			d := 34 * time.Second
+			if tt.cached > 0 {
+				d = 34200 * time.Millisecond
+			}
+			got := Summary(tt.ok, tt.turns, tt.toolCalls, tt.tokens, tt.cached, d)
 			if got != tt.want {
 				t.Errorf("Summary: got %q want %q", got, tt.want)
 			}
@@ -407,7 +507,7 @@ func TestToolResultOutcomeFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			w.ToolResult(tt.result)
-			w.RunEnd("success", 0, 1, 1, 1, time.Second)
+			w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
 
 			ev := firstEvent(t, w.Path())
 			if got := ev["outcome"]; got != tt.wantOutcome {
@@ -440,7 +540,7 @@ func TestToolResultBytesArePreClip(t *testing.T) {
 	}
 	const size = maxLoggedField * 3
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: strings.Repeat("x", size), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 1, time.Second)
+	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
 
 	ev := firstEvent(t, w.Path())
 	if got := ev["result_bytes"]; got != float64(size) {
@@ -461,7 +561,7 @@ func TestToolResultTruncatedFlag(t *testing.T) {
 	}
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "fs_read", Result: "x", Outcome: OutcomeOK, Truncated: true})
 	w.ToolResult(ToolResult{CallID: "c2", Tool: "fs_read", Result: "y", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 2, 2, time.Second)
+	w.RunEnd("success", 0, 1, 2, 2, 0, time.Second)
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -490,7 +590,7 @@ func TestOutcomeFieldsAreToolResultOnly(t *testing.T) {
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "text", ToolCallIDs: []string{"c1"}, InputTokens: 1, OutputTokens: 1, FinishReason: "tool_calls"})
 	w.ToolCall("c1", "shell", "{}")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: "out", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 2, time.Second)
+	w.RunEnd("success", 0, 1, 1, 2, 0, time.Second)
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -580,7 +680,7 @@ func TestGoldenMCP(t *testing.T) {
 	w.ToolResult(ToolResult{CallID: "call_2", Tool: "github__x", Result: "no response", Outcome: OutcomeIndeterminate})
 	w.MCPDisconnect(MCPDisconnect{Server: "github", Reason: "run_end"})
 	w.SetMCPErrors(1)
-	w.RunEnd("success", 0, 2, 2, 300, 1500*time.Millisecond)
+	w.RunEnd("success", 0, 2, 2, 300, 0, 1500*time.Millisecond)
 
 	got, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -639,7 +739,7 @@ func TestWriterConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	w.RunEnd("success", 0, 1, 0, 0, 0)
+	w.RunEnd("success", 0, 1, 0, 0, 0, 0)
 
 	data, rerr := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
 	if rerr != nil {
@@ -882,7 +982,7 @@ func TestWriterRedactsSecretAddedAfterNew(t *testing.T) {
 	}
 	secrets.Add("tok-123")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "mcp__x__y", Result: "auth used tok-123", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 10, time.Second)
+	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {

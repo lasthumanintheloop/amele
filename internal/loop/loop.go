@@ -375,6 +375,9 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 			Turn: l.TurnBase + turn, Content: resp.Message.Content,
 			ToolCallIDs: toolCallIDs(resp.Message.ToolCalls),
 			InputTokens: resp.Usage.InputTokens, OutputTokens: resp.Usage.OutputTokens,
+			// The cache counts are a subset of InputTokens (see llm.Usage), so
+			// they are recorded, never summed into the turn's total.
+			CacheReadTokens: resp.Usage.CacheReadTokens, CacheWriteTokens: resp.Usage.CacheWriteTokens,
 			FinishReason: resp.FinishReason, ReasoningBytes: len(resp.Message.Reasoning),
 			Reasoning: string(resp.Message.Reasoning),
 		})

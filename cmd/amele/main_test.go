@@ -3318,6 +3318,53 @@ func TestInitTemplateMatchesSchema(t *testing.T) {
 // both live entirely on stderr: stdout is the product channel and neither flag
 // may touch it (docs/contracts/cli.md).
 
+// textBodyCached is textBody with a prompt-cache hit reported the canonical
+// OpenAI way (prompt_tokens_details.cached_tokens), where the cached share is
+// already INSIDE prompt_tokens.
+func textBodyCached(content string) string {
+	b, _ := json.Marshal(content)
+	return fmt.Sprintf(`{
+		"choices": [{"message": {"role": "assistant", "content": %s}, "finish_reason": "stop"}],
+		"usage": {"prompt_tokens": 1000, "completion_tokens": 20,
+			"prompt_tokens_details": {"cached_tokens": 800}}
+	}`, b)
+}
+
+// TestSummaryReportsCachedTokens: a run whose prompt was partly served from the
+// provider's cache says so on the summary line and in run_end, and a run that
+// read no cache prints the same line it always did - the parenthetical is
+// additive, not a reformat.
+func TestSummaryReportsCachedTokens(t *testing.T) {
+	t.Run("cached", func(t *testing.T) {
+		srv := scriptedServer(t, textBodyCached("final answer"))
+		cfgPath, dir := writeTestConfig(t, srv.URL, "session_dir: sessions\n")
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "1.0k tokens (800 cached)") {
+			t.Errorf("summary missing the cached share: %q", stderr)
+		}
+		if raw := readSessionRaw(t, dir); !strings.Contains(raw, `"cache_read_tokens":800`) {
+			t.Errorf("run_end missing the cache read total:\n%s", raw)
+		}
+	})
+
+	t.Run("uncached", func(t *testing.T) {
+		srv := scriptedServer(t, textBody("final answer"))
+		cfgPath, _ := writeTestConfig(t, srv.URL, "")
+
+		code, _, stderr := execCLI(t, []string{"run", cfgPath, "task"}, "")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		if !strings.Contains(stderr, "15 tokens,") || strings.Contains(stderr, "cached") {
+			t.Errorf("an uncached run must print the pre-v0.3 line: %q", stderr)
+		}
+	})
+}
+
 // TestQuietSuppressesSummary pins the headline effect: a successful quiet run
 // says nothing at all, so a cron job's MAILTO only ever fires on trouble.
 func TestQuietSuppressesSummary(t *testing.T) {
