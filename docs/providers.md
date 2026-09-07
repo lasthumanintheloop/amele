@@ -174,7 +174,9 @@ gemini wire is the one that carries the provider's wish somewhere else - a 429
 there has **no `Retry-After` header**, and the delay arrives in the error body
 as a `google.rpc.RetryInfo` detail; amele reads it and feeds the same
 stretch-never-shrink mechanism. When the attempts run out, the run ends as a provider error
-(exit 5), so a longer ladder trades latency for surviving a rate-limit window.
+(exit 5) - or moves to the next
+[fallback target](#provider-fallback), if the config names one - so a longer
+ladder trades latency for surviving a rate-limit window.
 `limits.timeout` stays the wall-clock kill switch above all of it: a backoff
 wait is cut short when the run deadline fires, and the run then ends as a
 budget timeout (exit 3), not as a provider error.
@@ -985,6 +987,108 @@ thinking" and "another model" is a decision about the agent's quality, and an
 agent framework that made it behind your back would be lying about what it
 sent.
 
+## Provider fallback
+
+One endpoint is one point of failure. `provider.fallback` names the targets to
+try when the current one stops answering, in order:
+
+```yaml
+model: gpt-5.6
+provider:
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  fallback:
+    - model: claude-opus-5
+      type: anthropic
+      api_key: ${ANTHROPIC_API_KEY}
+    - model: deepseek-v4
+      base_url: https://api.deepseek.com/v1
+      dialect: deepseek
+      api_key: ${DEEPSEEK_API_KEY}
+      reasoning: {effort: low}
+```
+
+Each entry is a **complete provider block** - its own type, endpoint,
+credential, dialect, retry policy and tuning - plus its own required `model`.
+Nothing is inherited: a backup endpoint is a different vendor as often as not,
+and forwarding the primary's model name would turn a failover into a 404 at the
+worst possible moment. Entries cannot nest, and there are at most **four** of
+them: past a handful the order stops being something a person can hold in their
+head, and every extra entry is another endpoint nobody exercises until the day
+it has to work.
+
+**What triggers it.** Any provider-class failure, after that target's own
+`retry` policy is exhausted - the whole
+[exit 5](contracts/exit-codes.md#5---provider-error) class: transport failures,
+non-2xx responses, undecodable replies. That includes a **400 and a 401**: a
+wrong key or a parameter this model rejects moves the run onto the backup
+rather than stopping it. The consequence is worth stating plainly - **a
+fallback that succeeds can mask a primary misconfiguration for the rest of the
+run.** The `provider_fallback` event in the session log and the `-v` line are
+how you notice:
+
+```
+amele: turn 1: provider error on gpt-5.6 (openai); falling back to claude-opus-5 (anthropic)
+```
+
+Nothing else falls back. A budget kill (exit 3), a permission abort (exit 4)
+and an unmet output schema (exit 6) never ask a second endpoint to repeat a run
+that your own limits - or a refused tool call - stopped on purpose, and neither
+does a run you interrupted: a Ctrl-C is not an outage.
+
+**Sequential and sticky.** The run tries entry 1, then entry 2, and **stays**
+on whichever one answers. It never returns to the primary, and it never races
+two endpoints against each other: re-probing a known-down endpoint would pay
+its timeout again on every turn, which is the cost the fallback exists to
+avoid. In `chat` the stickiness lasts the whole session, not the exchange - one
+outage does not cost you a failed turn per message.
+
+**It costs a turn.** The failed attempt is a real round-trip, so it is counted
+against `limits.max_turns`, and so is the retry on the next backend. A chain
+cannot overspend a budget you set: with `max_turns: 1` a dead primary ends the
+run at exit 3 rather than borrowing a turn from the backup.
+
+**Crossing wires drops the reasoning carriers.** Reasoning payloads are
+provider-scoped - Anthropic signs its thinking blocks, DeepSeek hash-checks its
+`reasoning_content`, Gemini carries thought signatures - and each is either
+rejected or meaningless at another family's endpoint (see
+[Reasoning costs tokens twice](#reasoning-costs-tokens-twice)). So a switch
+that CROSSES identities strips them from the history it re-sends, and a switch
+*inside* one identity keeps them, because that family may require them back
+byte-for-byte. **Caveat, honestly stated:** stripping does not make every
+history portable. A thinking-enabled Anthropic model can still refuse a last
+assistant turn that requests tools without its signed block. That ends the run
+with the provider's own error, which is the truthful outcome - better than
+echoing a signature the new endpoint cannot verify. A chain whose entries all
+speak the same wire family never meets this at all.
+
+**Every key is a key.** `api_key` in a fallback entry obeys the same rule as
+the primary's: `${VAR}` only, a literal is a validation error naming the entry
+(`provider.fallback[1].api_key`). Every entry's credential is registered with
+the run's redactor **before the first call**, whether or not the run ever
+reaches that entry, so a backup that echoes its own key back in an error body
+cannot write it into the log. Every entry is also *built* before the run
+starts: a mistyped dialect in the third entry fails the run at exit 2, while it
+has cost nothing, instead of two minutes in when the primary is down and that
+entry is the only thing left.
+
+**Pre-flight it.** `amele explain` closes the `MODEL & PROVIDER` block with one
+row per entry, and lists each entry's `${VAR}`s in `REQUIREMENTS` - a fallback
+whose credential is unset should be visible now, not during an outage:
+
+```console
+  fallback 1:      "claude-opus-5" via anthropic (default: api.anthropic.com)
+  fallback 2:      "deepseek-v4" via openai/deepseek "https://api.deepseek.com/v1"
+```
+
+**What it is not.** It is availability, not orchestration: no routing by cost
+or by prompt, no fail-back to the primary once it recovers, no racing several
+endpoints for the first answer, no per-turn re-evaluation. amele walks a list
+you wrote, top to bottom, once. When the list runs out the run fails with the
+**last** endpoint's error at exit 5 - the earlier failures are in the session
+log, each on its own `provider_fallback` event
+([JSONL contract](contracts/jsonl-events.md)).
+
 ## What amele does not do
 
 - **No dialect auto-detection.** `explain` prints
@@ -1052,7 +1156,8 @@ stdout, and no truncated turn in the session log.
 - [features.md](features.md) - structured output, permissions, `chat`.
 - [contracts/cli.md](contracts/cli.md) - the `explain` report and the `--set`
   allowlist.
-- [contracts/jsonl-events.md](contracts/jsonl-events.md) - `reasoning_bytes`.
+- [contracts/jsonl-events.md](contracts/jsonl-events.md) - `reasoning_bytes`,
+  and the `provider_fallback` event.
 - [contracts/exit-codes.md](contracts/exit-codes.md) - exit 3 (budgets), 5
   (provider errors), 6 (schema).
 - [mcp.md](mcp.md) - borrowing tools from MCP servers, which is where the tool

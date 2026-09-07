@@ -371,7 +371,7 @@ changes require a semver major and a migration note.
 | 2 | config or usage error |
 | 3 | budget exceeded |
 | 4 | permission denied, could not continue |
-| 5 | provider/network error, retries exhausted |
+| 5 | provider/network error, retries and any fallback targets exhausted |
 | 6 | output schema unmet |
 | 7 | run lock held by another run |
 | 8 | a required MCP server was unavailable |

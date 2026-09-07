@@ -1,9 +1,9 @@
-# Structured output, permissions, shell, chat and parallel tool calls
+# Structured output, permissions, shell, chat, parallel tool calls and fallback
 
-Beyond the core `run` + `validate`, five features round out the agent: structured
+Beyond the core `run` + `validate`, six features round out the agent: structured
 output, permission profiles, a builtin `shell` tool, an interactive `chat`
-mode, and parallel tool calls. Everything below is configured in the same single
-YAML file.
+mode, parallel tool calls, and provider fallback. Everything below is configured
+in the same single YAML file.
 
 Exit codes are unchanged and frozen
 ([contract](contracts/exit-codes.md)):
@@ -261,6 +261,36 @@ not be: two subprocess tools appending to the same file, a script with a lock
 file, an MCP server that serializes requests badly. Those are the cases
 `parallel: false` exists for.
 
+## Provider fallback (`provider.fallback`)
+
+One endpoint is one point of failure. List the targets to try when the current
+one stops answering:
+
+```yaml
+model: gpt-5.6
+provider:
+  base_url: https://api.openai.com/v1
+  api_key: ${OPENAI_API_KEY}
+  fallback:
+    - model: claude-opus-5
+      type: anthropic
+      api_key: ${ANTHROPIC_API_KEY}
+```
+
+Each entry is a complete provider block plus its own required `model` (nothing
+is inherited), at most four of them, no nesting. The run moves on any
+provider-class failure - the [exit 5](contracts/exit-codes.md#5---provider-error)
+class, after that target's own retries - and **stays** on whichever entry
+answers: sequential, sticky, never back to the primary, never two endpoints
+raced against each other. The failed attempt and the retry are both ordinary
+turns, so a chain cannot overspend `limits.max_turns`. When the list runs out
+the run fails with the last endpoint's error at exit 5.
+
+Full rules - what falls back and what deliberately does not, the reasoning
+carriers dropped when a switch crosses wire families, and why a fallback that
+succeeds can mask a broken primary - are in
+[docs/providers.md](providers.md#provider-fallback).
+
 ## Session logs
 
 All of the above is recorded when `session_dir` is set (one JSONL file per run
@@ -310,3 +340,12 @@ no cache reads prints the line exactly as before. Where the caching comes from
 depends on the wire: amele places the markers itself on the anthropic wire
 (`provider.prompt_cache`, on by default), while every other endpoint decides on
 its own - see [docs/providers.md](providers.md#prompt-caching).
+
+`run_start` names the backend the run started on (`provider`: `openai`,
+`openai/<dialect>`, `anthropic`, `gemini` or `gemini/vertex`), and any turn
+served by a *different* one - after a `provider.fallback` switch - carries its
+own `model` and `provider` on the `llm_response`; both keys are absent while
+the run stays where it started. Each switch itself is one `provider_fallback`
+event (`turn`, the redacted `error` that caused it, the 0-based `from`/`to`
+positions in the chain, and both ends' models and identities), and
+`run_end.fallbacks` counts them - absent when there were none.

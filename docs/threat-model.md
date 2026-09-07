@@ -249,6 +249,16 @@ server is acceptable - which is what granting them already means.
   `docs/packs.md` makes credential naming a pack rule. Session-log redaction
   is unaffected and stays unconditional by value.
 
+- **A fallback target's key is a key.** Each `provider.fallback` entry carries
+  its own `api_key`, under exactly the primary's rules: `${ENV_VAR}` only (a
+  literal is a validation error naming the entry,
+  `provider.fallback[1].api_key`), and every entry's value is registered with
+  the run's redactor **before the first provider call** - not lazily when the
+  chain reaches it. A chain therefore widens the run's credential set: one run
+  now holds up to five API keys, and the model's blast radius (§5.1) includes
+  every endpoint they open. The session log names the wire family a turn was
+  served by, never the `base_url` and never the key.
+
 - **OAuth credentials live on disk, and the file permissions are the whole
   fence.** `amele mcp login` writes one `0600` JSON record per credential
   (access token, refresh token, expiry, issuer) into a `0700`
@@ -456,8 +466,10 @@ but success responses are JSON-decoded from the network without a size
 bound, and we make no attempt to defend against a *malicious provider*: an
 endpoint that colludes with the attacker controls the model outright, and
 no downstream mechanism recovers from that. Choosing `provider.base_url`
-is choosing a trusted dependency. TLS verification uses the system trust
-store.
+is choosing a trusted dependency - and a `provider.fallback` chain chooses
+several: every entry is a provider the run may end up trusting outright, so a
+chain is only as trustworthy as its least trustworthy entry. TLS verification
+uses the system trust store.
 
 **The provider's exemption does not extend to MCP servers.** An MCP server is
 not a trusted dependency in the same sense (§2), so its traffic is bounded
