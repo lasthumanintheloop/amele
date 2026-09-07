@@ -116,10 +116,12 @@ native Gemini one.
 With a fallback chain configured, this code means **every** target failed: the
 error reported is the LAST one's, because that is the endpoint that finally
 refused - the earlier failures are in the session log, each on its own
-`provider_fallback` event (jsonl-events.md). A chain does not change which
-failures fall back either: the whole exit-5 class does, including a 400 or a
-401, so a wrong key or a malformed parameter on the primary moves the run onto
-the backup rather than stopping it. Only the exit-5 class falls back - a budget
+`provider_fallback` event (jsonl-events.md). The message names that last
+backend (its model and provider identity) and how many fallback targets the run
+had tried, since a provider's own text rarely says which host produced it. A
+chain does not change which failures fall back either: the whole exit-5 class
+does, including a 400 or a 401, so a wrong key or a malformed parameter on the
+primary moves the run onto the backup rather than stopping it. Only the exit-5 class falls back - a budget
 kill (3), a permission abort (4) or an unmet output schema (6) never asks a
 second endpoint to repeat what the operator's own limits stopped on purpose.
 

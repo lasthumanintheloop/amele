@@ -2013,6 +2013,18 @@ func TestProviderFallbackExhaustedPropagatesLastError(t *testing.T) {
 	if !strings.Contains(err.Error(), "backup down") {
 		t.Errorf("error = %v, want the LAST backend's failure", err)
 	}
+	// The provider's own text names no endpoint: "backup down" reads like the
+	// primary's failure to anyone who did not write the config. The wrap is
+	// what turns it into a report an operator can act on without opening the
+	// YAML, so it is pinned verbatim.
+	if want := " (after 1 fallback target(s); last backend: backup-model (anthropic))"; !strings.HasSuffix(err.Error(), want) {
+		t.Errorf("error = %q, want it to end with %q", err.Error(), want)
+	}
+	// CONTRACT: the wrap must not cost the sentinel - an exhausted chain is
+	// still exit 5.
+	if !errors.Is(err, llm.ErrProvider) {
+		t.Errorf("the wrap lost llm.ErrProvider, which is exit 5: %v", err)
+	}
 	if res.Fallbacks != 1 {
 		t.Errorf("Result.Fallbacks = %d, want 1", res.Fallbacks)
 	}

@@ -4927,6 +4927,12 @@ func TestE2EProviderFallback(t *testing.T) {
 		if code != ExitProviderError {
 			t.Fatalf("exit %d, want %d; stderr: %s", code, ExitProviderError, stderr)
 		}
+		// The operator reads stderr, not the JSONL. A bare "500 upstream is
+		// down" would send them to the primary's host, which is not the
+		// machine that finally refused.
+		if !strings.Contains(stderr, "last backend:") {
+			t.Errorf("stderr does not name the backend the run died on: %q", stderr)
+		}
 		raw := readSessionRaw(t, dir)
 		if !strings.Contains(raw, `"fallbacks":1`) {
 			t.Errorf("run_end must still count the switch it made:\n%s", raw)

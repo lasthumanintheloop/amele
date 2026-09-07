@@ -426,7 +426,10 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 				messages = next
 				continue
 			}
-			return finish(err)
+			// b is the turn's own backend, read before the request:
+			// switchBackend just declined to move, so it is still the target
+			// that failed.
+			return finish(chainExhausted(err, res, b))
 		}
 
 		// Saturating add, not +=: a provider reporting near-max token counts
@@ -658,6 +661,27 @@ func (l *Loop) switchBackend(cause error, res *Result, turn int, messages []llm.
 	l.progressf("turn %d: provider error on %s (%s); falling back to %s (%s)",
 		l.TurnBase+turn, from.Model, from.Identity, to.Model, to.Identity)
 	return messages, true
+}
+
+// chainExhausted annotates the error that ends a run after at least one
+// fallback, naming the backend that finally refused and how many targets were
+// tried. It returns err untouched for a run that never fell back, so a
+// single-target config's message is byte-identical to what it always was.
+//
+// CONTRACT: the error a spent chain reports is the LAST backend's, verbatim
+// (spec ruling 9) - but "503 unavailable" names no endpoint, and an operator
+// reading a cron mail has no way to tell which of three hosts said it. This
+// adds the two facts the provider's text cannot carry and nothing else. %w
+// keeps llm.ErrProvider, so the exit code stays 5.
+//
+// It is a function rather than an inline branch because RunMessages sits at the
+// cyclomatic ceiling; the same reason switchBackend is one.
+func chainExhausted(err error, res *Result, last Backend) error {
+	if res.Fallbacks == 0 {
+		return err
+	}
+	return fmt.Errorf("%w (after %d fallback target(s); last backend: %s (%s))",
+		err, res.Fallbacks, last.Model, last.Identity)
 }
 
 // stripCarriers returns a COPY of the history with every assistant message's
