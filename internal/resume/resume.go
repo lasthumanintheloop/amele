@@ -24,6 +24,17 @@
 //     what the model saw and is ignored here; provider_fallback is read in a
 //     pre-scan, for carriers only.
 //
+// A file whose LAST line is torn - a prefix of an event with no newline after
+// it, which is what a SIGKILL mid-write leaves behind - ends there: the events
+// before it are complete, and that is the position the resumed run continues
+// from. A line that does not parse anywhere else is a damaged file
+// (ErrMalformed).
+//
+// Two llm_response events in a row where the first requested no tool calls mean
+// a user turn happened that the log does not record (today: the output.schema
+// validator's feedback). Such a log is refused with ErrNotResumable rather than
+// rebuilt into a conversation that never happened.
+//
 // A call the turn requested but never dispatched - no tool_call event, because
 // the run died between the two writes - is DROPPED from the assistant message
 // instead of being invented: its name and arguments were never written, so
@@ -50,6 +61,7 @@
 package resume
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -139,6 +151,11 @@ const PendingResultMessage = "error: the previous run was interrupted before thi
 // it, not one task to finish, so its log is refused rather than continued.
 const chatTask = "interactive chat"
 
+// redactedMarker is what session.SecretSet.Redact leaves in place of a secret.
+// It is spelled here rather than imported because session offers no name for
+// it; the two must not drift, which is why the resume tests pin the string.
+const redactedMarker = "[REDACTED]"
+
 // The event types this package understands. The rest are ignored by name, not
 // by omission, so an added event type cannot silently change a replay.
 const (
@@ -186,34 +203,55 @@ func ReadFrom(r io.Reader, opts Options) (*Replay, error) {
 	return &b.rep, nil
 }
 
-// decode reads the whole log into memory.
+// decode reads the whole log into memory, one JSONL line at a time.
 //
 // Whole, because two passes are needed anyway (a provider_fallback anywhere in
 // the file disables carriers for the turns before it), and a session log is
-// bounded by the run's own token and tool-output budgets. json.Decoder rather
-// than a line scanner: a full-record log (limits.max_logged_field: 0) can carry
-// a tool result far past any line-buffer size worth picking, and a reader that
-// fails on long lines would fail exactly on the logs resume exists for.
+// bounded by the run's own token and tool-output budgets. Lines rather than a
+// json.Decoder stream: the torn-line rule below is a statement about POSITION
+// in the file, and only a line split can tell "the last thing in the file" from
+// "something in the middle of it". Splitting on the newline is safe for JSONL -
+// a JSON string cannot contain a literal newline - and there is no line-buffer
+// cap to trip over, which matters because a full-record log
+// (limits.max_logged_field: 0) is exactly the log resume exists for.
+//
+// A torn LAST line is end of file, not corruption: the writer emits one line
+// per Write, so a SIGKILL or a power loss can leave a prefix of the final event
+// on disk with no newline after it. That is rule (d) of the resume design - the
+// history ends at the last complete position - and refusing there would refuse
+// precisely the crashed runs resume is for. Anywhere else a line that does not
+// parse is a damaged file, and damage is never resumed from silently.
 func decode(r io.Reader) ([]session.Event, error) {
-	dec := json.NewDecoder(r)
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading session log: %w", err)
+	}
+	lines := bytes.Split(data, []byte("\n"))
 	var events []session.Event
-	for {
-		var ev session.Event
-		err := dec.Decode(&ev)
-		if errors.Is(err, io.EOF) {
-			return events, nil
+	for i, line := range lines {
+		// A complete file ends in a newline, so the final split element is
+		// usually empty; a blank line anywhere else is likewise nothing to
+		// decode.
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
 		}
-		if err != nil {
-			// One JSON value per line is the format, so the count of values
-			// already read names the offending line.
-			return nil, fmt.Errorf("%w: line %d: %v", ErrMalformed, len(events)+1, err)
+		var ev session.Event
+		if err := json.Unmarshal(line, &ev); err != nil {
+			if i == len(lines)-1 {
+				// Nothing follows it, not even a newline: a torn tail.
+				return events, nil
+			}
+			return nil, fmt.Errorf("%w: line %d: %v", ErrMalformed, i+1, err)
 		}
 		events = append(events, ev)
 	}
+	return events, nil
 }
 
 // callState tracks one requested tool call across the events of its turn.
 type callState struct {
+	// call is the reproduced tool call, filled in from the tool_call event.
+	call llm.ToolCall
 	// called records that the tool_call event was seen, which is what makes
 	// the call reproducible (it carries the name and arguments).
 	called bool
@@ -305,14 +343,32 @@ func (b *builder) event(ev session.Event) error {
 	case eventToolResult:
 		return b.toolResult(ev)
 	default:
-		// mcp_*, provider_fallback and run_end record what the HARNESS did;
-		// none of them changed the conversation the model was shown.
+		// Everything else is ignored, by design and without inspection: the
+		// event types this reader knows to skip (mcp_connect,
+		// mcp_tools_listed, mcp_disconnect, provider_fallback, run_end)
+		// record what the HARNESS did rather than what the model was shown,
+		// and an event type added by a newer writer within schema v1 is
+		// additive by contract, so ignoring it is the forward-compatible
+		// reading too. provider_fallback is not lost here - hasFallback read
+		// it before the walk.
 		return nil
 	}
 }
 
 // llmResponse closes the previous turn and opens a new assistant message.
 func (b *builder) llmResponse(ev session.Event) error {
+	// CONTRACT: a turn with no tool calls is a final answer, so a second
+	// llm_response after one means SOMETHING was said to the model in
+	// between - today that is the output.schema validator's feedback, which
+	// the log does not record. Rebuilding without it would hand the model a
+	// conversation it never had (and, for a signed-reasoning provider, one
+	// that no longer matches its own carrier), so the log is refused rather
+	// than guessed at. Logging that feedback is a JSONL contract change and
+	// belongs to its own slice.
+	if b.assistant >= 0 && len(b.expected) == 0 {
+		return fmt.Errorf("%w: the log skips a user turn (an output.schema retry's feedback is not logged); the run is not resumable",
+			ErrNotResumable)
+	}
 	b.closeTurn()
 	if err := gateClip("content", ev.Turn, ev.Content); err != nil {
 		return err
@@ -360,6 +416,15 @@ func (b *builder) restoreCarrier(msg *llm.Message, ev session.Event) error {
 	if !b.carriers || ev.Reasoning == "" {
 		return nil
 	}
+	// SECURITY-driven, correctness-visible: the log's redactor rewrote a
+	// secret inside this payload, so the bytes on disk are no longer the bytes
+	// the provider signed or hashed. Echoing them back fails that check (a 400
+	// for the whole request), and un-redacting is not a thing anyone should
+	// want, so the turn is simply rebuilt without a carrier - the conversation
+	// is intact, only the thinking payload is gone.
+	if strings.Contains(ev.Reasoning, redactedMarker) {
+		return nil
+	}
 	// Gated only here: a clipped payload that would not be echoed anyway is
 	// not a reason to refuse an otherwise faithful log.
 	if err := gateClip("reasoning", ev.Turn, ev.Reasoning); err != nil {
@@ -383,11 +448,12 @@ func (b *builder) toolCall(ev session.Event) error {
 		return err
 	}
 	st.called = true
-	// CONTRACT: within a turn the tool events are in the model's call order,
-	// so appending in event order reproduces the assistant message's own
-	// order.
-	m := &b.rep.Messages[b.assistant]
-	m.ToolCalls = append(m.ToolCalls, llm.ToolCall{ID: ev.CallID, Name: ev.Tool, Arguments: ev.Args})
+	st.call = llm.ToolCall{ID: ev.CallID, Name: ev.Tool, Arguments: ev.Args}
+	// The call is NOT appended to the assistant message here: closeTurn puts
+	// the turn's calls back in tool_call_ids order, which is the model's own
+	// order by definition. The events are in that order too (the ordering
+	// guarantees), so this is the same result made structural instead of
+	// dependent on a promise about the file.
 	return nil
 }
 
@@ -436,6 +502,20 @@ func (b *builder) expect(id, kind string) (*callState, error) {
 // It runs before each new llm_response and once at the end of the file, which
 // is what makes an interrupted run (no run_end at all) resumable.
 func (b *builder) closeTurn() {
+	if b.assistant >= 0 {
+		// CONTRACT: tool_call_ids IS the model's call order, so rebuilding
+		// from it needs no assumption about the order the events were written
+		// in. Calls with no tool_call event are skipped here - that is the
+		// drop rule. Left nil when the turn dispatched nothing, so a
+		// tool-less turn keeps a nil slice.
+		var calls []llm.ToolCall
+		for _, id := range b.expected {
+			if st := b.calls[id]; st != nil && st.called {
+				calls = append(calls, st.call)
+			}
+		}
+		b.rep.Messages[b.assistant].ToolCalls = calls
+	}
 	for _, id := range b.expected {
 		st := b.calls[id]
 		if st == nil || !st.called || st.answered {

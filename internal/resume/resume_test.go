@@ -129,24 +129,28 @@ func TestReadFixtures(t *testing.T) {
 			name:      "carriers are restored for the same provider",
 			fixture:   "carriers-anthropic.jsonl",
 			opts:      resume.Options{Provider: "anthropic"},
-			task:      "check app.log for anything unusual",
+			task:      "check app.log and deploy.log for anything unusual",
 			model:     "claude-sonnet-4",
 			provider:  "anthropic",
-			lastTurn:  2,
+			lastTurn:  3,
 			completed: true,
 			carriers:  true,
 			messages: []llm.Message{
-				user("check app.log for anything unusual"),
+				user("check app.log and deploy.log for anything unusual"),
 				{
 					Role:      llm.RoleAssistant,
 					ToolCalls: []llm.ToolCall{{ID: "call_1", Name: "fs_read", Arguments: `{"path":"app.log"}`}},
-					Reasoning: json.RawMessage(`[{"type":"thinking","thinking":"The log lives at app.log; read it first.","signature":"Ej8BCkYIBBgCIkA="}]`),
+					Reasoning: json.RawMessage(carrierTurn1),
 				},
 				toolMsg("call_1", "WARN retrying in 5s"),
+				// Turn 2's payload was rewritten by the redactor, so it is not
+				// echoed back - the turn keeps its text and tool call only.
+				assistant("", llm.ToolCall{ID: "call_2", Name: "fs_read", Arguments: `{"path":"deploy.log"}`}),
+				toolMsg("call_2", "deployed 2026-09-04 with key [REDACTED]"),
 				{
 					Role:      llm.RoleAssistant,
 					Content:   "One retry warning, nothing unusual.",
-					Reasoning: json.RawMessage(`[{"type":"thinking","thinking":"A retry warning is routine.","signature":"Ej8BCkYIBBgCIkB="}]`),
+					Reasoning: json.RawMessage(carrierTurn3),
 				},
 			},
 		},
@@ -154,15 +158,17 @@ func TestReadFixtures(t *testing.T) {
 			name:      "a different provider gets no carriers",
 			fixture:   "carriers-anthropic.jsonl",
 			opts:      resume.Options{Provider: "openai"},
-			task:      "check app.log for anything unusual",
+			task:      "check app.log and deploy.log for anything unusual",
 			model:     "claude-sonnet-4",
 			provider:  "anthropic",
-			lastTurn:  2,
+			lastTurn:  3,
 			completed: true,
 			messages: []llm.Message{
-				user("check app.log for anything unusual"),
+				user("check app.log and deploy.log for anything unusual"),
 				assistant("", llm.ToolCall{ID: "call_1", Name: "fs_read", Arguments: `{"path":"app.log"}`}),
 				toolMsg("call_1", "WARN retrying in 5s"),
+				assistant("", llm.ToolCall{ID: "call_2", Name: "fs_read", Arguments: `{"path":"deploy.log"}`}),
+				toolMsg("call_2", "deployed 2026-09-04 with key [REDACTED]"),
 				assistant("One retry warning, nothing unusual."),
 			},
 		},
@@ -170,15 +176,17 @@ func TestReadFixtures(t *testing.T) {
 			name:      "an unnamed provider gets no carriers",
 			fixture:   "carriers-anthropic.jsonl",
 			opts:      resume.Options{},
-			task:      "check app.log for anything unusual",
+			task:      "check app.log and deploy.log for anything unusual",
 			model:     "claude-sonnet-4",
 			provider:  "anthropic",
-			lastTurn:  2,
+			lastTurn:  3,
 			completed: true,
 			messages: []llm.Message{
-				user("check app.log for anything unusual"),
+				user("check app.log and deploy.log for anything unusual"),
 				assistant("", llm.ToolCall{ID: "call_1", Name: "fs_read", Arguments: `{"path":"app.log"}`}),
 				toolMsg("call_1", "WARN retrying in 5s"),
+				assistant("", llm.ToolCall{ID: "call_2", Name: "fs_read", Arguments: `{"path":"deploy.log"}`}),
+				toolMsg("call_2", "deployed 2026-09-04 with key [REDACTED]"),
 				assistant("One retry warning, nothing unusual."),
 			},
 		},
@@ -230,6 +238,14 @@ func assertMessages(t *testing.T, got, want []llm.Message) {
 	}
 }
 
+// The carriers as the anthropic client stores them: the ENTIRE raw content
+// array, thinking blocks interleaved with the tool_use/text blocks they were
+// produced with, which is the unit Anthropic requires back byte-exact.
+const (
+	carrierTurn1 = `[{"type":"thinking","thinking":"The application log lives at app.log; read it first.","signature":"Ej8BCkYIBBgCIkA="},{"type":"tool_use","id":"call_1","name":"fs_read","input":{"path":"app.log"}}]`
+	carrierTurn3 = `[{"type":"thinking","thinking":"A retry warning is routine.","signature":"Ej8BCkYIBBgCIkC="},{"type":"text","text":"One retry warning, nothing unusual."}]`
+)
+
 // The reasoning payload is echoed back to a provider that signs it, so the
 // restored bytes must be the logged bytes - not a re-encoding of them.
 func TestCarrierBytesAreExact(t *testing.T) {
@@ -237,12 +253,16 @@ func TestCarrierBytesAreExact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Read = %v, want no error", err)
 	}
-	want := `[{"type":"thinking","thinking":"The log lives at app.log; read it first.","signature":"Ej8BCkYIBBgCIkA="}]`
-	if string(got.Messages[1].Reasoning) != want {
-		t.Errorf("Reasoning = %q, want %q", got.Messages[1].Reasoning, want)
+	if string(got.Messages[1].Reasoning) != carrierTurn1 {
+		t.Errorf("Reasoning = %q, want %q", got.Messages[1].Reasoning, carrierTurn1)
 	}
 	if got.Messages[1].ReasoningField != "" {
 		t.Errorf("ReasoningField = %q, want empty (the client's default key applies)", got.Messages[1].ReasoningField)
+	}
+	// The redacted payload is dropped, not repaired: its bytes no longer match
+	// the signature the provider gave them.
+	if got.Messages[3].Reasoning != nil {
+		t.Errorf("redacted carrier = %q, want nil", got.Messages[3].Reasoning)
 	}
 }
 
@@ -360,6 +380,21 @@ func TestReadRejects(t *testing.T) {
 			log:      runStart + "\nnot json at all\n",
 			want:     resume.ErrMalformed,
 			contains: []string{"line 2"},
+		},
+		{
+			// Not the last line: something complete follows it, so the file is
+			// damaged rather than cut short.
+			name: "a torn line in the middle of the file",
+			log: runStart + "\n" + `{"v":1,"type":"llm_res` + "\n" +
+				`{"v":1,"type":"llm_response","ts":"2026-09-05T03:00:01Z","turn":1,"content":"done","finish_reason":"stop"}` + "\n",
+			want:     resume.ErrMalformed,
+			contains: []string{"line 2"},
+		},
+		{
+			name:     "a log that skips the validator's feedback turn",
+			log:      readFixture(t, "schema-retry.jsonl"),
+			want:     resume.ErrNotResumable,
+			contains: []string{"skips a user turn", "output.schema"},
 		},
 		{
 			name:     "a future schema version",
@@ -486,6 +521,91 @@ func TestReadNamesThePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), path) {
 		t.Errorf("error %q does not name the path %q", err, path)
+	}
+}
+
+// A hard kill leaves a prefix of the event it was writing on disk. That is the
+// case resume exists for, so the history ends at the last complete line.
+func TestTornFinalLineEndsTheHistory(t *testing.T) {
+	log := runStart + "\n" +
+		`{"v":1,"type":"llm_response","ts":"2026-09-05T03:00:01Z","turn":1,"tool_call_ids":["c1"],"finish_reason":"tool_calls"}` + "\n" +
+		`{"v":1,"type":"tool_call","ts":"2026-09-05T03:00:02Z","tool_call_id":"c1","tool":"fs_read","args":"{}"}` + "\n" +
+		`{"v":1,"type":"tool_result","ts":"2026-09-05T03:00:03Z","tool_call_id":"c1","tool":"fs_read","resu`
+	got, err := resume.ReadFrom(strings.NewReader(log), resume.Options{})
+	if err != nil {
+		t.Fatalf("ReadFrom = %v, want no error", err)
+	}
+	if got.LastTurn != 1 {
+		t.Errorf("LastTurn = %d, want 1", got.LastTurn)
+	}
+	// The torn tool_result never happened as far as the log can prove, so its
+	// call is pending, not answered.
+	if !reflect.DeepEqual(got.Pending, []string{"c1"}) {
+		t.Errorf("Pending = %#v, want [c1]", got.Pending)
+	}
+	assertMessages(t, got.Messages, []llm.Message{
+		user("scan the logs"),
+		assistant("", llm.ToolCall{ID: "c1", Name: "fs_read", Arguments: "{}"}),
+		toolMsg("c1", resume.PendingResultMessage),
+	})
+}
+
+// Pending and the synthetic messages follow the model's call order, which is
+// tool_call_ids order - not the order the events happen to be written in.
+func TestPendingKeepsCallOrder(t *testing.T) {
+	log := runStart + "\n" +
+		`{"v":1,"type":"llm_response","ts":"2026-09-05T03:00:01Z","turn":1,"content":"both","tool_call_ids":["c1","c2"],"finish_reason":"tool_calls"}` + "\n" +
+		`{"v":1,"type":"tool_call","ts":"2026-09-05T03:00:02Z","tool_call_id":"c1","tool":"disk","args":"{}"}` + "\n" +
+		`{"v":1,"type":"tool_call","ts":"2026-09-05T03:00:02Z","tool_call_id":"c2","tool":"queue","args":"{}"}` + "\n"
+	got, err := resume.ReadFrom(strings.NewReader(log), resume.Options{})
+	if err != nil {
+		t.Fatalf("ReadFrom = %v, want no error", err)
+	}
+	if !reflect.DeepEqual(got.Pending, []string{"c1", "c2"}) {
+		t.Errorf("Pending = %#v, want [c1 c2]", got.Pending)
+	}
+	assertMessages(t, got.Messages, []llm.Message{
+		user("scan the logs"),
+		assistant("both",
+			llm.ToolCall{ID: "c1", Name: "disk", Arguments: "{}"},
+			llm.ToolCall{ID: "c2", Name: "queue", Arguments: "{}"}),
+		toolMsg("c1", resume.PendingResultMessage),
+		toolMsg("c2", resume.PendingResultMessage),
+	})
+}
+
+// The assistant message's calls come back in tool_call_ids order even when the
+// events were written in another one, because that order is the model's.
+func TestToolCallsFollowTheRequestedOrder(t *testing.T) {
+	log := runStart + "\n" +
+		`{"v":1,"type":"llm_response","ts":"2026-09-05T03:00:01Z","turn":1,"tool_call_ids":["c1","c2"],"finish_reason":"tool_calls"}` + "\n" +
+		`{"v":1,"type":"tool_call","ts":"2026-09-05T03:00:02Z","tool_call_id":"c2","tool":"queue","args":"{}"}` + "\n" +
+		`{"v":1,"type":"tool_call","ts":"2026-09-05T03:00:02Z","tool_call_id":"c1","tool":"disk","args":"{}"}` + "\n" +
+		`{"v":1,"type":"tool_result","ts":"2026-09-05T03:00:03Z","tool_call_id":"c2","tool":"queue","result":"empty","outcome":"ok"}` + "\n" +
+		`{"v":1,"type":"tool_result","ts":"2026-09-05T03:00:04Z","tool_call_id":"c1","tool":"disk","result":"61%","outcome":"ok"}` + "\n"
+	got, err := resume.ReadFrom(strings.NewReader(log), resume.Options{})
+	if err != nil {
+		t.Fatalf("ReadFrom = %v, want no error", err)
+	}
+	want := []llm.ToolCall{
+		{ID: "c1", Name: "disk", Arguments: "{}"},
+		{ID: "c2", Name: "queue", Arguments: "{}"},
+	}
+	if !reflect.DeepEqual(got.Messages[1].ToolCalls, want) {
+		t.Errorf("ToolCalls = %#v, want %#v", got.Messages[1].ToolCalls, want)
+	}
+}
+
+// errReader fails mid-stream the way a truncated pipe or an unreadable file
+// does: the read error is reported, not mistaken for end of file.
+type errReader struct{}
+
+func (errReader) Read([]byte) (int, error) { return 0, errors.New("disk went away") }
+
+func TestReadFromReaderError(t *testing.T) {
+	_, err := resume.ReadFrom(errReader{}, resume.Options{})
+	if err == nil || !strings.Contains(err.Error(), "disk went away") {
+		t.Fatalf("ReadFrom error = %v, want the read failure", err)
 	}
 }
 
