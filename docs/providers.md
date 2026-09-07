@@ -283,7 +283,13 @@ on its own, and why a parallel tool fan-out - a dozen calls and a dozen results
 in two turns - never costs you the previous turn's entry. The limit that
 follows: a turn that appends more than that lookback of other, non-tool content
 can reach back past the previous entry, and that turn writes the whole prefix
-again instead of reading it.
+again instead of reading it. The API allows a fourth breakpoint, which
+Anthropic's own multi-turn recipe spends on the previous turn's last block to
+cover exactly that case; amele does not place it yet, which is a follow-up and
+not a claim that the case cannot happen, so that turn still rewrites the
+prefix instead of reading it until it lands. Live-unverified (#17): the
+lookback and its tool-run collapsing come from Anthropic's documentation, not
+from a response amele has recorded.
 
 The API allows 4 breakpoints; amele places at most 3 and leaves the fourth
 alone. An empty system prompt gets none (a blank text block is a 400), and
