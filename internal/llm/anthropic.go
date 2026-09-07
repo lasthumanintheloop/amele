@@ -77,6 +77,13 @@ type AnthropicClient struct {
 	// requires the field on every request; 0 means
 	// DefaultAnthropicMaxOutput.
 	MaxOutputTokens int
+	// PromptCache asks for explicit prompt caching: the request grows up to
+	// three ephemeral cache_control breakpoints (last tool, system prompt,
+	// last message block - see placeCacheBreakpoints). The zero value false
+	// sends the request byte for byte as it was sent before caching existed,
+	// which is what keeps every pre-caching wire golden valid. Wired from the
+	// config's provider.prompt_cache, where an unset value means true.
+	PromptCache bool
 }
 
 // Wire types for the Anthropic Messages API JSON body. Kept unexported: the
@@ -89,11 +96,14 @@ type AnthropicClient struct {
 // AnthropicOwnedWireFields lists these same keys for the params collision
 // check - keep the two in step when a field is added here.
 type anRequest struct {
-	Model     string      `json:"model"`
-	MaxTokens int         `json:"max_tokens"`
-	System    string      `json:"system,omitempty"`
-	Messages  []anMessage `json:"messages"`
-	Tools     []anTool    `json:"tools,omitempty"`
+	Model     string `json:"model"`
+	MaxTokens int    `json:"max_tokens"`
+	// System is a pointer so an absent prompt still omits the key entirely:
+	// omitempty cannot see inside a struct, and "system":"" is not the same
+	// request as no system field at all.
+	System   *anSystem   `json:"system,omitempty"`
+	Messages []anMessage `json:"messages"`
+	Tools    []anTool    `json:"tools,omitempty"`
 	// Thinking and OutputConfig are pointers so the keys vanish entirely when
 	// the config asked for nothing: this API rejects unknown AND unexpected
 	// fields (research §matrix "Unknown request fields"), and a model
@@ -115,8 +125,52 @@ type anRequest struct {
 // right answer for provider.params collisions on this wire (config.
 // validateParams). Note the difference from every openai-wire dialect: thinking
 // and output_config ARE written here, and response_format is not.
+//
+// CONTRACT: prompt caching adds no body-root key - cache_control lives INSIDE
+// tool definitions, the system block and message content blocks - so the list
+// is unchanged by it, and provider.params can still not collide with a
+// breakpoint.
 func AnthropicOwnedWireFields() []string {
 	return []string{"model", "max_tokens", "system", "messages", "tools", "thinking", "output_config", "temperature", "top_p"}
+}
+
+// anSystem is the system prompt in the two shapes this API accepts. Text is
+// the prompt; Cache asks for the cached form.
+//
+// The two shapes exist because a bare string cannot carry a breakpoint: the
+// only place cache_control may sit is a block, so caching the system prompt
+// means promoting it to a one-element text array. Uncached requests keep the
+// string, so turning caching off restores the exact bytes amele sent before
+// this feature.
+type anSystem struct {
+	Text  string
+	Cache bool
+}
+
+// MarshalJSON implements json.Marshaler: a JSON string when uncached, a
+// one-element array of text blocks carrying the ephemeral breakpoint when not.
+func (s anSystem) MarshalJSON() ([]byte, error) {
+	if !s.Cache {
+		return json.Marshal(s.Text)
+	}
+	return json.Marshal([]anBlock{{Type: "text", Text: s.Text, CacheControl: ephemeralCacheControl()}})
+}
+
+// anCacheControl is a prompt-cache breakpoint. Only the ephemeral type exists
+// on this API; it is still spelled out as a field rather than a bare marker
+// because the object is where a future longer-lived cache type would land.
+type anCacheControl struct {
+	Type string `json:"type"`
+}
+
+// cacheEphemeral is the only cache_control type the Messages API defines.
+const cacheEphemeral = "ephemeral"
+
+// ephemeralCacheControl returns a fresh breakpoint. Fresh, not shared: the
+// pointers land in structs the caller may later copy, and a shared value would
+// make an accidental mutation reach every breakpoint at once.
+func ephemeralCacheControl() *anCacheControl {
+	return &anCacheControl{Type: cacheEphemeral}
 }
 
 // anThinking is the thinking control object. Two shapes share it because they
@@ -200,12 +254,19 @@ type anBlock struct {
 	// ToolUseID and Content are set on "tool_result" blocks.
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   string `json:"content,omitempty"`
+	// CacheControl marks this block as a prompt-cache breakpoint. Last in the
+	// struct so the key lands at the end of the block, after the fields that
+	// identify it. Nil on every block but the one placeCacheBreakpoints picks.
+	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 }
 
 type anTool struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema"`
+	// CacheControl marks the end of the tool definitions as a cache
+	// breakpoint; only the last tool ever carries it (placeCacheBreakpoints).
+	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 }
 
 type anResponse struct {
@@ -738,6 +799,9 @@ func (c *AnthropicClient) toWire(req Request) (anRequest, map[string]json.RawMes
 		out.Tools = append(out.Tools, anTool{Name: t.Name, Description: t.Description, InputSchema: t.Parameters})
 	}
 	out.applyKnobs(req)
+	if c.PromptCache {
+		out.placeCacheBreakpoints()
+	}
 	return out, extraFields(req.Extra)
 }
 
@@ -749,13 +813,8 @@ func (out *anRequest) appendMessage(m Message) {
 	switch m.Role {
 	case RoleSystem:
 		// Anthropic rejects a system role inside messages; the prompt
-		// belongs in the top-level "system" field. Joining defends
-		// against a caller supplying several system messages.
-		if out.System == "" {
-			out.System = m.Content
-		} else {
-			out.System += "\n\n" + m.Content
-		}
+		// belongs in the top-level "system" field.
+		out.appendSystem(m.Content)
 	case RoleTool:
 		block := anBlock{Type: "tool_result", ToolUseID: m.ToolCallID, Content: m.Content}
 		// CONTRACT: Anthropic requires all parallel tool results in a
@@ -789,6 +848,59 @@ func (out *anRequest) appendMessage(m Message) {
 			Role:    m.Role,
 			Content: []anBlock{{Type: "text", Text: m.Content}},
 		})
+	}
+}
+
+// appendSystem folds one system message into the top-level prompt. Joining
+// defends against a caller supplying several system messages.
+//
+// An empty prompt leaves System nil so the key stays off the wire entirely:
+// the API rejects a blank system text block, and an empty string was never
+// sent before caching either.
+func (out *anRequest) appendSystem(text string) {
+	switch {
+	case out.System == nil && text == "":
+		return
+	case out.System == nil:
+		out.System = &anSystem{Text: text}
+	default:
+		out.System.Text += "\n\n" + text
+	}
+}
+
+// placeCacheBreakpoints marks the prompt prefix and the conversation so far as
+// cacheable. It runs last, once the tools, system prompt and messages are all
+// in place.
+//
+// CONTRACT: at most 4 breakpoints per request (a fifth is a 400), and the API
+// renders the prompt as tools -> system -> messages. amele places at most
+// three, in that render order:
+//
+//   - the LAST tool definition, which caches every tool at once;
+//   - the system prompt, extending that prefix over the instructions;
+//   - the last content block of the last message, which caches the
+//     conversation so far. This one MOVES forward every turn: each new turn
+//     marks its own tail, so the previous turn's prefix is a cache hit and only
+//     the delta is written.
+func (out *anRequest) placeCacheBreakpoints() {
+	if n := len(out.Tools); n > 0 {
+		out.Tools[n-1].CacheControl = ephemeralCacheControl()
+	}
+	// A nil System is the only empty state appendSystem can produce; the text
+	// check is belt and braces, because a blank text block is a 400.
+	if out.System != nil && out.System.Text != "" {
+		out.System.Cache = true
+	}
+	if n := len(out.Messages); n > 0 {
+		last := &out.Messages[n-1]
+		// An echoed raw content array is signed by the provider and must go
+		// back byte for byte (anMessage.MarshalJSON), so it never receives a
+		// breakpoint. The loop never sends a history ending in an assistant
+		// turn - the last message is the user task or the tool results - so
+		// this only gives up a breakpoint on a path that does not occur.
+		if last.ContentRaw == nil && len(last.Content) > 0 {
+			last.Content[len(last.Content)-1].CacheControl = ephemeralCacheControl()
+		}
 	}
 }
 

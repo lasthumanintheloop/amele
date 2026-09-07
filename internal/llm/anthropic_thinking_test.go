@@ -406,27 +406,34 @@ func TestAnthropicToWireGolden(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encodeBody: %v", err)
 			}
-			if !json.Valid(got) {
-				t.Fatalf("body is not valid JSON: %s", got)
-			}
-
-			goldenPath := filepath.Join("testdata", "golden", "wire", tc.golden)
-			if *update {
-				if err := os.MkdirAll(filepath.Dir(goldenPath), 0o750); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(goldenPath, append(got, '\n'), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			raw, err := os.ReadFile(goldenPath) //nolint:gosec // G304: fixed testdata path.
-			if err != nil {
-				t.Fatalf("reading golden (run with -update to create): %v", err)
-			}
-			if want := strings.TrimSuffix(string(raw), "\n"); string(got) != want {
-				t.Errorf("request body differs from golden %s.\ngot:  %s\nwant: %s", tc.golden, got, want)
-			}
+			checkWireGolden(t, got, tc.golden)
 		})
+	}
+}
+
+// checkWireGolden compares an encoded request body against testdata/golden/wire
+// and rewrites it under -update. Shared by every wire golden test in this
+// package so a single harness decides what "the bytes on the wire" means.
+func checkWireGolden(t *testing.T, got []byte, golden string) {
+	t.Helper()
+	if !json.Valid(got) {
+		t.Fatalf("body is not valid JSON: %s", got)
+	}
+	goldenPath := filepath.Join("testdata", "golden", "wire", golden)
+	if *update {
+		if err := os.MkdirAll(filepath.Dir(goldenPath), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(goldenPath, append(got, '\n'), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw, err := os.ReadFile(goldenPath) //nolint:gosec // G304: fixed testdata path.
+	if err != nil {
+		t.Fatalf("reading golden (run with -update to create): %v", err)
+	}
+	if want := strings.TrimSuffix(string(raw), "\n"); string(got) != want {
+		t.Errorf("request body differs from golden %s.\ngot:  %s\nwant: %s", golden, got, want)
 	}
 }
 
