@@ -4308,6 +4308,34 @@ func TestBuildAgentLoopWiring(t *testing.T) {
 			wantIdentity:  "openai",
 			wantFallbacks: []wantBackend{{model: "claude-backup", identity: "anthropic"}},
 		},
+		{
+			// A chain is a LIST, and its ORDER is the operator's stated
+			// preference. buildFallbacks is the only place that order can be
+			// lost, so this row pins it with two entries whose models and
+			// identities are both distinguishable: a builder that sorted,
+			// reversed or deduplicated them would send the run to the wrong
+			// endpoint first and only be noticed during an outage.
+			name: "two fallbacks keep file order",
+			provider: &config.ProviderConfig{
+				BaseURL: "https://api.example.com/v1", APIKey: "k",
+				Fallback: []config.FallbackTarget{
+					{
+						Model:          "claude-backup",
+						ProviderConfig: config.ProviderConfig{Type: config.ProviderTypeAnthropic, APIKey: "k2"},
+					},
+					{
+						Model:          "gemini-backup",
+						ProviderConfig: config.ProviderConfig{Type: config.ProviderTypeGemini, APIKey: "k3"},
+					},
+				},
+			},
+			wantParallel: true, wantAuto: true,
+			wantIdentity: "openai",
+			wantFallbacks: []wantBackend{
+				{model: "claude-backup", identity: "anthropic"},
+				{model: "gemini-backup", identity: "gemini"},
+			},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

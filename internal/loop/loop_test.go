@@ -1889,6 +1889,110 @@ func checkFallbackEvent(t *testing.T, sw session.Event) {
 	}
 }
 
+// TestProviderFallbackWalksTheChainInOrder: a chain is a LIST, not a spare.
+// Every other fallback test stops at the first entry, so an implementation
+// that always reached for Fallbacks[0] would satisfy all of them while a
+// second outage sent the run straight back to the endpoint that had just
+// failed. This case walks two entries and pins the order at every layer that
+// reports it: which target each request reached, the two switch events, and
+// the answer's attribution.
+func TestProviderFallbackWalksTheChainInOrder(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primary := &llm.Fake{Errs: []error{providerErr("503 primary unavailable")}}
+	first := &llm.Fake{Errs: []error{providerErr("529 overloaded")}}
+	second := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(10, 5))}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Session = w
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{
+		{Provider: first, Model: "m1", Identity: "anthropic"},
+		{Provider: second, Model: "m2", Identity: "gemini"},
+	}
+
+	res, err := l.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FinalText != "answer" {
+		t.Errorf("final text = %q, want %q", res.FinalText, "answer")
+	}
+	if res.Fallbacks != 2 {
+		t.Errorf("Result.Fallbacks = %d, want 2", res.Fallbacks)
+	}
+	// Three provider round-trips for two switches: the retry after a switch is
+	// an ordinary turn (TestProviderFallbackCountsTheRetriedTurn), so the two
+	// failed attempts are counted alongside the one that answered.
+	if res.Turns != 3 {
+		t.Errorf("Result.Turns = %d, want 3", res.Turns)
+	}
+	checkChainRequests(t, primary, first, second)
+
+	events := sessionEvents(t, w)
+	checkEventTypes(t, events, "run_start", "provider_fallback", "provider_fallback", "llm_response")
+	checkChainStep(t, events[1], chainStep{0, 1, "test-model", "openai", "m1", "anthropic"})
+	checkChainStep(t, events[2], chainStep{1, 2, "m1", "anthropic", "m2", "gemini"})
+	if events[3].Model != "m2" || events[3].Provider != "gemini" {
+		t.Errorf("llm_response identity = %q/%q, want m2/gemini", events[3].Model, events[3].Provider)
+	}
+}
+
+// checkChainRequests asserts each target was asked exactly once, for its OWN
+// model. This is the pair of claims a Fallbacks[0]-only backend() fails: the
+// first entry would be asked twice, under its own model both times, and the
+// second entry never at all.
+func checkChainRequests(t *testing.T, primary, first, second *llm.Fake) {
+	t.Helper()
+	for _, tc := range []struct {
+		name  string
+		fake  *llm.Fake
+		model string
+	}{
+		{"the primary", primary, "test-model"},
+		{"fallback 1", first, "m1"},
+		{"fallback 2", second, "m2"},
+	} {
+		if len(tc.fake.Requests) != 1 {
+			t.Fatalf("%s received %d requests, want 1", tc.name, len(tc.fake.Requests))
+		}
+		if got := tc.fake.Requests[0].Model; got != tc.model {
+			t.Errorf("%s was asked for model %q, want %q", tc.name, got, tc.model)
+		}
+	}
+}
+
+// chainStep is one expected provider_fallback line: the two ordinals and both
+// ends of the move. It is a struct rather than six positional parameters
+// because a caller mixing up "from model" and "to model" would still compile.
+type chainStep struct {
+	from, to                int
+	fromModel, fromProvider string
+	toModel, toProvider     string
+}
+
+// checkChainStep asserts one provider_fallback line matches the expected step.
+// checkFallbackEvent pins the single-entry case's fixed values; this one is
+// parameterised because the chain test asserts two different steps.
+func checkChainStep(t *testing.T, sw session.Event, want chainStep) {
+	t.Helper()
+	if sw.FromBackend == nil || *sw.FromBackend != want.from || sw.ToBackend == nil || *sw.ToBackend != want.to {
+		t.Errorf("provider_fallback ordinals = %v -> %v, want %d -> %d",
+			sw.FromBackend, sw.ToBackend, want.from, want.to)
+	}
+	if sw.FromModel != want.fromModel || sw.ToModel != want.toModel {
+		t.Errorf("provider_fallback models = %q -> %q, want %q -> %q",
+			sw.FromModel, sw.ToModel, want.fromModel, want.toModel)
+	}
+	if sw.FromProvider != want.fromProvider || sw.ToProvider != want.toProvider {
+		t.Errorf("provider_fallback providers = %q -> %q, want %q -> %q",
+			sw.FromProvider, sw.ToProvider, want.fromProvider, want.toProvider)
+	}
+}
+
 // TestProviderFallbackExhaustedPropagatesLastError: when the last backend
 // fails too there is nothing left to try, and the error the operator sees must
 // be the one the LAST endpoint reported - the primary's is already in the log,
