@@ -817,7 +817,7 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 	// the value, but a placeholder is bare prose and the vertex one embeds the
 	// configured location (an unvalidated config reaches this report), so
 	// without it a newline there could forge a row.
-	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, singleLine(defaultHostNote(cfg))))
+	fmt.Fprintf(b, "  base_url:        %s\n", field(cfg.Provider.BaseURL, singleLine(defaultHostNote(&cfg.Provider))))
 	vertexRows(b, cfg)
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
 	retryRow(b, cfg)
@@ -828,7 +828,60 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 			cfg.Provider.MaxOutputTokens, set.mark("provider.max_output_tokens"))
 	}
 	providerMapping(b, cfg, reg, set)
+	fallbackRows(b, cfg)
 	b.WriteString("\n")
+}
+
+// fallbackRows lists provider.fallback, one row per entry, in the order the run
+// will walk it. The rows close the MODEL & PROVIDER section rather than opening
+// a section of their own: a backup target is a property of this run's provider,
+// and a reader comparing it against the primary wants the primary's rows on the
+// same screen.
+//
+// Each row answers the three questions a chain raises and nothing else: which
+// model this entry asks for, which wire family it speaks (the same Identity the
+// session log and the fallback event name it by, so the report and the log
+// agree), and where the request goes. Deliberately absent: a per-entry mapping
+// block, which would triple the section's height for tuning an entry usually
+// does not carry, and an override marker, because no fallback key is --set-able.
+//
+// SECURITY: the composed row goes through singleLine. Two of its three pieces
+// are bare config text - the base_url, and the dialect inside the identity -
+// and explain reports on configs Validate REJECTED, so a newline in either
+// would forge a row an operator reads as amele's own words. (The model is
+// quoted by field, which already escapes one; singleLine covers the row as a
+// whole so no future piece can be forgotten.)
+func fallbackRows(b *strings.Builder, cfg *config.Config) {
+	for i := range cfg.Provider.Fallback {
+		entry := &cfg.Provider.Fallback[i]
+		// 1-based, because the index is what an operator reads back to the
+		// YAML list and to the fallback event's from/to pair.
+		row := fmt.Sprintf("%s via %s %s",
+			field(entry.Model, "(unset)"), entry.Identity(), fallbackHost(entry))
+		fmt.Fprintf(b, "  fallback %d:      %s\n", i+1, singleLine(row))
+	}
+}
+
+// fallbackHost is the row's third piece: where this entry's requests go.
+//
+// It prints the entry's own base_url when it has one, and otherwise the note
+// naming the host its client falls back to. The openai wire is the exception
+// the primary row never has to state: it has NO default host (OpenAI,
+// OpenRouter, vLLM and Ollama all differ, which is why base_url is required
+// there), so the row says "(unset)" rather than borrowing defaultHostNote's
+// answer for the native wires - printing api.anthropic.com next to an openai
+// entry would tell an operator the failover goes somewhere it cannot. The
+// omission itself is already an error in PROBLEMS; this row only refuses to
+// contradict it.
+func fallbackHost(entry *config.FallbackTarget) string {
+	if entry.BaseURL != "" {
+		return entry.BaseURL
+	}
+	switch entry.Type {
+	case config.ProviderTypeAnthropic, config.ProviderTypeGemini:
+		return defaultHostNote(&entry.ProviderConfig)
+	}
+	return "(unset)"
 }
 
 // vertexModelSentinel stands in for an unset model while the address is built.
@@ -950,10 +1003,15 @@ func geminiWire(cfg *config.Config) bool {
 // Ollama all differ, which is why base_url is required there - so an empty
 // value on that wire is a PROBLEMS entry, and this row keeps the phrasing it
 // has always had rather than growing a fourth answer for a state validate
-// refuses.
-func defaultHostNote(cfg *config.Config) string {
-	if geminiWire(cfg) {
-		if v := cfg.Provider.Vertex; v != nil {
+// refuses. A caller that cannot live with that (fallbackHost, whose rows are
+// new and owe no phrasing to history) must ask about the wire before calling.
+//
+// It takes a ProviderConfig rather than the whole config because a fallback
+// entry IS one: the entries pick their client by exactly the same fields, so
+// they must get exactly the same answer from the same function.
+func defaultHostNote(p *config.ProviderConfig) string {
+	if p.Type == config.ProviderTypeGemini {
+		if v := p.Vertex; v != nil {
 			// The gemini wire has two backends and the vertex one is addressed
 			// by location, so naming the AI Studio host here would describe a
 			// request this config will never send. This row answers only "what

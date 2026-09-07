@@ -1,0 +1,20 @@
+# Fixture for TestRenderFallbackGolden: a primary target with two backups, one
+# per entry shape - a native wire that names no base_url of its own, and an
+# openai dialect that names its endpoint. Each entry carries its own credential
+# so the REQUIREMENTS checklist has something to report for the chain.
+model: golden-model
+provider:
+  base_url: https://api.example.com/v1
+  api_key: ${PRIMARY_KEY}
+  max_output_tokens: 4096
+  fallback:
+    - model: claude-opus-5
+      type: anthropic
+      api_key: ${FALLBACK_KEY}
+    - model: deepseek-v4
+      base_url: https://api.deepseek.com/v1
+      dialect: deepseek
+      api_key: ${BACKUP_KEY}
+limits:
+  max_turns: 10
+  max_tokens: 1000

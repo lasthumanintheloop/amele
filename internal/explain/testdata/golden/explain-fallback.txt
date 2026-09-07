@@ -1,0 +1,49 @@
+MODEL & PROVIDER
+  model:           "golden-model"
+  provider type:   "openai"
+  base_url:        "https://api.example.com/v1"
+  request_timeout: default (120s)
+  retry:           3 attempts (default), 1s initial backoff (default)
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
+  max_output_tokens: 4096
+  provider mapping (the wire fields this config will send):
+    max_output_tokens: 4096 -> max_completion_tokens: 4096
+  fallback 1:      "claude-opus-5" via anthropic (default: api.anthropic.com)
+  fallback 2:      "deepseek-v4" via openai/deepseek https://api.deepseek.com/v1
+
+TOOLS
+  workspace: "<TMP>"
+  fs builtins (fs_read, fs_write, fs_list): disabled
+  shell: disabled
+  subprocess tools: (none)
+
+REQUIREMENTS
+  env:
+    PRIMARY_KEY     ✓ set
+    FALLBACK_KEY    ✗ MISSING
+    BACKUP_KEY      ✗ MISSING
+
+PERMISSIONS
+  default policy: allow (unset)
+  per-tool overrides: (none)
+  note: without a TTY, every "ask" policy is auto-denied (headless fail-safe).
+
+BUDGETS
+  max_turns:  10
+  max_tokens: 1000
+  timeout:    none
+  max_tool_result_bytes: built-in per-tool caps (fs_read 256 KiB, fs_list/subprocess/shell 64 KiB per stream, mcp 64 KiB)
+
+CONCURRENCY
+  lock: disabled (concurrent runs of this config are allowed)
+  tool calls in a turn: parallel (default)
+
+OUTPUT
+  schema: none (final answer is unconstrained text)
+
+SESSION
+  session_dir: none (no audit log)
+  max_logged_field: 8192 (default)
+
+WARNINGS
+  - session_dir is not set: no session log (audit trail) will be written
