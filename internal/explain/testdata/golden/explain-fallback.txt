@@ -9,7 +9,7 @@ MODEL & PROVIDER
   provider mapping (the wire fields this config will send):
     max_output_tokens: 4096 -> max_completion_tokens: 4096
   fallback 1:      "claude-opus-5" via anthropic (default: api.anthropic.com)
-  fallback 2:      "deepseek-v4" via openai/deepseek https://api.deepseek.com/v1
+  fallback 2:      "deepseek-v4" via openai/deepseek "https://api.deepseek.com/v1"
 
 TOOLS
   workspace: "<TMP>"

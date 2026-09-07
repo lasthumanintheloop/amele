@@ -43,7 +43,7 @@ func TestFallbackRows(t *testing.T) {
 	// after: this block pins the rows between the two things they sit between.
 	want := "    max_output_tokens: 4096 -> max_completion_tokens: 4096\n" +
 		"  fallback 1:      \"claude-opus-5\" via anthropic (default: api.anthropic.com)\n" +
-		"  fallback 2:      \"deepseek-v4\" via openai/deepseek https://api.deepseek.com/v1\n" +
+		"  fallback 2:      \"deepseek-v4\" via openai/deepseek \"https://api.deepseek.com/v1\"\n" +
 		"\nTOOLS\n"
 	if !strings.Contains(got, want) {
 		t.Errorf("report missing the fallback block\nwant:\n%s\nfull report:\n%s", want, got)
@@ -117,9 +117,10 @@ func TestFallbackHostPlaceholders(t *testing.T) {
 
 // TestFallbackRowCannotForgeARow is the security regression. explain reports on
 // configs Validate REJECTED, so every piece of a fallback row is attacker-shaped
-// text: the model, the base_url (printed bare, unlike the quoted model) and the
-// dialect that composes the identity. A newline in any of them would invent a
-// report line an operator reads as amele's own words.
+// text: the model, the base_url (both quoted, which escapes a newline) and the
+// dialect that composes the identity (bare, because an identity is a composed
+// phrase and not a value). A newline in any of them would invent a report line
+// an operator reads as amele's own words.
 func TestFallbackRowCannotForgeARow(t *testing.T) {
 	forged := "  fallback 2:      \"ghost\" via anthropic https://evil.example.com/v1"
 	tests := []struct {
