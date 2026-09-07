@@ -1,8 +1,8 @@
 // Package session records every run as a single append-only JSONL file.
 //
 // One format serves three purposes at once (docs/contracts/jsonl-events.md): it is the
-// observability log ("what did the agent do at 03:00?"), the future resume
-// source, and the future replay input. Events are therefore written in
+// observability log ("what did the agent do at 03:00?"), the resume source
+// (internal/resume), and the future replay input. Events are therefore written in
 // strict chronological order and never mutated.
 package session
 
@@ -102,7 +102,7 @@ type Event struct {
 	// free-text field.
 	ReasoningBytes int `json:"reasoning_bytes,omitempty"`
 	// Reasoning is the provider's reasoning payload for the turn, as a
-	// string (clipped + redacted like every other free-text field). Present
+	// string (clipped + redacted like every other clipped field; Event.ResumedFrom is the one unclipped exception, see Writer.RunStartResumed). Present
 	// only when the writer was opened with LogReasoning (log_reasoning:
 	// true, JSONL v1.5); absent otherwise - absence is the pre-v1.5 and
 	// default-config shape.
@@ -159,7 +159,7 @@ type Event struct {
 	// The models and identities are spelled out beside the ordinals so a
 	// reader needs no config to interpret the line, and Error above carries
 	// the failure that caused the move (clipped and redacted like every other
-	// free-text field).
+	// clipped field; Event.ResumedFrom is the one exception).
 	FromBackend  *int   `json:"from,omitempty"`
 	ToBackend    *int   `json:"to,omitempty"`
 	FromModel    string `json:"from_model,omitempty"`
