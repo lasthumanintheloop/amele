@@ -150,7 +150,7 @@ type ProviderConfig struct {
 	// decides how the fields below are mapped onto the request. Empty means
 	// the OpenAI baseline, so configs written before dialects existed keep
 	// their behavior. It is ignored with type anthropic and refused with type
-	// gemini (see validateProviderTuning). It is explicit rather than sniffed
+	// gemini (see validateTuning). It is explicit rather than sniffed
 	// from BaseURL:
 	// guessing wrong would send a knob to the wrong field name and the
 	// consequence would surface as a provider error much later.
@@ -795,11 +795,18 @@ func rejectLiteralAPIKey(raw []byte) error {
 	return nil
 }
 
+// providerPath is the dotted path of the primary provider block: the prefix
+// every violation of that block is reported under, and the base apiKeyPath is
+// built from. It exists as a constant because validateTarget takes the path as
+// an argument now (a fallback entry passes its own), and the primary's messages
+// are pinned byte-for-byte by tests and by `amele validate`'s golden output.
+const providerPath = "provider"
+
 // apiKeyPath is the dotted field path of provider.api_key, whose references
 // are marked as credentials regardless of the variable's name (see
 // EnvBinding.APIKey and credentialPath, which also covers sensitive MCP
 // headers).
-const apiKeyPath = "provider.api_key"
+const apiKeyPath = providerPath + ".api_key"
 
 // interpolateNode substitutes ${VAR} references inside every scalar VALUE of
 // the parsed YAML tree and returns one EnvBinding per referenced variable, in
@@ -1093,29 +1100,47 @@ func (c *Config) Violations() []string {
 // validateProvider checks the provider block. Split from Validate to keep
 // each function under the complexity budget.
 func (c *Config) validateProvider(add func(format string, args ...any)) {
-	switch c.Provider.Type {
+	c.Provider.validateTarget(providerPath, add)
+}
+
+// validateTarget checks one provider target - the primary `provider` block, or
+// one entry of provider.fallback - and reports every violation under prefix,
+// the dotted path the operator reads in the file ("provider", or
+// "provider.fallback[1]").
+//
+// CONTRACT: the rules belong to the TARGET, not to the primary. An entry names
+// its own endpoint, credential, wire and tuning, so every check must reach it
+// under its own path; a rule that only ran on the primary would let a
+// misconfigured backup pass `amele validate` and surface as a provider error on
+// the day the primary is down - the worst possible moment to discover it.
+//
+// The path is a parameter rather than a field of the target so a target never
+// has to know where it sits, and so the primary's messages stay byte-identical
+// to the ones it produced before fallback existed.
+func (p *ProviderConfig) validateTarget(prefix string, add func(format string, args ...any)) {
+	switch p.Type {
 	case "", ProviderTypeOpenAI, ProviderTypeAnthropic, ProviderTypeGemini:
 	default:
-		add("provider.type %q is not a valid provider type (%s, or omit for openai)", c.Provider.Type, providerTypeValues)
+		add("%s.type %q is not a valid provider type (%s, or omit for openai)", prefix, p.Type, providerTypeValues)
 	}
-	anthropic := c.Provider.Type == ProviderTypeAnthropic
+	anthropic := p.Type == ProviderTypeAnthropic
 
-	if c.Provider.BaseURL == "" {
+	if p.BaseURL == "" {
 		// base_url stays required on the OpenAI-compatible path: there is no
 		// canonical gateway address to default to (OpenAI, OpenRouter, Ollama
 		// all differ). The Anthropic and Gemini paths are exempt because each
 		// has ONE official host, fixed by its vendor, and the client falls back
 		// to it on its own.
-		if !anthropic && c.Provider.Type != ProviderTypeGemini {
-			add("provider.base_url is required")
+		if !anthropic && p.Type != ProviderTypeGemini {
+			add("%s.base_url is required", prefix)
 		}
-	} else if problem := baseURLProblem(c.Provider.BaseURL); problem != "" {
-		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
-	} else if problem := c.hostOrVersionProblem(); problem != "" {
-		add("provider.base_url %q %s", c.Provider.BaseURL, problem)
+	} else if problem := baseURLProblem(p.BaseURL); problem != "" {
+		add("%s.base_url %q %s", prefix, p.BaseURL, problem)
+	} else if problem := p.hostOrVersionProblem(prefix); problem != "" {
+		add("%s.base_url %q %s", prefix, p.BaseURL, problem)
 	}
 
-	if c.Provider.Type == ProviderTypeGemini && c.Provider.APIKey == "" && c.Provider.Vertex == nil {
+	if p.Type == ProviderTypeGemini && p.APIKey == "" && p.Vertex == nil {
 		// The Gemini API has two auth paths and this wire speaks both: the AI
 		// Studio key, and Vertex's Google credentials (named by the vertex
 		// block, which carries the project and location rather than a secret).
@@ -1126,18 +1151,18 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 		//
 		// Scoped to this wire: a keyless openai-compatible config is a local
 		// Ollama server, which is a supported deployment.
-		add("provider.api_key: gemini needs api_key (AI Studio) or a vertex block (Vertex AI)")
+		add("%s.api_key: gemini needs api_key (AI Studio) or a vertex block (Vertex AI)", prefix)
 	}
-	c.validateVertex(add)
+	p.validateVertex(prefix, add)
 
-	if c.Provider.RequestTimeout < 0 {
-		add("provider.request_timeout must not be negative")
+	if p.RequestTimeout < 0 {
+		add("%s.request_timeout must not be negative", prefix)
 	}
-	if c.Provider.MaxOutputTokens < 0 {
-		add("provider.max_output_tokens must not be negative")
+	if p.MaxOutputTokens < 0 {
+		add("%s.max_output_tokens must not be negative", prefix)
 	}
-	c.validateRetry(add)
-	c.validateProviderTuning(add)
+	p.validateRetry(prefix, add)
+	p.validateTuning(prefix, add)
 }
 
 // validateVertex checks the Vertex AI block: presence relative to the wire, the
@@ -1150,38 +1175,38 @@ func (c *Config) validateProvider(add func(format string, args ...any)) {
 // exit-code contract forbids (docs/engineering.md §7: exit 2 is decided before
 // the run, never during it). The SECURITY reasoning behind the charset lives
 // with the definition.
-func (c *Config) validateVertex(add func(format string, args ...any)) {
-	v := c.Provider.Vertex
+func (p *ProviderConfig) validateVertex(prefix string, add func(format string, args ...any)) {
+	v := p.Vertex
 	if v == nil {
 		return
 	}
-	if c.Provider.Type != ProviderTypeGemini {
+	if p.Type != ProviderTypeGemini {
 		// Refused rather than ignored: a config carrying a vertex block reads as
 		// a Vertex deployment to everyone who opens it, and running it against
 		// another wire would honor the file's letter while breaking its intent.
-		add("provider.vertex is only valid with provider.type: gemini")
+		add("%s.vertex is only valid with %s.type: gemini", prefix, prefix)
 		return
 	}
-	if c.Provider.APIKey != "" {
+	if p.APIKey != "" {
 		// The two credentials are alternatives, and not merely redundant
 		// together: Vertex REFUSES API keys outright (live-verified - see
 		// docs/superpowers/specs/2026-08-25-vertex-adc-research.md §3.3), so a
 		// config naming both would look authenticated and fail at the endpoint.
-		add("provider.vertex must not be combined with provider.api_key: vertex authenticates with google credentials (application default credentials, or vertex.credentials), and the AI Studio key is not accepted there")
+		add("%s.vertex must not be combined with %s.api_key: vertex authenticates with google credentials (application default credentials, or vertex.credentials), and the AI Studio key is not accepted there", prefix, prefix)
 	}
 	if v.Project == "" {
-		add("provider.vertex.project is required (the google cloud project id or number that owns the quota)")
+		add("%s.vertex.project is required (the google cloud project id or number that owns the quota)", prefix)
 	} else if !llm.ValidVertexID(v.Project) {
-		add("provider.vertex.project %q must be a lowercase project id or project number (letters, digits and hyphens): it becomes a path segment of the endpoint", v.Project)
+		add("%s.vertex.project %q must be a lowercase project id or project number (letters, digits and hyphens): it becomes a path segment of the endpoint", prefix, v.Project)
 	}
 	if v.Location == "" {
 		// No default: the location decides where the prompt is processed, so
 		// guessing one (us-central1, the historical habit) would be a residency
 		// decision amele made on the operator's behalf - and it does not even
 		// serve the current Gemini models.
-		add("provider.vertex.location is required (e.g. us-central1, europe-west4, or global)")
+		add("%s.vertex.location is required (e.g. us-central1, europe-west4, or global)", prefix)
 	} else if !llm.ValidVertexID(v.Location) {
-		add("provider.vertex.location %q must be a lowercase region id like us-central1 or global (letters, digits and hyphens): it becomes part of the endpoint host", v.Location)
+		add("%s.vertex.location %q must be a lowercase region id like us-central1 or global (letters, digits and hyphens): it becomes part of the endpoint host", prefix, v.Location)
 	}
 }
 
@@ -1189,24 +1214,24 @@ func (c *Config) validateVertex(add func(format string, args ...any)) {
 // fields - the struct cannot tell an absent key from a written 0, and every
 // other budget in this file spells "use the default" that way - so only a value
 // the operator actually chose is range-checked.
-func (c *Config) validateRetry(add func(format string, args ...any)) {
-	r := c.Provider.Retry
+func (p *ProviderConfig) validateRetry(prefix string, add func(format string, args ...any)) {
+	r := p.Retry
 	if r == nil {
 		return
 	}
 	if r.MaxAttempts != 0 && (r.MaxAttempts < retryMinAttempts || r.MaxAttempts > retryMaxAttempts) {
-		add("provider.retry.max_attempts must be between %d and %d (got %d; omit for the default 3, or set 1 to disable retrying)",
-			retryMinAttempts, retryMaxAttempts, r.MaxAttempts)
+		add("%s.retry.max_attempts must be between %d and %d (got %d; omit for the default 3, or set 1 to disable retrying)",
+			prefix, retryMinAttempts, retryMaxAttempts, r.MaxAttempts)
 	}
 	// The bounds are spelled literally rather than formatted from the constants
 	// above: time.Duration.String() renders the ceiling as "1m0s", and an error
 	// message must show the units the operator typed in the file.
 	if backoff := r.InitialBackoff.Std(); backoff != 0 && (backoff < retryMinBackoff || backoff > retryMaxBackoff) {
-		add("provider.retry.initial_backoff must be between 100ms and 60s (got %s; omit for the default 1s)", backoff)
+		add("%s.retry.initial_backoff must be between 100ms and 60s (got %s; omit for the default 1s)", prefix, backoff)
 	}
 }
 
-// validateProviderTuning checks the dialect and the knobs whose legality
+// validateTuning checks the dialect and the knobs whose legality
 // depends on it (reasoning, sampling, raw params).
 //
 // CONTRACT: only rules that are TOTAL for a dialect live here - what the
@@ -1215,12 +1240,12 @@ func (c *Config) validateRetry(add func(format string, args ...any)) {
 // mapped messages: a config that passes validate must not be rejected for its
 // CONFIGURATION at run time, but validate must not refuse a combination that
 // works either.
-func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
-	dialect, known := c.tuningDialect(add)
-	c.validateReasoning(add, dialect, known)
-	c.validateSampling(add, dialect, known)
-	c.validatePromptCache(add)
-	validateParams(add, c.Provider.Params, c.ownedParamsKeys(dialect, known), reservedWireFields)
+func (p *ProviderConfig) validateTuning(prefix string, add func(format string, args ...any)) {
+	dialect, known := p.tuningDialect(prefix, add)
+	p.validateReasoning(prefix, add, dialect, known)
+	p.validateSampling(prefix, add, dialect, known)
+	p.validatePromptCache(prefix, add)
+	validateParams(prefix, add, p.Params, p.ownedParamsKeys(dialect, known), reservedWireFields)
 }
 
 // validatePromptCache scopes provider.prompt_cache to the wire that has
@@ -1240,15 +1265,15 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 //
 // nil is always legal, on every wire: it is what every config written before
 // the key existed carries, and it means "the wire's own default".
-func (c *Config) validatePromptCache(add func(format string, args ...any)) {
-	if c.Provider.PromptCache == nil || c.Provider.Type == ProviderTypeAnthropic {
+func (p *ProviderConfig) validatePromptCache(prefix string, add func(format string, args ...any)) {
+	if p.PromptCache == nil || p.Type == ProviderTypeAnthropic {
 		return
 	}
 	// The message says caching still HAPPENS before it says to remove the key:
 	// an operator who set it to turn caching on must not read "remove it" as
 	// "this endpoint does not cache".
-	add("provider.prompt_cache: caching is automatic on this wire; " +
-		"the key configures the anthropic wire's cache_control markers - remove it")
+	add("%s.prompt_cache: caching is automatic on this wire; "+
+		"the key configures the anthropic wire's cache_control markers - remove it", prefix)
 }
 
 // tuningDialect resolves the dialect the dialect-DEPENDENT rules are checked
@@ -1259,8 +1284,8 @@ func (c *Config) validatePromptCache(add func(format string, args ...any)) {
 // that says "kimi-k3" would send the operator to the wrong line. The
 // dialect-INDEPENDENT rules still run, so one pass still reports everything
 // actionable.
-func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialect, bool) {
-	if c.Provider.Type == ProviderTypeGemini && c.Provider.Dialect != "" {
+func (p *ProviderConfig) tuningDialect(prefix string, add func(format string, args ...any)) (llm.Dialect, bool) {
+	if p.Type == ProviderTypeGemini && p.Dialect != "" {
 		// The gemini wire is a family of its own, not a variation of the OpenAI
 		// one, so the VALUE is not parsed here: whatever it spells, the fix is
 		// to delete the line, and reporting the dialect vocabulary instead
@@ -1269,12 +1294,12 @@ func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialec
 		// is new: nothing was written against it before this rule existed, so
 		// strictness costs no working config and buys the operator certainty
 		// that no knob is being quietly dropped.
-		add("provider.dialect: %q applies to the openai wire; remove it for type gemini", c.Provider.Dialect)
+		add("%s.dialect: %q applies to the openai wire; remove it for type gemini", prefix, p.Dialect)
 		return llm.DialectOpenAI, false
 	}
-	dialect, err := llm.ParseDialect(c.Provider.Dialect)
+	dialect, err := llm.ParseDialect(p.Dialect)
 	if err != nil {
-		add("provider.dialect: %v", err)
+		add("%s.dialect: %v", prefix, err)
 		return dialect, false
 	}
 	return dialect, true
@@ -1297,8 +1322,8 @@ func (c *Config) tuningDialect(add func(format string, args ...any)) (llm.Dialec
 // regardless - so the call site passes them unconditionally rather than
 // costing the operator a second validate round for a violation that was
 // already answerable, against validate's one-pass, every-violation contract.
-func (c *Config) ownedParamsKeys(dialect llm.Dialect, known bool) []string {
-	switch c.Provider.Type {
+func (p *ProviderConfig) ownedParamsKeys(dialect llm.Dialect, known bool) []string {
+	switch p.Type {
 	case ProviderTypeAnthropic:
 		// The dialect is not consulted on this wire, so a leftover (even an
 		// unparseable) value cannot decide the answer.
@@ -1317,44 +1342,44 @@ func (c *Config) ownedParamsKeys(dialect llm.Dialect, known bool) []string {
 
 // validateReasoning checks the thinking knob against the effort vocabulary and
 // against the dialects that can actually carry a token budget.
-func (c *Config) validateReasoning(add func(format string, args ...any), dialect llm.Dialect, known bool) {
-	r := c.Provider.Reasoning
+func (p *ProviderConfig) validateReasoning(prefix string, add func(format string, args ...any), dialect llm.Dialect, known bool) {
+	r := p.Reasoning
 	if r == nil {
 		return
 	}
 	if r.Effort != "" && !slices.Contains(effortValues, r.Effort) {
-		add("provider.reasoning.effort %q is not a valid effort (%s, or omit for the provider default)",
-			r.Effort, strings.Join(effortValues, ", "))
+		add("%s.reasoning.effort %q is not a valid effort (%s, or omit for the provider default)",
+			prefix, r.Effort, strings.Join(effortValues, ", "))
 	}
 	if r.BudgetTokens < 0 {
-		add("provider.reasoning.budget_tokens must not be negative")
+		add("%s.reasoning.budget_tokens must not be negative", prefix)
 	}
 	// Checked BEFORE the dialect early return: it is a relation between two
 	// anthropic-wire fields, and that wire does not consult the dialect at all,
 	// so an unparseable dialect cannot make it unanswerable. Leaving it below
 	// the return cost the operator a second validate round for a violation the
 	// first pass already knew - against validate's one-pass contract.
-	c.validateThinkingBudgetFitsCap(add, r)
+	p.validateThinkingBudgetFitsCap(prefix, add, r)
 	// Checked before the dialect early return for the same reason: it is a
 	// relation between two gemini-wire fields, and that wire refuses the
 	// dialect outright, so an illegal one cannot make the pair unanswerable.
-	c.validateGeminiThinkingChoice(add, r)
+	p.validateGeminiThinkingChoice(prefix, add, r)
 	if !known {
 		return
 	}
 	// Everything else on the openai wire takes a LEVEL, not a count. Sending
 	// the budget anyway would be dropped by the endpoint (or 400 on the strict
 	// ones) while the config claims a bounded thinking cost.
-	if r.BudgetTokens > 0 && c.Provider.Type != ProviderTypeAnthropic &&
-		c.Provider.Type != ProviderTypeGemini && dialect != llm.DialectOpenRouter {
-		add("provider.reasoning.budget_tokens is only mapped for the anthropic or gemini wire, or the openrouter dialect (use provider.reasoning.effort instead)")
+	if r.BudgetTokens > 0 && p.Type != ProviderTypeAnthropic &&
+		p.Type != ProviderTypeGemini && dialect != llm.DialectOpenRouter {
+		add("%s.reasoning.budget_tokens is only mapped for the anthropic or gemini wire, or the openrouter dialect (use %s.reasoning.effort instead)", prefix, prefix)
 	}
 	// Kimi's K-series thinks unconditionally; "none" has nothing to map to.
 	// Gated on the openai wire: the dialect describes an openai-wire variation
 	// and is ignored when type is anthropic (documented in the published
 	// schema), where "none" is a legal thinking setting.
-	if c.dialectApplies(known) && dialect == llm.DialectKimi && r.Effort == "none" {
-		add("provider.reasoning.effort %q: kimi models cannot disable thinking", r.Effort)
+	if p.dialectApplies(known) && dialect == llm.DialectKimi && r.Effort == "none" {
+		add("%s.reasoning.effort %q: kimi models cannot disable thinking", prefix, r.Effort)
 	}
 }
 
@@ -1376,19 +1401,19 @@ func (c *Config) validateReasoning(add func(format string, args ...any), dialect
 // number. Checking only the explicit case let `budget_tokens: 8192` with no cap
 // pass validate and 400 at the API - the exact split this function exists to
 // close.
-func (c *Config) validateThinkingBudgetFitsCap(add func(format string, args ...any), r *ReasoningConfig) {
+func (p *ProviderConfig) validateThinkingBudgetFitsCap(prefix string, add func(format string, args ...any), r *ReasoningConfig) {
 	// Zero budget means "unset": there is no relation to check.
-	if c.Provider.Type != ProviderTypeAnthropic || r.BudgetTokens <= 0 {
+	if p.Type != ProviderTypeAnthropic || r.BudgetTokens <= 0 {
 		return
 	}
-	capTokens, capNote := c.Provider.MaxOutputTokens, ""
+	capTokens, capNote := p.MaxOutputTokens, ""
 	if capTokens <= 0 {
 		capTokens = llm.DefaultAnthropicMaxOutput
-		capNote = ", the default amele sends when provider.max_output_tokens is unset"
+		capNote = ", the default amele sends when " + prefix + ".max_output_tokens is unset"
 	}
 	if r.BudgetTokens >= capTokens {
-		add("provider.reasoning.budget_tokens must be below provider.max_output_tokens (%d >= %d%s): on the anthropic wire the thinking budget is drawn from the same output ceiling, so nothing is left for the answer",
-			r.BudgetTokens, capTokens, capNote)
+		add("%s.reasoning.budget_tokens must be below %s.max_output_tokens (%d >= %d%s): on the anthropic wire the thinking budget is drawn from the same output ceiling, so nothing is left for the answer",
+			prefix, prefix, r.BudgetTokens, capTokens, capNote)
 	}
 }
 
@@ -1400,14 +1425,14 @@ func (c *Config) validateThinkingBudgetFitsCap(add func(format string, args ...a
 // CONTRACT: a total rule of that wire, knowable from the file alone - so it is
 // an exit-2 config error rather than an exit-5 provider error on the first
 // unattended run.
-func (c *Config) validateGeminiThinkingChoice(add func(format string, args ...any), r *ReasoningConfig) {
-	if c.Provider.Type != ProviderTypeGemini {
+func (p *ProviderConfig) validateGeminiThinkingChoice(prefix string, add func(format string, args ...any), r *ReasoningConfig) {
+	if p.Type != ProviderTypeGemini {
 		return
 	}
 	// Zero budget means "unset", and an empty effort means "send no knob":
 	// only two values the operator actually chose are in conflict.
 	if r.Effort != "" && r.BudgetTokens > 0 {
-		add("provider.reasoning: gemini accepts thinkingLevel or thinkingBudget, not both (drop provider.reasoning.effort or provider.reasoning.budget_tokens)")
+		add("%s.reasoning: gemini accepts thinkingLevel or thinkingBudget, not both (drop %s.reasoning.effort or %s.reasoning.budget_tokens)", prefix, prefix, prefix)
 	}
 }
 
@@ -1419,18 +1444,18 @@ func (c *Config) validateGeminiThinkingChoice(add func(format string, args ...an
 // not on the gemini wire either, for the stronger reason that a dialect is
 // refused there outright - so no dialect-shaped rule can be about a request
 // that wire would send. known carries whether the dialect parsed at all.
-func (c *Config) dialectApplies(known bool) bool {
-	return known && c.Provider.Type != ProviderTypeAnthropic && c.Provider.Type != ProviderTypeGemini
+func (p *ProviderConfig) dialectApplies(known bool) bool {
+	return known && p.Type != ProviderTypeAnthropic && p.Type != ProviderTypeGemini
 }
 
 // validateSampling checks temperature/top_p against the range the target
 // accepts for every model it serves.
-func (c *Config) validateSampling(add func(format string, args ...any), dialect llm.Dialect, known bool) {
-	temperature, topP := c.Provider.Temperature, c.Provider.TopP
+func (p *ProviderConfig) validateSampling(prefix string, add func(format string, args ...any), dialect llm.Dialect, known bool) {
+	temperature, topP := p.Temperature, p.TopP
 	// The K-series pins temperature and top_p to fixed values and answers any
 	// other value with a 400, so this is a config error, not a preference.
-	if c.dialectApplies(known) && dialect == llm.DialectKimi && (temperature != nil || topP != nil) {
-		add("provider: kimi K-series models fix sampling; remove temperature/top_p")
+	if p.dialectApplies(known) && dialect == llm.DialectKimi && (temperature != nil || topP != nil) {
+		add("%s: kimi K-series models fix sampling; remove temperature/top_p", prefix)
 	}
 
 	// Both ceilings below are TOTAL for their target, so they belong here
@@ -1440,9 +1465,9 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 	// consulted at all, so naming it in the message would misdirect the fix.
 	maxTemperature, ceilingNote := 2.0, ""
 	switch {
-	case c.Provider.Type == ProviderTypeAnthropic:
+	case p.Type == ProviderTypeAnthropic:
 		maxTemperature, ceilingNote = 1.0, " on the anthropic wire"
-	case c.dialectApplies(known) && dialect == llm.DialectGLM:
+	case p.dialectApplies(known) && dialect == llm.DialectGLM:
 		maxTemperature, ceilingNote = 1.0, " for the glm dialect"
 	}
 	// Both checks are written as a NEGATED positive test, deliberately: every
@@ -1451,12 +1476,12 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 	// from --set, and YAML spells it ".nan") only for it to die as an
 	// unserializable request body at run time.
 	if temperature != nil && !(*temperature >= 0 && *temperature <= maxTemperature) {
-		add("provider.temperature %g is out of range: must be between 0 and %g%s", *temperature, maxTemperature, ceilingNote)
+		add("%s.temperature %g is out of range: must be between 0 and %g%s", prefix, *temperature, maxTemperature, ceilingNote)
 	}
 	// Zero is excluded rather than clamped: top_p 0 asks for an empty nucleus,
 	// which providers answer with a 400 rather than with greedy decoding.
 	if topP != nil && !(*topP > 0 && *topP <= 1) {
-		add("provider.top_p %g is out of range: must be greater than 0 and at most 1", *topP)
+		add("%s.top_p %g is out of range: must be greater than 0 and at most 1", prefix, *topP)
 	}
 }
 
@@ -1480,7 +1505,7 @@ func (c *Config) validateSampling(add func(format string, args ...any), dialect 
 // (reservedWireFields) - neither reason describes the other case, so one
 // message for both would misdirect the fix for whichever half it does not
 // describe.
-func validateParams(add func(format string, args ...any), params map[string]any, owned, reserved []string) {
+func validateParams(prefix string, add func(format string, args ...any), params map[string]any, owned, reserved []string) {
 	if len(params) == 0 {
 		return
 	}
@@ -1491,16 +1516,16 @@ func validateParams(add func(format string, args ...any), params map[string]any,
 		case slices.Contains(reserved, key):
 			// Checked first: a key could in principle appear in both lists, and
 			// "refused on every target" is the stronger, always-true claim.
-			add("provider.params key %q is reserved on every target (that slot belongs to amele's own request machinery, whatever the value); remove it", key)
+			add("%s.params key %q is reserved on every target (that slot belongs to amele's own request machinery, whatever the value); remove it", prefix, key)
 		case slices.Contains(owned, key):
-			add("provider.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", key)
+			add("%s.params key %q is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)", prefix, key)
 		}
 	}
 	// The values are serialized into the request body verbatim, so a value
 	// JSON cannot express (a non-string mapping key, a NaN) must fail here
 	// rather than on the first request of an unattended run.
 	if _, err := json.Marshal(params); err != nil {
-		add("provider.params is not JSON-serializable: %v", err)
+		add("%s.params is not JSON-serializable: %v", prefix, err)
 	}
 }
 
@@ -1538,20 +1563,20 @@ func baseURLProblem(raw string) string {
 // and location, so any path written here would be dropped. It is refused
 // instead of dropped - a proxy prefix that silently disappears is a request
 // sent somewhere other than where the config says.
-func (c *Config) hostOrVersionProblem() string {
+func (p *ProviderConfig) hostOrVersionProblem(prefix string) string {
 	// The type is consulted too: a vertex block outside the gemini wire is
 	// already an error of its own, and the endpoint it describes is not the one
 	// this base_url would serve, so the version rule stays the right complaint.
-	if c.Provider.Vertex == nil || c.Provider.Type != ProviderTypeGemini {
-		return versionedBaseURLProblem(c.Provider.Type, c.Provider.BaseURL)
+	if p.Vertex == nil || p.Type != ProviderTypeGemini {
+		return versionedBaseURLProblem(p.Type, p.BaseURL)
 	}
-	u, err := url.Parse(c.Provider.BaseURL)
+	u, err := url.Parse(p.BaseURL)
 	if err != nil || strings.Trim(u.Path, "/") == "" {
 		// A parse failure is already reported by baseURLProblem, which runs
 		// first; there is nothing to add here.
 		return ""
 	}
-	return "must not include a path when provider.vertex is set: only the scheme and host are taken from base_url, and the client appends /v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent itself"
+	return "must not include a path when " + prefix + ".vertex is set: only the scheme and host are taken from base_url, and the client appends /v1/projects/{project}/locations/{location}/publishers/google/models/{model}:generateContent itself"
 }
 
 // versionedBaseURLProblem reports the "the API version is still in base_url"
