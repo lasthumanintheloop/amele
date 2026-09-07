@@ -7,7 +7,7 @@ printed by `amele schema`). Exit codes are specified in
 [exit-codes.md](exit-codes.md); this page only cross-references them.
 
 ```
-amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v] [task...]
+amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [--resume PATH] [-q|-v] [task...]
 amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]
 amele validate <config.yaml|dir> [--set key=value] [-w DIR]
 amele explain <config.yaml|dir> [--set key=value] [-w DIR]
@@ -45,7 +45,7 @@ The pipe rule that everything below follows: **stdout carries the product,
 stderr carries everything meant for a human** - prompts, progress, errors, the
 run summary.
 
-## `amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v] [task...]`
+## `amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [--resume PATH] [-q|-v] [task...]`
 
 One-shot run: load the config, run the agent on the task, print the final
 answer, exit per the contract.
@@ -225,7 +225,8 @@ as every other flag: a `-h` written after the task text is task text.
 **stdin** is read only when it is actually needed: the config's `prompt`
 template references `{{input}}`, or there is no `prompt` and no task text.
 `amele run cfg.yaml "task"` never touches stdin, so it cannot hang on an open
-pipe. When stdin is an interactive terminal, nothing is read (a run never
+pipe. A `--resume` run never reads it at all: its history comes from the
+log. When stdin is an interactive terminal, nothing is read (a run never
 blocks waiting for typing). Piped input is capped at 10 MB; the cut is marked
 with `[input truncated at 10MB by amele]` so the model knows data is missing.
 
@@ -269,6 +270,117 @@ armed. For the cron/systemd angle on this flag -
 and why an embedding that wants concurrent runs should leave it off - see
 [docs/deployment.md](../deployment.md).
 
+### Resuming a run: `--resume PATH`
+
+Added additively after the v1 freeze (2026-09-07). Available on `run` only.
+
+`amele run <config.yaml|dir> --resume <session.jsonl> [instruction...]`
+continues the run recorded in that session log. amele reads the log, rebuilds
+the conversation it recorded, and opens the new run with it:
+
+1. the **current** config's `system_prompt`, when it has one - no log records
+   a system prompt, so editing the YAML between the two runs is how a
+   continuation is steered;
+2. the old run's task, as its `run_start` recorded it;
+3. the logged assistant turns and tool results, in log order;
+4. the task text given on the command line, if any, as the last user message,
+   **verbatim**.
+
+That last step is the one surprise for a config with a `prompt` template: the
+template is **not** applied to the instruction. It shaped the original task,
+which the rebuilt history already carries, and re-rendering it around a
+follow-up would send the model a second copy of the framing it has been
+reading all along. For the same reason **stdin is never read on a `--resume`
+run** - `{{input}}` is not re-rendered either, and a resume cannot hang on an
+open pipe.
+
+**The log must be a full record.** By default a session log clips every
+free-text field to `limits.max_logged_field` bytes, and a conversation rebuilt
+from clipped text is a different conversation than the model had. A log
+carrying the clip marker in a field the history needs is therefore refused
+rather than quietly resumed from, naming the field, the turn and the key that
+would have prevented it:
+
+```
+run-20260907T085501Z-4120.jsonl: session log is clipped: result in turn 3 ends in the clip marker; write the log with limits.max_logged_field: 0 to make it resumable
+```
+
+So a config whose runs may need continuing sets `limits.max_logged_field: 0`
+(see [docs/session-logging.md](../session-logging.md)).
+
+**Everything refused is exit 2**, reported on stderr before a token is spent
+and before any session log is opened - a refused resume leaves no file behind:
+
+- a **clipped** log, as above;
+- a log whose lines do not parse, or whose events contradict the schema
+  (`session log is malformed: line 4: ...`). A **torn last line** is not
+  damage: the prefix a SIGKILL or a power loss leaves mid-write ends the
+  history at the last complete line, and the resume proceeds - that is the
+  crashed run `--resume` exists for;
+- an interactive chat's log (`session log is not resumable: it records an
+  interactive chat, which has no task to continue`);
+- a file that does not begin with a `run_start`, one whose `run_start` carries
+  no task, or one written to a schema version this build does not read - the
+  same `not resumable` sentence with its own reason;
+- a log whose run took an `output.schema` retry: the validator's feedback is a
+  user turn the log does not record, so rebuilding it would hand the model a
+  conversation that never happened (`the log skips a user turn (an
+  output.schema retry's feedback is not logged); the run is not resumable`).
+  In the file it looks like two adjacent `llm_response` events where the first
+  requested no tool calls;
+- a missing or unreadable file (`opening session log: ...`);
+- a log whose run **already produced a final answer**, resumed with no
+  instruction to add: `run already produced a final answer; pass an
+  instruction to continue`. Whitespace-only task text is no instruction.
+
+**No tool call is ever re-executed.** A call the interrupted run dispatched
+but whose `tool_result` never reached the log is not repeated: the log records
+that a call was requested, not whether its side effect landed. The model gets
+a synthetic result in its place - `error: the previous run was interrupted
+before this tool call completed; call it again if the result is still needed`
+- and decides for itself whether to ask again. A call the old turn requested
+but never dispatched (no `tool_call` event) is dropped from the history
+entirely: its name and arguments were never written, so there is nothing
+faithful to send.
+
+**Reasoning carriers** - the opaque payloads logged by `log_reasoning: true` -
+are restored only when the log's `run_start.provider` equals the current
+config's provider identity **and** the old run never fell back to another
+backend: a provider signs or hash-checks its own reasoning payload, so
+replaying one into a different backend is at best rejected. A carrier
+containing `[REDACTED]` is dropped for the same reason - those are no longer
+the bytes the provider signed. Without `log_reasoning: true` the rebuilt
+conversation simply carries no thinking payloads, which providers accept: the
+turn is replayed without it. Redaction is otherwise **not** a fidelity gate -
+a `[REDACTED]` inside a tool result is replayed as it stands, because that is
+the text the run being continued was reading.
+
+**The resumed run writes a NEW session log.** The file named by `--resume` is
+opened read-only and never appended to, and the new file numbers its turns
+from 1 again. Its `run_start` records the origin in the three fields added by
+[JSONL v1.9](jsonl-events.md): `resumed_from` (the path exactly as typed, the
+one logged field that is redacted but never clipped), `resumed_turn` (the
+highest turn the old log carried) and `resumed_pending` (the interrupted call
+ids above, absent when there are none). The task it records is the OLD run's
+task, so the two files read as one story.
+
+**The other run-level guards come first.** `lock: true` keys on the config
+path, not on the log, so resuming a config whose original run is still alive
+is exit **7** exactly as any second run of that config would be. Both the lock
+and the MCP credential pre-flight run *before* the log is read, which is why a
+resume the credential gate refuses (exit **8**) writes an ordinary `run_start`
+with none of the `resumed_*` keys: that run never got as far as the log. MCP
+servers themselves connect exactly as they do for any other run; if the
+resumed config no longer declares the server that produced a pending call, the
+history references a tool that is not in the request's tool list - providers
+tolerate that, and the model has already been told that call's result is
+unknown.
+
+**`amele chat` has no `--resume`.** `amele chat cfg.yaml --resume x` prints
+`chat has no --resume` and exits 2 - a chat builds its own history at the
+keyboard, and its log carries the fixed task `interactive chat`, which is not
+resumable in the first place.
+
 ### Directory arguments
 
 If the config argument is a directory, `<dir>/agent.yaml` is used. A
@@ -291,7 +403,9 @@ Interactive REPL over the same config, tools and permissions as `run`.
 `run` - a chat reads its input from stdin. `--model`, `--set` and
 `-w` / `--workspace` behave as in `run` (same closed key list, same
 command-line path resolution, same merge order), and `-h` / `--help` prints
-`chat`'s detailed page to stdout (exit 0).
+`chat`'s detailed page to stdout (exit 0). There is no `--resume`:
+`amele chat cfg.yaml --resume x` is exit 2 with `chat has no --resume` (see
+[Resuming a run](#resuming-a-run---resume-path)).
 
 **`-q` / `--quiet`** and **`-v` / `--verbose`** behave as in `run`. In chat,
 `-q` suppresses the closing session summary and the `output.schema is ignored
@@ -635,7 +749,9 @@ generator and no shared completion framework, in keeping with the
 single-static-binary, no-runtime-dependency rule ([docs/engineering.md](../../docs/engineering.md) §2).
 Each script completes the subcommands, the flags each subcommand accepts,
 config paths (YAML files or pack directories) in the config-path slot, and
-the shell names accepted by `completion` itself.
+the shell names accepted by `completion` itself. Per-subcommand means exactly
+that: `--resume` is offered for `run` and not for `chat`, which has none, and
+it completes to a path.
 
 - **Arguments**: exactly one, the shell name (`bash`, `zsh` or `fish`); no
   argument, an unrecognized shell, or more than one argument is a usage error

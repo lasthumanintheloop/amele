@@ -1,16 +1,18 @@
 # JSONL event schema
 
-**v1.8 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.9 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
 `mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4), the
 opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6), the
-prompt-cache counts on `llm_response` and `run_end` (v1.7) and the provider
-identities plus the `provider_fallback` event (v1.8) added
+prompt-cache counts on `llm_response` and `run_end` (v1.7), the provider
+identities plus the `provider_fallback` event (v1.8) and the resumed-run keys
+on `run_start` (v1.9) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
-and (future) replay input are deliberately the same format. Source of truth:
-`session.Event` in `internal/session/session.go`.
+and resume input are deliberately the same format: `amele run --resume` reads
+this file back and rebuilds the conversation from it ([cli.md](cli.md)).
+Source of truth: `session.Event` in `internal/session/session.go`.
 
 ## File
 
@@ -49,7 +51,10 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 |-------|------|---------|
 | `model` | string | Model identifier the run was started with (after any `--model` override). |
 | `provider` | string | Identity of the backend the run started on: the wire family, narrowed by the variation that changes the request shape - `openai`, `openai/<dialect>` (e.g. `openai/deepseek`), `anthropic`, `gemini` or `gemini/vertex`. Deliberately **not** the `base_url`: a log is pasted into issues and shipped to collectors, and a URL can carry a credential in its query string or name an internal host. The consequence is that two targets on the same family read alike here - the `provider_fallback` event's `from`/`to` index pair is what tells them apart. Every `run`, `chat` and pack invocation of the binary writes it from v1.8 on, so absent means the log predates v1.8 (or was written by an embedder of `internal/session` that named no backend). Since v1.8. |
-| `task` | string | The rendered user task (clipped + redacted, see below). For a chat session this is the fixed label `interactive chat`. |
+| `task` | string | The rendered user task (clipped + redacted, see below). For a chat session this is the fixed label `interactive chat`. On a resumed run it is the task of the run being continued, copied from its log, so the two files read as one story. |
+| `resumed_from` | string | The session log this run's conversation was rebuilt from, exactly as it was typed after `--resume` (cli.md). Written only by a resumed run, so absence means "this run started from its own task" - in every log, including every one written before v1.9. It is the **one** free-text field that is redacted but never clipped ([Clipping and redaction](#clipping-and-redaction)). Since v1.9. |
+| `resumed_turn` | int | The highest `turn` the resumed log carried: how much conversation precedes turn 1 of this file, whose own numbering starts at 1 again. Absent means 0, which is a real case rather than a gap - a log whose run died before its first `llm_response` still resumes, it simply starts the task over. Since v1.9. |
+| `resumed_pending` | string[] | The tool call ids the interrupted run dispatched but never logged a `tool_result` for. Each was answered with a synthetic result telling the model the outcome is unknown, and **nothing was re-executed**, so this list is exactly the set of side effects that are unaccounted for. The ids belong to the OLD log and appear in no `tool_call` event of this file. Absent means none. Since v1.9. |
 
 ### `llm_response` - one per provider round-trip
 
@@ -325,6 +330,15 @@ the clip boundary - and it runs unconditionally, before the bound is even
 consulted, so `limits.max_logged_field: 0` widens the record without weakening
 the scrubbing.
 
+**One field is scrubbed but not bounded:** `run_start.resumed_from` (v1.9),
+the session log a resumed run continued. It goes through the same redactor as
+every other field and skips only the clip - it is a filesystem path the OS has
+already bounded, and a silent cut would make the field lie about the one thing
+it exists to say. Redaction still applies, which has a consequence worth
+knowing: when a secret value appears inside the path, the logged string
+carries `[REDACTED]` in its place and is no longer a path that can be fed back
+to `--resume` verbatim.
+
 ## Change policy
 
 Within v1, changes are **additive only**: new event types and new optional
@@ -586,3 +600,49 @@ answering turn):
 - `fallbacks` is a count of switches, not of failures: a target that failed and
   had no successor left never produces one (the run ends with that provider's
   error, exit 5).
+
+### v1.9 (amele v0.3.0) - resumed runs (additive, `v` stays `1`)
+
+Added three optional fields to `run_start` - `resumed_from`, `resumed_turn`
+and `resumed_pending` - written only by a run started with `--resume`
+([cli.md](cli.md)). Nothing was removed, renamed or re-typed, no other event
+type changed a byte, and no new event type appeared. A run that was not
+resumed writes exactly the bytes v1.8 wrote.
+
+- `resumed_from` (string, omitted when the run was not resumed): the log the
+  history was rebuilt from, as the operator named it on the command line. It
+  is the one free-text field that is redacted but NOT clipped (see [Clipping
+  and redaction](#clipping-and-redaction)): the field exists to say which log
+  this run continued, and a silently shortened path would not say it;
+- `resumed_turn` (int, omitted when 0): the highest `turn` the resumed log
+  carried. The new run numbers its own turns from 1 again, so this is the only
+  record in the file of how much conversation came before it;
+- `resumed_pending` (string[], omitted when empty): the tool call ids the
+  interrupted run dispatched but never logged a result for. The resumed run
+  handed the model a synthetic result for each and **re-executed none of
+  them** - the log records that a call was requested, not whether its side
+  effect landed - so the list is precisely what an operator has to reconcile
+  by hand.
+
+The opening line of a resumed run, as amele writes it:
+
+```
+{"v":1,"type":"run_start","ts":"2026-09-07T09:14:02.113977401Z","model":"gpt-5.6","provider":"openai","task":"scan the logs","resumed_from":"out/run-20260907T085501Z-4120.jsonl","resumed_turn":3,"resumed_pending":["call_7"]}
+```
+
+**Migration:** none required. Concretely:
+
+- absent `resumed_*` keys mean "this run started from its own task". That is
+  what a pre-v1.9 log says and what a v1.9 writer writes for an ordinary run,
+  so the two are indistinguishable - correctly, because they describe the same
+  thing;
+- turn numbers do NOT continue across the two files. A consumer stitching a
+  resumed run onto the one it continues reads both files and uses
+  `resumed_turn` as the offset; nothing inside this file refers to the old
+  one's turns;
+- `resumed_from` is a path as it was typed, resolved against whatever
+  directory the shell was in, and it has been through secret redaction. Treat
+  it as a human-readable origin note, not as a path a script may open blindly;
+- the resumed run always writes a NEW file. The log named by `resumed_from` is
+  opened read-only and never appended to, so a resumed chain is N files, not
+  one growing one.

@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.8). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.9). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -233,6 +233,17 @@ Within a frozen version, changes must be additive and backwards-compatible:
   had and sends exactly the requests it sent. Migration: none required.
   `--set model=` keeps overriding the primary only; no fallback key is on
   the allowlist (they name where credentials go).
+- **2026-09-07 - JSONL v1.9, resumed runs.** `run_start` gains three optional
+  keys written only by `amele run --resume`: `resumed_from` (the log the
+  history was rebuilt from, as given on the command line), `resumed_turn`
+  (the highest turn that log carried) and `resumed_pending` (tool-call ids
+  that were interrupted before their result was logged - the model was told
+  so, and nothing was re-executed). Additive: the wire `v` stays `1`, nothing
+  was removed, renamed or re-typed, and a run that was not resumed writes
+  exactly the bytes v1.8 wrote. Migration: none required. Resume itself is
+  a CLI addition (cli.md): it reads a full-record log
+  (`limits.max_logged_field: 0`), refuses a clipped or chat log with exit 2,
+  and always writes a new file.
 
 ## Schema versioning note (`$id`)
 
