@@ -1,0 +1,2 @@
+{"v":1,"type":"run_start","ts":"2026-09-05T12:00:00Z","model":"gpt-4o","provider":"openai","task":"restart the worker and confirm it came back"}
+{"v":1,"type":"llm_response","ts":"2026-09-05T12:00:02Z","turn":1,"tool_call_ids":["call_1"],"input_tokens":280,"output_tokens":31,"finish_reason":"tool_calls"}

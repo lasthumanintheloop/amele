@@ -80,6 +80,23 @@ func TestReadFixtures(t *testing.T) {
 			},
 		},
 		{
+			// The crash between an llm_response and the tool_call lines it
+			// announced: the turn requested a call, nothing was dispatched, so
+			// the message has no text, no call and no carrier left. Sending it
+			// is what the anthropic wire refuses as "content": null, so the
+			// whole turn is dropped and only the task survives.
+			name:     "a turn that dispatched nothing is dropped whole",
+			fixture:  "undispatched-only.jsonl",
+			opts:     resume.Options{Provider: "openai", Model: "gpt-4o"},
+			task:     "restart the worker and confirm it came back",
+			model:    "gpt-4o",
+			provider: "openai",
+			lastTurn: 1,
+			messages: []llm.Message{
+				user("restart the worker and confirm it came back"),
+			},
+		},
+		{
 			name:      "final answer is a completed run",
 			fixture:   "final-answer.jsonl",
 			opts:      resume.Options{Provider: "openai"},
@@ -126,9 +143,9 @@ func TestReadFixtures(t *testing.T) {
 			},
 		},
 		{
-			name:      "carriers are restored for the same provider",
+			name:      "carriers are restored for the same provider and model",
 			fixture:   "carriers-anthropic.jsonl",
-			opts:      resume.Options{Provider: "anthropic"},
+			opts:      resume.Options{Provider: "anthropic", Model: "claude-sonnet-4"},
 			task:      "check app.log and deploy.log for anything unusual",
 			model:     "claude-sonnet-4",
 			provider:  "anthropic",
@@ -155,9 +172,31 @@ func TestReadFixtures(t *testing.T) {
 			},
 		},
 		{
+			// Same backend, another model: a thinking block is signed by the
+			// model that minted it, so `--resume --model other` replays the
+			// conversation carrier-less rather than handing one model's
+			// signed reasoning to another.
+			name:      "a different model gets no carriers",
+			fixture:   "carriers-anthropic.jsonl",
+			opts:      resume.Options{Provider: "anthropic", Model: "claude-opus-4"},
+			task:      "check app.log and deploy.log for anything unusual",
+			model:     "claude-sonnet-4",
+			provider:  "anthropic",
+			lastTurn:  3,
+			completed: true,
+			messages: []llm.Message{
+				user("check app.log and deploy.log for anything unusual"),
+				assistant("", llm.ToolCall{ID: "call_1", Name: "fs_read", Arguments: `{"path":"app.log"}`}),
+				toolMsg("call_1", "WARN retrying in 5s"),
+				assistant("", llm.ToolCall{ID: "call_2", Name: "fs_read", Arguments: `{"path":"deploy.log"}`}),
+				toolMsg("call_2", "deployed 2026-09-04 with key [REDACTED]"),
+				assistant("One retry warning, nothing unusual."),
+			},
+		},
+		{
 			name:      "a different provider gets no carriers",
 			fixture:   "carriers-anthropic.jsonl",
-			opts:      resume.Options{Provider: "openai"},
+			opts:      resume.Options{Provider: "openai", Model: "claude-sonnet-4"},
 			task:      "check app.log and deploy.log for anything unusual",
 			model:     "claude-sonnet-4",
 			provider:  "anthropic",
@@ -249,7 +288,8 @@ const (
 // The reasoning payload is echoed back to a provider that signs it, so the
 // restored bytes must be the logged bytes - not a re-encoding of them.
 func TestCarrierBytesAreExact(t *testing.T) {
-	got, err := resume.Read(filepath.Join("testdata", "carriers-anthropic.jsonl"), resume.Options{Provider: "anthropic"})
+	got, err := resume.Read(filepath.Join("testdata", "carriers-anthropic.jsonl"),
+		resume.Options{Provider: "anthropic", Model: "claude-sonnet-4"})
 	if err != nil {
 		t.Fatalf("Read = %v, want no error", err)
 	}
@@ -313,7 +353,7 @@ func TestReadRejects(t *testing.T) {
 			name: "clipped reasoning that would be restored",
 			log: runStart + "\n" +
 				`{"v":1,"type":"llm_response","ts":"2026-09-05T03:00:01Z","turn":1,"content":"done","reasoning_bytes":9000,"reasoning":"[{\"type\":\"thinking\"...[clipped]","finish_reason":"stop"}`,
-			opts:     resume.Options{Provider: "openai"},
+			opts:     resume.Options{Provider: "openai", Model: "gpt-4o"},
 			want:     resume.ErrClipped,
 			contains: []string{"reasoning", "turn 1"},
 		},
@@ -413,6 +453,21 @@ func TestReadRejects(t *testing.T) {
 			log:      "",
 			want:     resume.ErrNotResumable,
 			contains: []string{"empty"},
+		},
+		{
+			// A torn tail ends a history; with no complete line before it
+			// there is no history to end, so the file is damage rather than
+			// an empty log - and the two ask different things of the operator.
+			name:     "a file that is only a torn line",
+			log:      "hello",
+			want:     resume.ErrMalformed,
+			contains: []string{"line 1"},
+		},
+		{
+			name:     "a file that is only a garbage line with a newline",
+			log:      "hello\n",
+			want:     resume.ErrMalformed,
+			contains: []string{"line 1"},
 		},
 		{
 			name:     "a run_start without a task",

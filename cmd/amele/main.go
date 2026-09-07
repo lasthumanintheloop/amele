@@ -1997,11 +1997,15 @@ func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskA
 		}
 		return task, openingHistory(cfg, task), nil, nil
 	}
-	// The provider identity decides whether the log's reasoning payloads come
-	// back: they are signed or hash-checked by the backend that produced them
-	// (internal/resume Options), so replaying one into a different provider is
-	// at best rejected.
-	replay, err := resume.Read(parsed.resume, resume.Options{Provider: cfg.Provider.Identity()})
+	// The provider identity AND the model decide whether the log's reasoning
+	// payloads come back: they are signed or hash-checked by the backend that
+	// produced them, for the model that produced them (internal/resume
+	// Options), so replaying one into a different provider - or into another
+	// model on the same one, which is what `--resume --model x` asks for - is
+	// at best rejected. cfg.Model is the EFFECTIVE model, after --model and
+	// --set.
+	replay, err := resume.Read(parsed.resume,
+		resume.Options{Provider: cfg.Provider.Identity(), Model: cfg.Model})
 	if err != nil {
 		return "", nil, nil, err
 	}

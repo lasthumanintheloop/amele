@@ -40,7 +40,12 @@
 // instead of being invented: its name and arguments were never written, so
 // there is nothing faithful to send, and a call that never left the harness has
 // no result to stand in for either. It is therefore not Pending; the model is
-// free to ask again.
+// free to ask again. When that drop leaves the turn with no text, no call and
+// no reasoning carrier, the assistant message goes too: an empty assistant turn
+// is not a message any provider takes (Anthropic answers 400 to the
+// "content": null it becomes, Gemini discards it), so the history simply ends
+// at the last turn that said something. LastTurn still counts the dropped turn:
+// it reports where the old run got to, not what the rebuilt history kept.
 //
 // # Fidelity
 //
@@ -110,6 +115,15 @@ type Replay struct {
 }
 
 // Options tunes carrier restoration.
+//
+// CONTRACT: a reasoning payload comes back only when the log's run_start names
+// BOTH the same provider identity and the same model as the run about to be
+// made, and the old run never fell back. The backend signs or hash-checks the
+// payload, and it signs it for the model that minted it - a thinking block
+// belongs to that model, not merely to that vendor - so `--resume` with a
+// changed model (`--model`, `--set model=`, an edited YAML) replays the
+// conversation carrier-less rather than offering one model's signed reasoning
+// to another.
 type Options struct {
 	// Provider is the current primary's identity (session.Event.Provider
 	// spelling, e.g. "anthropic" or "openai/deepseek"). Reasoning payloads are
@@ -119,6 +133,12 @@ type Options struct {
 	// Empty means "do not restore" - it is also what a pre-v1.8 log carries,
 	// and two unknowns are not a match.
 	Provider string
+	// Model is the model the resumed run will call, after every override the
+	// caller applied. It must equal the log's run_start.model for the same
+	// reason Provider must match: the signature is over that model's own
+	// output. Empty means "do not restore" for every log that names a model,
+	// which is every log the writer produces.
+	Model string
 }
 
 // The typed failures of a read. CONTRACT: the caller (cmd) maps all three onto
@@ -239,10 +259,15 @@ func decode(r io.Reader) ([]session.Event, error) {
 		}
 		var ev session.Event
 		if err := json.Unmarshal(line, &ev); err != nil {
-			if i == len(lines)-1 {
+			if i == len(lines)-1 && len(events) > 0 {
 				// Nothing follows it, not even a newline: a torn tail.
 				return events, nil
 			}
+			// A torn tail ENDS a history, so it needs a history to end. With
+			// nothing complete before it the file is not a cut-short log at
+			// all - it is a file that is not a log - and reporting "the log is
+			// empty" there would send the operator looking for a missing run
+			// instead of at the damaged bytes on line 1.
 			return nil, fmt.Errorf("%w: line %d: %v", ErrMalformed, i+1, err)
 		}
 		events = append(events, ev)
@@ -273,8 +298,15 @@ type builder struct {
 	carriers bool
 	// turn is the open turn's number, used to name the turn in clip errors.
 	turn int
-	// assistant indexes the open turn's assistant message in rep.Messages.
+	// assistant indexes the open turn's assistant message in rep.Messages, or
+	// -1 when there is none to patch - before the first turn, and after
+	// closeTurn dropped an empty one.
 	assistant int
+	// opened records that an llm_response was seen at all, which is a
+	// statement about the FILE rather than about the rebuilt history: the
+	// skipped-user-turn rule in llmResponse reads the sequence of turns in the
+	// log, so a turn closeTurn dropped still counts as one that happened.
+	opened bool
 	// expected is the open turn's tool_call_ids in the model's call order,
 	// and calls is their state by id. Both are replaced on every llm_response.
 	expected []string
@@ -312,12 +344,13 @@ func newBuilder(events []session.Event, opts Options) (*builder, error) {
 	b := &builder{assistant: -1}
 	b.rep.Task, b.rep.Model, b.rep.Provider = start.Task, start.Model, start.Provider
 	b.rep.Messages = []llm.Message{{Role: llm.RoleUser, Content: start.Task}}
-	// Three conditions, all necessary: an identity to compare, the SAME
-	// identity, and a run that never moved off it. A fallback anywhere in the
-	// file taints the whole replay because the history is sent as one document
-	// - the surviving payloads belong to a backend that is no longer the one
-	// being talked to.
-	b.carriers = opts.Provider != "" && opts.Provider == start.Provider && !hasFallback(events)
+	// Four conditions, all necessary: an identity to compare, the SAME
+	// identity, the same MODEL behind it, and a run that never moved off
+	// either. A fallback anywhere in the file taints the whole replay because
+	// the history is sent as one document - the surviving payloads belong to a
+	// backend (and a model) that is no longer the one being talked to.
+	b.carriers = opts.Provider != "" && opts.Provider == start.Provider &&
+		opts.Model != "" && opts.Model == start.Model && !hasFallback(events)
 	return b, nil
 }
 
@@ -367,7 +400,7 @@ func (b *builder) llmResponse(ev session.Event) error {
 	// that no longer matches its own carrier), so the log is refused rather
 	// than guessed at. Logging that feedback is a JSONL contract change and
 	// belongs to its own slice.
-	if b.assistant >= 0 && len(b.expected) == 0 {
+	if b.opened && len(b.expected) == 0 {
 		return fmt.Errorf("%w: the log skips a user turn (an output.schema retry's feedback is not logged); the run is not resumable",
 			ErrNotResumable)
 	}
@@ -390,6 +423,7 @@ func (b *builder) llmResponse(ev session.Event) error {
 		calls[id] = &callState{}
 	}
 	b.turn, b.expected, b.calls = ev.Turn, ev.ToolCallIDs, calls
+	b.opened = true
 	b.assistant = len(b.rep.Messages)
 	b.rep.Messages = append(b.rep.Messages, msg)
 	if ev.Turn > b.rep.LastTurn {
@@ -499,7 +533,8 @@ func (b *builder) expect(id, kind string) (*callState, error) {
 // closeTurn finishes the open turn: every call that was dispatched but never
 // answered gets the synthetic tool message and is reported as Pending. Calls
 // that were never dispatched are skipped - see the package comment for why
-// they are dropped rather than invented.
+// they are dropped rather than invented - and a turn left with nothing at all
+// by that drop is itself dropped.
 //
 // It runs before each new llm_response and once at the end of the file, which
 // is what makes an interrupted run (no run_end at all) resumable.
@@ -517,6 +552,7 @@ func (b *builder) closeTurn() {
 			}
 		}
 		b.rep.Messages[b.assistant].ToolCalls = calls
+		b.dropEmptyAssistant()
 	}
 	for _, id := range b.expected {
 		st := b.calls[id]
@@ -529,6 +565,32 @@ func (b *builder) closeTurn() {
 		b.rep.Pending = append(b.rep.Pending, id)
 	}
 	b.expected, b.calls = nil, nil
+}
+
+// dropEmptyAssistant removes the closed turn's assistant message when the drop
+// rule left nothing in it: no text, no tool call, no reasoning carrier.
+//
+// CONTRACT: this completes the never-dispatched drop. A message with all three
+// empty is not something a provider takes - the Anthropic wire would receive
+// "content": null and answer 400, and the Gemini wire drops such a turn on the
+// floor anyway - so the harness must not build one. It is the shape a crash
+// between the llm_response line and its tool_call lines leaves behind (also a
+// torn last tool_call, and an empty final answer): the calls were announced but
+// never written, so there is nothing faithful to send and the model is free to
+// ask again.
+//
+// The message is always the LAST one at this point: a turn reaches here empty
+// only when no call was dispatched, and no tool message can exist for a call
+// that was not (toolResult refuses a result before its tool_call), so nothing
+// is appended after it that this truncation could take with it.
+func (b *builder) dropEmptyAssistant() {
+	msg := b.rep.Messages[b.assistant]
+	if msg.Content != "" || len(msg.ToolCalls) > 0 || len(msg.Reasoning) > 0 {
+		return
+	}
+	b.rep.Messages = b.rep.Messages[:b.assistant]
+	// Nothing left to patch; the turn itself is still counted (b.opened).
+	b.assistant = -1
 }
 
 // gateClip fails the read when a field the history needs was shortened by the
