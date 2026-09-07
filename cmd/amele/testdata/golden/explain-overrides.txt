@@ -44,7 +44,7 @@ BUDGETS
   max_turns:  3 (overridden via --set)
   max_tokens: 500 (overridden via --set)
   timeout:    5m0s
-  max_tool_result_bytes: built-in per-tool caps (fs_read 256 KiB, subprocess/shell 64 KiB per stream, mcp 64 KiB)
+  max_tool_result_bytes: built-in per-tool caps (fs_read 256 KiB, fs_list/subprocess/shell 64 KiB per stream, mcp 64 KiB)
 
 CONCURRENCY
   lock: enabled (a run started while another holds <config>.lock exits 7)
