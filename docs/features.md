@@ -296,3 +296,16 @@ minimum is 1024 and omitting the key keeps the built-in caps byte for byte.
 with the log's own per-field clip (`limits.max_logged_field`): that one
 shortens what the FILE stores, after the model has already read the text, and
 never sets `truncated`.
+
+Each `llm_response` also records what the provider's prompt cache did for that
+turn: `cache_read_tokens` (input served from the cache) and
+`cache_write_tokens` (input billed to populate it), both a share of the turn's
+`input_tokens` rather than an addition to it, and both absent when the endpoint
+reported nothing. `run_end.cache_read_tokens` is the run's total. The same fact
+reaches the terminal: when a run read anything back from a cache, the summary
+line's token figure carries a parenthetical -
+`✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s` - and a run with
+no cache reads prints the line exactly as before. Where the caching comes from
+depends on the wire: amele places the markers itself on the anthropic wire
+(`provider.prompt_cache`, on by default), while every other endpoint decides on
+its own - see [docs/providers.md](providers.md#prompt-caching).

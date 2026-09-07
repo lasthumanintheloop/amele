@@ -280,8 +280,9 @@ STDOUT
 STDERR
   Config and run errors, permission questions
   (amele: allow tool X with {...}? [y/N]) and audit notes, and - unless -q -
-  the one-line summary: ✓ 8 turns, 3 tool calls, 41.0k tokens, 34.2s (✗ on
-  failure).
+  the one-line summary: ✓ 8 turns, 3 tool calls, 41.0k tokens, 34.2s (with a
+  (N cached) suffix on the token figure when any turn was served from the
+  provider's prompt cache; ✗ on failure).
 
   With -v, one line per loop event, as it happens:
     amele: turn 3: model requested fs_read {"path":"app.log"}
