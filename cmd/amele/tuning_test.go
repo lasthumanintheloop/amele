@@ -148,6 +148,46 @@ func TestBuildProviderDialect(t *testing.T) {
 	}
 }
 
+// TestBuildProviderPromptCache pins the one place the config key becomes a
+// request shape. Nothing downstream can recover the answer: the client decides
+// per request whether to write cache_control, and its zero value is off - so a
+// dropped nil case would silently cost every anthropic run the caching the
+// contract promises by default.
+func TestBuildProviderPromptCache(t *testing.T) {
+	cases := []struct {
+		name  string
+		value *bool
+		want  bool
+	}{
+		{"omitted means on", nil, true},
+		{"true means on", ptrBool(true), true},
+		{"false means off", ptrBool(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
+				Type: config.ProviderTypeAnthropic, PromptCache: tc.value,
+			}}
+			provider, err := buildProvider(cfg, nil)
+			if err != nil {
+				t.Fatalf("buildProvider: %v", err)
+			}
+			client, ok := provider.(*llm.AnthropicClient)
+			if !ok {
+				t.Fatalf("provider is %T, want *llm.AnthropicClient", provider)
+			}
+			if client.PromptCache != tc.want {
+				t.Errorf("PromptCache = %v, want %v", client.PromptCache, tc.want)
+			}
+		})
+	}
+}
+
+// ptrBool is the literal-to-pointer helper for provider.prompt_cache: the key
+// is a *bool because omitted (cache on) and false must reach the client as
+// different answers.
+func ptrBool(v bool) *bool { return &v }
+
 // TestBuildProviderRejectsUnknownDialect: validate cannot be bypassed, but the
 // wiring must not paper over an unparseable dialect either - a client silently
 // falling back to the openai mapping would reshape every request.

@@ -822,6 +822,7 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 	fmt.Fprintf(b, "  request_timeout: %s\n", durationOrDefault(cfg.Provider.RequestTimeout, "120s"))
 	retryRow(b, cfg)
 	dialectRow(b, cfg)
+	promptCacheRow(b, cfg)
 	if cfg.Provider.MaxOutputTokens > 0 {
 		fmt.Fprintf(b, "  max_output_tokens: %d%s\n",
 			cfg.Provider.MaxOutputTokens, set.mark("provider.max_output_tokens"))
@@ -1003,6 +1004,35 @@ func dialectRow(b *strings.Builder, cfg *config.Config) {
 	if hinted {
 		fmt.Fprintf(b, "  %s\n", singleLine(hint))
 	}
+}
+
+// promptCacheRow answers the question a run's token bill turns on: is the
+// unchanged prefix of every request re-billed each turn, or read back from
+// cache?
+//
+// It prints on EVERY wire, unlike dialectRow, because all three answers are
+// facts about this run rather than states of one key. On the anthropic wire
+// amele decides, so the row says where the breakpoints go (an operator sizing
+// the saving needs to know the system prompt and the tool list are in the
+// cached prefix, and that a 3-breakpoint request is what will be sent). On the
+// other wires the endpoint decides on its own and there is nothing to
+// configure - so the row says "automatic" and points at the session log, which
+// is where the actual hit shows up. Saying "off" there, or printing nothing,
+// would both leave the reviewer believing this run pays full price.
+func promptCacheRow(b *strings.Builder, cfg *config.Config) {
+	if !anthropicWire(cfg) {
+		fmt.Fprint(b, "  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)\n")
+		return
+	}
+	// nil is the default and it is ON: the config that says nothing gets the
+	// markers, so only an explicit false takes the second branch. The row names
+	// the key in that case because the operator reviewing this report did not
+	// necessarily write the file.
+	if pc := cfg.Provider.PromptCache; pc != nil && !*pc {
+		fmt.Fprint(b, "  prompt cache:    disabled (provider.prompt_cache: false)\n")
+		return
+	}
+	fmt.Fprint(b, "  prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)\n")
 }
 
 // baseURLDialectHint returns the "your base_url looks like X" line, or "" when

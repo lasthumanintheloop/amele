@@ -5,6 +5,7 @@ MODEL & PROVIDER
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "kimi" (ignored: the anthropic wire has no dialects)
+  prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)
   max_output_tokens: 16384
   provider mapping (the wire fields this config will send):
     max_output_tokens: 16384 -> max_tokens: 16384

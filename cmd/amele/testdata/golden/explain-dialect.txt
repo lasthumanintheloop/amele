@@ -6,6 +6,7 @@ MODEL & PROVIDER
   retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "deepseek"
   hint: base_url looks like api.groq.com; consider dialect: groq
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
   max_output_tokens: 4096
   provider mapping (the wire fields this config will send):
     max_output_tokens: 4096 -> max_tokens: 4096

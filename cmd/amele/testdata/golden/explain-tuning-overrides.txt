@@ -11,6 +11,7 @@ MODEL & PROVIDER
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
   dialect:         "deepseek"
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
   max_output_tokens: 4096 (overridden via --set)
   provider mapping (the wire fields this config will send):
     max_output_tokens: 4096 -> max_tokens: 4096 (overridden via --set)

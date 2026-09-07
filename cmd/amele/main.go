@@ -2737,6 +2737,7 @@ func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Prov
 			MaxAttempts:     maxAttempts,
 			InitialBackoff:  initialBackoff,
 			MaxOutputTokens: cfg.Provider.MaxOutputTokens,
+			PromptCache:     promptCacheOn(cfg),
 		}, nil
 	}
 	if cfg.Provider.Type == config.ProviderTypeGemini {
@@ -2776,6 +2777,20 @@ func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Prov
 		MaxAttempts:    maxAttempts,
 		InitialBackoff: initialBackoff,
 	}, nil
+}
+
+// promptCacheOn resolves provider.prompt_cache into the client's plain bool.
+//
+// CONTRACT: an absent key means ON. The pointer exists so that "the file said
+// nothing" and "the file said false" stay distinguishable in the config, and
+// this is the single place the distinction is spent: nil and true both ask for
+// the cache_control markers, false asks for the pre-v0.3 request bytes.
+//
+// Called only on the anthropic branch of buildProvider. The other wires cache
+// on their own and validate refuses the key there, so translating it for them
+// would describe a request field neither client writes.
+func promptCacheOn(cfg *config.Config) bool {
+	return cfg.Provider.PromptCache == nil || *cfg.Provider.PromptCache
 }
 
 // vertexTarget translates the optional provider.vertex block into the client's

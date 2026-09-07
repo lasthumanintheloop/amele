@@ -4,6 +4,7 @@ MODEL & PROVIDER
   base_url:        (default: generativelanguage.googleapis.com)
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
   max_output_tokens: 4096
   provider mapping (the wire fields this config will send):
     max_output_tokens: 4096 -> generationConfig.maxOutputTokens: 4096

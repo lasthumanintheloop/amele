@@ -4,6 +4,7 @@ MODEL & PROVIDER
   base_url:        "https://api.example.com/v1"
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
 
 TOOLS
   workspace: "<TMP>/ws"

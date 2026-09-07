@@ -6,6 +6,7 @@ MODEL & PROVIDER
   vertex auth:     service account file "/etc/amele/sa-key.json"
   request_timeout: default (120s)
   retry:           3 attempts (default), 1s initial backoff (default)
+  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)
   provider mapping (the wire fields this config will send):
     tool schemas: sanitized for the gemini wire (an unsupported JSON Schema keyword or shape is a 400 there)
       "fs_read": no keys stripped

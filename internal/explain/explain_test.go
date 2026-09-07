@@ -1306,6 +1306,89 @@ func TestRenderMaxToolResultBytesOverrideMarked(t *testing.T) {
 	}
 }
 
+// TestRenderPromptCacheRow pins the one row that answers "will this run be
+// billed for the whole prompt every turn". All three answers are here because
+// they are three DIFFERENT facts, not one fact with a value: the anthropic wire
+// is configured (and says where the breakpoints go), the same wire switched off
+// names the key that did it, and every other wire caches without asking - a
+// row that said "off" there would be a lie about the endpoint.
+//
+// Unit-tested rather than golden-only for the direction the fixtures cannot
+// show: no golden config sets the key, so the "disabled" row would otherwise
+// never be rendered by the suite at all.
+func TestRenderPromptCacheRow(t *testing.T) {
+	const anthropicOn = "  prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)\n"
+	const anthropicOff = "  prompt cache:    disabled (provider.prompt_cache: false)\n"
+	const automatic = "  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)\n"
+
+	cases := []struct {
+		name    string
+		mutate  func(*config.Config)
+		want    string
+		notWant []string
+	}{
+		{
+			name: "anthropic with the key omitted is on",
+			mutate: func(c *config.Config) {
+				c.Provider.Type = config.ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+			},
+			want:    anthropicOn,
+			notWant: []string{anthropicOff, automatic},
+		},
+		{
+			name: "anthropic with the key true is the same row",
+			mutate: func(c *config.Config) {
+				c.Provider.Type = config.ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.PromptCache = ptrBool(true)
+			},
+			want:    anthropicOn,
+			notWant: []string{anthropicOff, automatic},
+		},
+		{
+			name: "anthropic with the key false names the key",
+			mutate: func(c *config.Config) {
+				c.Provider.Type = config.ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.PromptCache = ptrBool(false)
+			},
+			want:    anthropicOff,
+			notWant: []string{anthropicOn, automatic},
+		},
+		{
+			name:    "the openai wire caches on its own",
+			mutate:  func(*config.Config) {},
+			want:    automatic,
+			notWant: []string{anthropicOn, anthropicOff},
+		},
+		{
+			name: "so does the gemini wire",
+			mutate: func(c *config.Config) {
+				c.Provider.Type = config.ProviderTypeGemini
+				c.Provider.BaseURL = ""
+			},
+			want:    automatic,
+			notWant: []string{anthropicOn, anthropicOff},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := baseCfg()
+			tc.mutate(cfg)
+			got := Render(cfg, registryWith(t, fsBuiltins...), nil, nil, alwaysFound, nil)
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("report missing %q:\n%s", tc.want, got)
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(got, notWant) {
+					t.Errorf("report unexpectedly contains %q:\n%s", notWant, got)
+				}
+			}
+		})
+	}
+}
+
 // TestRenderDataGovernanceKeys: log_reasoning and print_session_path are the
 // two keys --set cannot reach, which makes this report the only place an
 // operator pre-flighting someone else's pack can learn that the run writes the
