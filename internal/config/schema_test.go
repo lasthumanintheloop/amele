@@ -195,6 +195,45 @@ provider:
 
 }
 
+// TestSchemaPromptCache pins the new provider key on the editor side: it is a
+// BOOLEAN, so the YAML habit of writing yes/no as a quoted string is caught
+// while the file is being typed rather than at load time. The cross-field rule
+// (anthropic wire only) stays OUT of the schema for the reason stated on
+// TestSchemaVertexBlock: `amele validate` says it in the operator's own words,
+// and encoding it here would mean maintaining the same conditional in two
+// copies of a frozen contract.
+func TestSchemaPromptCache(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const head = `
+model: claude-test
+provider:
+  type: anthropic
+  prompt_cache: `
+
+	tests := []struct {
+		name  string
+		value string
+		want  bool // whether the document must validate
+	}{
+		{"false validates", "false", true},
+		{"true validates", "true", true},
+		{"a quoted string is rejected", `"yes"`, false},
+		{"a number is rejected", "1", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, feedback, ok := validator.Validate(yamlToJSON(t, []byte(head+tt.value+"\n")))
+			if ok != tt.want {
+				t.Errorf("schema validation = %v, want %v:\n%s", ok, tt.want, feedback)
+			}
+		})
+	}
+}
+
 // TestSchemaVertexBlock pins the vertex block on the editor side: the block a
 // Vertex config writes validates, and a misspelled key inside it is caught
 // rather than silently ignored (additionalProperties: false, the house rule for

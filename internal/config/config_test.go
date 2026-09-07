@@ -1648,6 +1648,11 @@ func TestLoadResolvesPathLikeCommands(t *testing.T) {
 // agent).
 func ptrFloat(v float64) *float64 { return &v }
 
+// ptrBool is the same helper for provider.prompt_cache, which is a *bool for a
+// stronger reason than the sampling knobs: absent means the anthropic wire
+// caches (the default), so "unset" and "false" ask for opposite request bytes.
+func ptrBool(v bool) *bool { return &v }
+
 // hasFloat reports whether p is set and points at want. It keeps the sampling
 // assertions to one comparison each: the two questions ("is it set?" and "is it
 // right?") have the same answer for a test that expects a value.
@@ -1732,8 +1737,38 @@ func TestLoadWithoutProviderTuning(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.Provider.Dialect != "" || cfg.Provider.Reasoning != nil ||
-		cfg.Provider.Temperature != nil || cfg.Provider.TopP != nil || cfg.Provider.Params != nil {
+		cfg.Provider.Temperature != nil || cfg.Provider.TopP != nil ||
+		cfg.Provider.Params != nil || cfg.Provider.PromptCache != nil {
 		t.Errorf("a config without a tuning block gained values: %+v", cfg.Provider)
+	}
+}
+
+// TestLoadPromptCache pins the YAML surface of the one key whose ABSENCE is
+// not its zero value: `prompt_cache: false` must arrive as a set pointer to
+// false, because an unset key means the anthropic client places its markers.
+// A bool field would have collapsed the two into the same request.
+func TestLoadPromptCache(t *testing.T) {
+	dir := t.TempDir()
+	path := writeConfig(t, dir, `
+model: claude-test
+provider:
+  type: anthropic
+  api_key: ${API_KEY}
+  prompt_cache: false
+workspace: `+dir+`
+`)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Provider.PromptCache == nil {
+		t.Fatal("prompt_cache: false did not reach the config (nil means the default, which is on)")
+	}
+	if *cfg.Provider.PromptCache {
+		t.Error("prompt_cache: false loaded as true")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("an anthropic config that switches the cache off must validate: %v", err)
 	}
 }
 
@@ -1746,6 +1781,15 @@ func TestLoadWithoutProviderTuning(t *testing.T) {
 // an operator told the wrong reason looks for the wrong fix.
 const wantReservedStream = `provider.params key "stream" is reserved on every target ` +
 	`(that slot belongs to amele's own request machinery, whatever the value); remove it`
+
+// wantPromptCacheOffWire is the WHOLE message provider.prompt_cache must
+// produce on a wire that is not anthropic. It is pinned as a constant because
+// the message has to do two jobs at once: say that nothing is broken (caching
+// already happens here) and say what the key actually configures, so an
+// operator who set it hoping to TURN CACHING ON does not read "remove it" as
+// "you cannot have caching".
+const wantPromptCacheOffWire = `provider.prompt_cache: caching is automatic on this wire; ` +
+	`the key configures the anthropic wire's cache_control markers - remove it`
 
 // TestValidateProviderTuning is the rule-by-rule table for the tuning surface.
 // Every case is a rule an operator can only learn about at exit 2, so each
@@ -2253,6 +2297,58 @@ func TestValidateProviderTuning(t *testing.T) {
 				c.Provider.MaxOutputTokens = 8192
 				c.Provider.Reasoning = &ReasoningConfig{BudgetTokens: 8192}
 			},
+			"",
+		},
+
+		// Rule 10: prompt_cache configures the anthropic wire's cache_control
+		// markers. Every other wire caches on its own, with nothing to
+		// configure, so an explicit value there names a request field amele
+		// would never write - a silently dropped key, which is exactly what
+		// this validator exists to refuse (the budget_tokens precedent).
+		{
+			"prompt_cache off on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.PromptCache = ptrBool(false)
+			},
+			"",
+		},
+		{
+			"prompt_cache on on the anthropic wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeAnthropic
+				c.Provider.BaseURL = ""
+				c.Provider.PromptCache = ptrBool(true)
+			},
+			"",
+		},
+		{
+			"prompt_cache on the openai wire",
+			func(c *Config) { c.Provider.PromptCache = ptrBool(true) },
+			wantPromptCacheOffWire,
+		},
+		{
+			// false is refused as loudly as true: the operator is switching off
+			// something this wire never did, so silence would confirm a belief
+			// about the run that is not true.
+			"prompt_cache false on the openai wire",
+			func(c *Config) { c.Provider.PromptCache = ptrBool(false) },
+			wantPromptCacheOffWire,
+		},
+		{
+			"prompt_cache on the gemini wire",
+			func(c *Config) {
+				c.Provider.Type = ProviderTypeGemini
+				c.Provider.BaseURL = ""
+				c.Provider.APIKey = "k"
+				c.Provider.PromptCache = ptrBool(false)
+			},
+			wantPromptCacheOffWire,
+		},
+		{
+			"prompt_cache omitted is legal on every wire",
+			func(c *Config) { c.Provider.PromptCache = nil },
 			"",
 		},
 	}

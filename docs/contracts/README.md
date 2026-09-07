@@ -178,6 +178,22 @@ Within a frozen version, changes must be additive and backwards-compatible:
   `limits.max_tool_result_bytes` (cli.md) - a budget, like
   `limits.max_logged_field`: the worst an operator can do with it is make
   the model read more or less of a result; no key was removed.
+- **2026-09-07 - config schema: `provider.prompt_cache`.** One optional boolean
+  for the anthropic wire: when omitted or true the client places
+  `cache_control: {type: ephemeral}` markers on the last tool definition,
+  the system prompt (sent as a one-block array) and the last content block
+  of the last message; false sends the pre-v0.3 request byte-for-byte. An
+  explicit value with any other `provider.type` is a config error - caching
+  is automatic on those wires and the key would be a silently dropped field.
+  Additive to the schema: the key is optional and `additionalProperties:
+  false` still holds. **One behavior changed:** every anthropic config that
+  does not set the key now sends the markers, and its `llm_response.
+  input_tokens` counts the cached share it never reported before (jsonl-
+  events.md v1.7). Migration: none required for a multi-turn agent, where
+  the second turn already pays back the 1.25x write premium; a single-turn
+  config over the model's minimum cacheable prefix pays that premium with no
+  read to recoup it - set `provider.prompt_cache: false` there. Not on the
+  `--set` allowlist: it reshapes every request rather than retuning one.
 
 ## Schema versioning note (`$id`)
 

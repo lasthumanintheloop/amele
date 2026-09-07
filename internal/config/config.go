@@ -179,6 +179,19 @@ type ProviderConfig struct {
 	// gemini config written before this block carries. It is refused with any
 	// other provider.type - the block describes ONE wire's endpoint.
 	Vertex *VertexConfig `yaml:"vertex"`
+	// PromptCache configures explicit prompt caching on the ANTHROPIC wire:
+	// cache_control breakpoints on the tool list, the system prompt and the
+	// last message, so an unchanged prefix is read back instead of re-billed.
+	//
+	// nil means on - the default every anthropic config gets - and false sends
+	// the request without markers, byte-for-byte as it was sent before the key
+	// existed. It is a pointer for exactly that reason: "unset" and "false"
+	// must ask for opposite request bytes, which a bool cannot express.
+	//
+	// An explicit value with any other provider.type is a validation error
+	// (validatePromptCache), not a silently ignored key: caching is automatic
+	// on those wires and there is no marker for the config to place.
+	PromptCache *bool `yaml:"prompt_cache"`
 	// Params is the escape hatch: arbitrary keys merged verbatim into the
 	// request body root, for provider extras amele has no neutral field for.
 	// Keys amele writes itself ON THE ACTIVE TARGET are rejected at validation
@@ -1206,7 +1219,36 @@ func (c *Config) validateProviderTuning(add func(format string, args ...any)) {
 	dialect, known := c.tuningDialect(add)
 	c.validateReasoning(add, dialect, known)
 	c.validateSampling(add, dialect, known)
+	c.validatePromptCache(add)
 	validateParams(add, c.Provider.Params, c.ownedParamsKeys(dialect, known), reservedWireFields)
+}
+
+// validatePromptCache scopes provider.prompt_cache to the wire that has
+// something to configure.
+//
+// CONTRACT: the key decides whether the anthropic client places cache_control
+// breakpoints. The openai-compatible endpoints and the gemini wire cache
+// automatically - the request carries no marker amele could add or withhold -
+// so an explicit value there would be a dropped field while the file claims a
+// setting. Refused rather than ignored, following provider.reasoning.
+// budget_tokens: a knob that cannot reach the wire it is written for is a
+// mistake the operator can only find by reading amele's source otherwise.
+//
+// Not gated on the dialect: this is a WIRE question, and the dialect describes
+// a variation of the openai one, so an unparseable dialect cannot make it
+// unanswerable (the budget-fits-cap precedent).
+//
+// nil is always legal, on every wire: it is what every config written before
+// the key existed carries, and it means "the wire's own default".
+func (c *Config) validatePromptCache(add func(format string, args ...any)) {
+	if c.Provider.PromptCache == nil || c.Provider.Type == ProviderTypeAnthropic {
+		return
+	}
+	// The message says caching still HAPPENS before it says to remove the key:
+	// an operator who set it to turn caching on must not read "remove it" as
+	// "this endpoint does not cache".
+	add("provider.prompt_cache: caching is automatic on this wire; " +
+		"the key configures the anthropic wire's cache_control markers - remove it")
 }
 
 // tuningDialect resolves the dialect the dialect-DEPENDENT rules are checked

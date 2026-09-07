@@ -109,6 +109,10 @@
             }
           }
         },
+        "prompt_cache": {
+          "type": "boolean",
+          "description": "Anthropic wire only: place cache_control breakpoints on the tool list, the system prompt and the last message (default true). false sends the request without markers. Setting the key with any other provider.type is a config error - caching is automatic there and reported in the session log."
+        },
         "params": {
           "type": "object",
           "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself ON THE ACTIVE TARGET are rejected at load time - model, messages, tools, response_format, temperature, top_p, the dialect's cap and reasoning spellings, thinking/output_config/system on the anthropic wire, and contents/systemInstruction/tools/toolConfig/generationConfig/safetySettings/cachedContent (in either spelling) on the gemini wire - so params can extend a request but never rewrite one. stream and tool_choice are refused everywhere: amele's transport reads a single JSON body and its loop owns the tool protocol. A key the active target never writes (thinking on kimi) stays available. Values must be JSON-serializable."
