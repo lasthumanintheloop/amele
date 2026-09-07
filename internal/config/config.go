@@ -231,6 +231,43 @@ type FallbackTarget struct {
 	ProviderConfig `yaml:",inline"`
 }
 
+// Identity names the backend this target describes, for run_start.provider and
+// for both sides of a provider_fallback event: the wire family ("openai",
+// "anthropic", "gemini"), narrowed by the variation that changes the request
+// shape ("openai/deepseek", "gemini/vertex").
+//
+// It is deliberately NOT the base_url. A session log is pasted into issues and
+// shipped to log collectors, and a base_url can carry a credential in its
+// query string or name an internal host; the family plus the variation is what
+// a reader actually needs to explain a response's shape. The consequence is
+// that two targets on the same family are indistinguishable in the log - the
+// fallback event's index pair (from/to) is what tells them apart.
+//
+// The dialect narrows only the openai wire, because that is the only place it
+// changes anything: validation refuses it with gemini and documents it as
+// ignored with anthropic, so repeating it there would describe a request
+// nobody sent.
+//
+// It lives on ProviderConfig rather than on Config so a fallback entry - which
+// embeds ProviderConfig - names itself by the same rule as the primary.
+func (p *ProviderConfig) Identity() string {
+	switch p.Type {
+	case ProviderTypeAnthropic:
+		return ProviderTypeAnthropic
+	case ProviderTypeGemini:
+		if p.Vertex != nil {
+			return ProviderTypeGemini + "/vertex"
+		}
+		return ProviderTypeGemini
+	}
+	// "" and "openai" are the same wire (see Type), and a dialect spelled
+	// "openai" is the baseline rather than a variation.
+	if p.Dialect != "" && p.Dialect != ProviderTypeOpenAI {
+		return ProviderTypeOpenAI + "/" + p.Dialect
+	}
+	return ProviderTypeOpenAI
+}
+
 // ReasoningConfig is the provider-neutral reasoning knob. Both fields are
 // optional; the dialect decides how they are mapped onto the wire, and
 // `amele explain` reports the mapping (including any rounding) before a run.

@@ -3258,3 +3258,43 @@ func TestPrimaryOnlyViolationsUnchangedByFallback(t *testing.T) {
 		})
 	}
 }
+
+// TestProviderConfigIdentity pins the identity string written to
+// run_start.provider and to both sides of a provider_fallback event: the wire
+// family, narrowed by the variation that changes the request shape. The
+// base_url is deliberately NOT part of it - it can carry a credential in a
+// query string, and the log must stay safe to paste.
+func TestProviderConfigIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		p    ProviderConfig
+		want string
+	}{
+		{"default is openai", ProviderConfig{}, "openai"},
+		{"explicit openai", ProviderConfig{Type: ProviderTypeOpenAI}, "openai"},
+		{"openai dialect narrows", ProviderConfig{Dialect: "deepseek"}, "openai/deepseek"},
+		{"the openai dialect does not repeat itself", ProviderConfig{Dialect: "openai"}, "openai"},
+		{"anthropic", ProviderConfig{Type: ProviderTypeAnthropic}, "anthropic"},
+		{"anthropic ignores a leftover dialect", ProviderConfig{Type: ProviderTypeAnthropic, Dialect: "groq"}, "anthropic"},
+		{"gemini", ProviderConfig{Type: ProviderTypeGemini}, "gemini"},
+		{
+			"vertex is its own target",
+			ProviderConfig{Type: ProviderTypeGemini, Vertex: &VertexConfig{Project: "p", Location: "us-central1"}},
+			"gemini/vertex",
+		},
+		{
+			// A fallback entry is a ProviderConfig too, so the chain's
+			// non-primary targets name themselves through the same method.
+			"a fallback entry names itself",
+			FallbackTarget{Model: "m", ProviderConfig: ProviderConfig{Type: ProviderTypeAnthropic}}.ProviderConfig,
+			"anthropic",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.p.Identity(); got != tt.want {
+				t.Errorf("Identity() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
