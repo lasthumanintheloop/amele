@@ -349,7 +349,7 @@ func TestSchemaStructTwoWaySync(t *testing.T) {
 		t.Fatalf("parsing embedded schema: %v", err)
 	}
 	schemaPaths := map[string]bool{}
-	collectSchemaPaths(doc, "", schemaPaths)
+	collectSchemaPaths(doc, doc, "", schemaPaths)
 
 	for _, path := range sortedKeys(structPaths) {
 		if !schemaPaths[path] {
@@ -368,21 +368,36 @@ func TestSchemaStructTwoWaySync(t *testing.T) {
 // under a "[]" marker; maps and scalars are leaves - their value shape is the
 // schema's business (additionalProperties), not a named property.
 func collectYAMLPaths(t reflect.Type, prefix string, out map[string]bool) {
+	collectYAMLPathsWithin(t, prefix, out, nil)
+}
+
+// collectYAMLPathsWithin is collectYAMLPaths carrying the chain of struct types
+// the walk is already inside, which is what makes a self-referential type
+// walkable: FallbackTarget embeds ProviderConfig, whose Fallback field is a
+// list of FallbackTarget again.
+func collectYAMLPathsWithin(t reflect.Type, prefix string, out map[string]bool, enclosing []reflect.Type) {
+	within := append(slices.Clip(enclosing), t)
 	for i := range t.NumField() {
 		field := t.Field(i)
 		if !field.IsExported() {
 			continue // derived state (e.g. interpolated), not YAML schema
 		}
-		name := strings.Split(field.Tag.Get("yaml"), ",")[0]
+		tag := strings.Split(field.Tag.Get("yaml"), ",")
+		name := tag[0]
 		if name == "-" {
+			continue
+		}
+		if name == "" && slices.Contains(tag[1:], "inline") {
+			// An embedded struct tagged ",inline" contributes its fields at the
+			// SAME path, with no key of its own - that is what lets a fallback
+			// entry be written exactly like the primary provider block.
+			collectYAMLPathsWithin(field.Type, prefix, out, within)
 			continue
 		}
 		if name == "" {
 			// yaml.v3's default for an untagged field.
 			name = strings.ToLower(field.Name)
 		}
-		path := prefix + name
-		out[path] = true
 
 		ft := field.Type
 		// An optional block is a pointer to a struct (nil = absent, e.g.
@@ -390,12 +405,29 @@ func collectYAMLPaths(t reflect.Type, prefix string, out map[string]bool) {
 		if ft.Kind() == reflect.Pointer && ft.Elem().Kind() == reflect.Struct {
 			ft = ft.Elem()
 		}
+		elem := ft
+		if ft.Kind() == reflect.Slice {
+			elem = ft.Elem()
+		}
+		// A key whose type is one the walk is already inside is a self-nesting
+		// one, and it is deliberately NOT a schema property:
+		// provider.fallback[].fallback exists in Go only because FallbackTarget
+		// embeds ProviderConfig inline, validation refuses it ("fallback
+		// entries cannot nest") and the providerTarget def omits it. Recording
+		// it would make this guard demand a property the contract must not
+		// have - and descending into it would never terminate.
+		if elem.Kind() == reflect.Struct && slices.Contains(within, elem) {
+			continue
+		}
+
+		path := prefix + name
+		out[path] = true
 		switch ft.Kind() {
 		case reflect.Struct:
-			collectYAMLPaths(ft, path+".", out)
+			collectYAMLPathsWithin(ft, path+".", out, within)
 		case reflect.Slice:
-			if ft.Elem().Kind() == reflect.Struct {
-				collectYAMLPaths(ft.Elem(), path+"[].", out)
+			if elem.Kind() == reflect.Struct {
+				collectYAMLPathsWithin(elem, path+"[].", out, within)
 			}
 		default:
 			// Leaf: scalar, map, or slice of scalars.
@@ -408,8 +440,12 @@ func collectYAMLPaths(t reflect.Type, prefix string, out map[string]bool) {
 // "items" that declare properties. Objects validated only by
 // additionalProperties (maps) and free-form objects (output.schema) are
 // leaves, matching the struct walk.
-func collectSchemaPaths(node map[string]any, prefix string, out map[string]bool) {
-	props, ok := node["properties"].(map[string]any)
+//
+// root is the whole document, kept so a local "$ref" can be followed: the
+// fallback list declares its element shape once in $defs and points at it, and
+// the struct walk sees those fields inline.
+func collectSchemaPaths(root, node map[string]any, prefix string, out map[string]bool) {
+	props, ok := resolveSchemaRef(root, node)["properties"].(map[string]any)
 	if !ok {
 		return
 	}
@@ -420,16 +456,39 @@ func collectSchemaPaths(node map[string]any, prefix string, out map[string]bool)
 		}
 		path := prefix + name
 		out[path] = true
+		sub = resolveSchemaRef(root, sub)
 		if _, nested := sub["properties"]; nested {
-			collectSchemaPaths(sub, path+".", out)
+			collectSchemaPaths(root, sub, path+".", out)
 			continue
 		}
 		if items, ok := sub["items"].(map[string]any); ok {
+			items = resolveSchemaRef(root, items)
 			if _, nested := items["properties"]; nested {
-				collectSchemaPaths(items, path+"[].", out)
+				collectSchemaPaths(root, items, path+"[].", out)
 			}
 		}
 	}
+}
+
+// resolveSchemaRef follows a local "#/..." reference to the subschema it names,
+// or returns node unchanged when there is nothing to follow. Only local
+// references are resolvable, and only they appear in this schema; an
+// unresolvable one is returned as-is so the caller treats it as a leaf rather
+// than silently dropping the property it belongs to.
+func resolveSchemaRef(root, node map[string]any) map[string]any {
+	ref, ok := node["$ref"].(string)
+	if !ok || !strings.HasPrefix(ref, "#/") {
+		return node
+	}
+	target := root
+	for _, segment := range strings.Split(strings.TrimPrefix(ref, "#/"), "/") {
+		next, ok := target[segment].(map[string]any)
+		if !ok {
+			return node
+		}
+		target = next
+	}
+	return target
 }
 
 // sortedKeys returns the map's keys in stable order so failure output is
@@ -712,4 +771,70 @@ provider:
 			t.Errorf("config with ${VAR} in tuning fields does not validate:\n%s", feedback)
 		}
 	})
+}
+
+// TestSchemaProviderFallback pins the fallback list on the editor side: a
+// complete entry validates, and the three shapes `amele validate` refuses that
+// ARE schema-expressible - a missing model, a fifth entry, a nested fallback -
+// are red-squiggled while the file is being typed. The cross-field rules of an
+// entry (the wire/dialect relations) stay out of the schema for the reason
+// stated on TestSchemaVertexBlock.
+func TestSchemaProviderFallback(t *testing.T) {
+	validator, err := schema.Compile(SchemaJSONBytes())
+	if err != nil {
+		t.Fatalf("compiling config schema: %v", err)
+	}
+
+	const head = `
+model: primary-model
+provider:
+  base_url: https://api.example.com/v1
+  api_key: ${API_KEY}
+  fallback:
+`
+	t.Run("canonical fallback list", func(t *testing.T) {
+		const doc = head + `    - model: backup-1
+      base_url: https://backup.example.com/v1
+      api_key: ${BACKUP_KEY}
+      dialect: openrouter
+      reasoning:
+        effort: low
+      retry:
+        max_attempts: 2
+    - model: claude-backup
+      type: anthropic
+      api_key: ${ANTHROPIC_KEY}
+      prompt_cache: false
+`
+		if _, feedback, ok := validator.Validate(yamlToJSON(t, []byte(doc))); !ok {
+			t.Errorf("a canonical fallback list does not validate:\n%s", feedback)
+		}
+	})
+
+	rejected := map[string]string{
+		"entry without a model": `    - base_url: https://backup.example.com/v1
+`,
+		"nested fallback": `    - model: backup-1
+      base_url: https://backup.example.com/v1
+      fallback:
+        - model: backup-2
+          base_url: https://deeper.example.com/v1
+`,
+		"misspelled key in an entry": `    - model: backup-1
+      base_urls: https://backup.example.com/v1
+`,
+		"five entries": `    - {model: b1, base_url: https://b1/v1}
+    - {model: b2, base_url: https://b2/v1}
+    - {model: b3, base_url: https://b3/v1}
+    - {model: b4, base_url: https://b4/v1}
+    - {model: b5, base_url: https://b5/v1}
+`,
+	}
+	for name, tail := range rejected {
+		t.Run(name, func(t *testing.T) {
+			if _, _, ok := validator.Validate(yamlToJSON(t, []byte(head+tail))); ok {
+				t.Error("schema accepts a fallback list the runtime rejects")
+			}
+		})
+	}
 }

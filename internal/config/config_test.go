@@ -2996,3 +2996,231 @@ func TestSessionContentKeysAreNotSettable(t *testing.T) {
 		}
 	}
 }
+
+// TestProviderFallbackValidation pins the four rules provider.fallback adds on
+// top of the target rules every entry inherits: the ceiling, the required
+// model, the no-nesting rule, and that a broken entry is reported under its own
+// indexed path rather than under the primary's.
+//
+// The entries are built in Go rather than in YAML so one table can reach shapes
+// the loader would refuse earlier (a nested block), and so each case names the
+// exact message an operator will read.
+func TestProviderFallbackValidation(t *testing.T) {
+	dir := t.TempDir()
+
+	// openaiTarget is a complete, valid openai-wire entry: the baseline each
+	// case mutates so a failure names the rule under test and nothing else.
+	openaiTarget := func(model string) FallbackTarget {
+		return FallbackTarget{
+			Model:          model,
+			ProviderConfig: ProviderConfig{BaseURL: "https://backup.example.com/v1"},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		targets []FallbackTarget
+		want    string // "" means the config must validate
+	}{
+		{
+			name:    "two complete entries validate",
+			targets: []FallbackTarget{openaiTarget("backup-1"), openaiTarget("backup-2")},
+		},
+		{
+			name:    "an entry without a model is refused",
+			targets: []FallbackTarget{{ProviderConfig: ProviderConfig{BaseURL: "https://backup.example.com/v1"}}},
+			want:    "provider.fallback[0].model is required",
+		},
+		{
+			name: "five entries exceed the ceiling",
+			targets: []FallbackTarget{
+				openaiTarget("b1"), openaiTarget("b2"), openaiTarget("b3"), openaiTarget("b4"), openaiTarget("b5"),
+			},
+			want: "provider.fallback: at most 4 entries (got 5)",
+		},
+		{
+			name: "an entry may not carry its own fallback list",
+			targets: []FallbackTarget{{
+				Model: "backup-1",
+				ProviderConfig: ProviderConfig{
+					BaseURL:  "https://backup.example.com/v1",
+					Fallback: []FallbackTarget{openaiTarget("backup-2")},
+				},
+			}},
+			want: "provider.fallback[0].fallback: fallback entries cannot nest",
+		},
+		{
+			name:    "an openai entry still needs a base_url, under its own path",
+			targets: []FallbackTarget{openaiTarget("b1"), {Model: "b2"}},
+			want:    "provider.fallback[1].base_url is required",
+		},
+		{
+			name: "a gemini entry refuses a dialect, under its own path",
+			targets: []FallbackTarget{{
+				Model: "gemini-3-pro",
+				ProviderConfig: ProviderConfig{
+					Type:    ProviderTypeGemini,
+					APIKey:  "k",
+					Dialect: "deepseek",
+				},
+			}},
+			want: `provider.fallback[0].dialect: "deepseek" applies to the openai wire; remove it for type gemini`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, dir, minimalYAML)
+			cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			cfg.Provider.Fallback = tt.targets
+
+			got := cfg.Violations()
+			if tt.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("Violations() = %v, want none", got)
+				}
+				return
+			}
+			if !slices.Contains(got, tt.want) {
+				t.Errorf("Violations() = %v, want it to contain %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestProviderFallbackNestingIndexIsTheEntrysOwn pins that the nesting message
+// names the entry that carries the illegal key, not the entry it holds.
+func TestProviderFallbackNestingIndexIsTheEntrysOwn(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), minimalYAML)
+	cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	good := FallbackTarget{Model: "b1", ProviderConfig: ProviderConfig{BaseURL: "https://b/v1"}}
+	nested := FallbackTarget{
+		Model: "b2",
+		ProviderConfig: ProviderConfig{
+			BaseURL:  "https://b/v1",
+			Fallback: []FallbackTarget{good},
+		},
+	}
+	cfg.Provider.Fallback = []FallbackTarget{good, nested}
+
+	want := "provider.fallback[1].fallback: fallback entries cannot nest"
+	if got := cfg.Violations(); !slices.Contains(got, want) {
+		t.Errorf("Violations() = %v, want it to contain %q", got, want)
+	}
+}
+
+// TestFallbackLiteralAPIKeyRejected pins the SECURITY rule at the entry level:
+// a fallback names its own credential, so the ban on literal secrets in YAML
+// (docs/engineering.md §5.5) has to reach it - under its own indexed path, so
+// the operator knows which block to fix.
+func TestFallbackLiteralAPIKeyRejected(t *testing.T) {
+	yaml := `model: m
+provider:
+  base_url: https://x/v1
+  api_key: ${API_KEY}
+  fallback:
+    - model: backup
+      base_url: https://backup/v1
+      api_key: sk-live-verysecret
+`
+	path := writeConfig(t, t.TempDir(), yaml)
+	_, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+	if err == nil || !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a literal api_key in a fallback entry must be rejected: %v", err)
+	}
+	const want = "provider.fallback[0].api_key must be built only from environment references"
+	if !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q does not name the entry: want it to contain %q", err, want)
+	}
+
+	// The reference form is what a fallback is supposed to carry, and it must
+	// load exactly like the primary's.
+	ok := writeConfig(t, t.TempDir(), strings.Replace(yaml, "sk-live-verysecret", "${BACKUP_KEY}", 1))
+	cfg, err := Load(ok, envMap(map[string]string{"API_KEY": "k", "BACKUP_KEY": "bk"}))
+	if err != nil {
+		t.Fatalf("Load with a referenced fallback key: %v", err)
+	}
+	if got := cfg.Provider.Fallback[0].APIKey; got != "bk" {
+		t.Errorf("fallback api_key = %q, want the interpolated %q", got, "bk")
+	}
+	if got := cfg.Provider.Fallback[0].Model; got != "backup" {
+		t.Errorf("fallback model = %q, want %q", got, "backup")
+	}
+}
+
+// TestFallbackAPIKeyIsACredentialBinding pins that a ${VAR} referenced by a
+// fallback's api_key is marked as a credential, exactly as the primary's is:
+// the two hold the same kind of secret, and `explain` decides what it may print
+// from that flag.
+func TestFallbackAPIKeyIsACredentialBinding(t *testing.T) {
+	yaml := `model: m
+provider:
+  base_url: https://x/v1
+  fallback:
+    - model: backup
+      base_url: https://backup/v1
+      api_key: ${BACKUP_CRED}
+`
+	path := writeConfig(t, t.TempDir(), yaml)
+	cfg, err := Load(path, envMap(map[string]string{"BACKUP_CRED": "bk"}))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, b := range cfg.EnvBindings() {
+		if b.Name == "BACKUP_CRED" {
+			if !b.APIKey {
+				t.Error("a fallback's api_key reference is not marked as a credential")
+			}
+			return
+		}
+	}
+	t.Fatal("BACKUP_CRED was not recorded as an env binding")
+}
+
+// TestPrimaryOnlyViolationsUnchangedByFallback is the regression guard for the
+// validator refactor: a config that names no fallback must report the exact
+// strings it reported before provider.fallback existed. The three fixtures
+// cover the three shapes the refactor touched - a required key, a cross-field
+// rule that names the block twice, and a formatted bound.
+func TestPrimaryOnlyViolationsUnchangedByFallback(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{
+			"missing base_url",
+			func(c *Config) { c.Provider.BaseURL = "" },
+			"provider.base_url is required",
+		},
+		{
+			"vertex outside the gemini wire",
+			func(c *Config) { c.Provider.Vertex = &VertexConfig{Project: "p", Location: "us-central1"} },
+			"provider.vertex is only valid with provider.type: gemini",
+		},
+		{
+			"retry attempts out of range",
+			func(c *Config) { c.Provider.Retry = &RetryConfig{MaxAttempts: 11} },
+			"provider.retry.max_attempts must be between 1 and 10 (got 11; omit for the default 3, or set 1 to disable retrying)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeConfig(t, t.TempDir(), minimalYAML)
+			cfg, err := Load(path, envMap(map[string]string{"API_KEY": "k"}))
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			tt.mutate(cfg)
+			if got := cfg.Violations(); !slices.Contains(got, tt.want) {
+				t.Errorf("Violations() = %v, want it to contain the unchanged message %q", got, tt.want)
+			}
+		})
+	}
+}

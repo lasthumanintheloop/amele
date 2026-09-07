@@ -199,6 +199,36 @@ type ProviderConfig struct {
 	// rewrite one - while a key that target never writes (thinking on kimi)
 	// stays reachable.
 	Params map[string]any `yaml:"params"`
+	// Fallback lists the backup targets, in order, that the run moves to when
+	// the current one fails with a provider error - after that target's own
+	// retries, so a fallback is a last resort rather than a second opinion.
+	// At most maxFallbackTargets entries.
+	//
+	// The switch is sequential and STICKY: the run tries the next entry down
+	// the list and stays on whichever one answers, rather than returning to the
+	// primary. Each entry is a complete provider block plus its own required
+	// model, because a backup endpoint rarely serves the model the primary
+	// does; the primary's model stays the top-level `model` key.
+	//
+	// Every entry is checked by the same rules as the primary, under its own
+	// path (validateTarget). Entries cannot nest: an entry may syntactically
+	// carry this key - it embeds ProviderConfig inline - and validation refuses
+	// it, so the list stays the one flat order an operator can read off the
+	// file.
+	Fallback []FallbackTarget `yaml:"fallback"`
+}
+
+// FallbackTarget is one entry of provider.fallback: a complete provider
+// target plus the model to ask it for. It embeds ProviderConfig inline so an
+// entry is written exactly like the primary block; its own Fallback list must
+// be empty (no nesting).
+type FallbackTarget struct {
+	// Model is the model identifier sent to THIS target. It is required and
+	// never inherited: a backup endpoint is a different vendor as often as not,
+	// and silently forwarding the primary's model name would turn a failover
+	// into a 404 at the worst possible moment.
+	Model          string `yaml:"model"`
+	ProviderConfig `yaml:",inline"`
 }
 
 // ReasoningConfig is the provider-neutral reasoning knob. Both fields are
@@ -776,24 +806,59 @@ func load(path string, env LookupEnv, tolerant bool) (*Config, error) {
 // lenient parse over just this field: other fields may legitimately contain
 // text that only becomes valid for the strict schema after interpolation.
 func rejectLiteralAPIKey(raw []byte) error {
+	// SECURITY: every target in the file is probed, not just the primary. A
+	// fallback entry names its own credential, and a secret committed in the
+	// backup block is leaked exactly as completely as one in the primary.
+	type keyProbe struct {
+		APIKey string `yaml:"api_key"`
+	}
+	// The primary's key is spelled out rather than embedded inline: yaml.v3
+	// skips an embedded field of an unexported type, which would have made the
+	// primary silently unprobed - the exact guard this function is.
 	var probe struct {
 		Provider struct {
-			APIKey string `yaml:"api_key"`
+			APIKey   string     `yaml:"api_key"`
+			Fallback []keyProbe `yaml:"fallback"`
 		} `yaml:"provider"`
 	}
 	if err := yaml.Unmarshal(raw, &probe); err != nil {
 		return nil // let the strict decoder produce the real parse error
 	}
-	// Stripping every ${VAR} reference (and the "$$" escape) must leave
-	// nothing: "sk-live-secret-${SUFFIX}" is still a committed secret even
-	// though it contains a reference.
-	stripped := interpRe.ReplaceAllString(probe.Provider.APIKey, "")
-	stripped = strings.ReplaceAll(stripped, "$$", "")
-	if stripped != "" {
-		return errors.New("provider.api_key must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are forbidden")
+	if isLiteralSecret(probe.Provider.APIKey) {
+		return literalSecretError(apiKeyPath)
+	}
+	for i, entry := range probe.Provider.Fallback {
+		if isLiteralSecret(entry.APIKey) {
+			// The path carries the index: with several entries, "fix the
+			// api_key" is only actionable if it says which block.
+			return literalSecretError(fmt.Sprintf("%s.fallback[%d].api_key", providerPath, i))
+		}
 	}
 	return nil
 }
+
+// isLiteralSecret reports whether value carries anything beyond ${VAR}
+// references. Stripping every reference (and the "$$" escape) must leave
+// nothing: "sk-live-secret-${SUFFIX}" is still a committed secret even though
+// it contains a reference.
+func isLiteralSecret(value string) bool {
+	stripped := interpRe.ReplaceAllString(value, "")
+	return strings.ReplaceAll(stripped, "$$", "") != ""
+}
+
+// literalSecretError phrases the ban for the field at path. The wording is
+// pinned by tests and by `amele validate`'s output; only the path varies.
+func literalSecretError(path string) error {
+	return fmt.Errorf("%s must be built only from environment references (api_key: ${MY_API_KEY}); literal secrets in YAML are forbidden", path)
+}
+
+// maxFallbackTargets caps provider.fallback. Four is a ceiling on a LIST an
+// operator reads top to bottom, not a tuning knob: past a handful the order
+// stops being something a human can hold, and every extra entry is another
+// endpoint that is never exercised until the day it has to work. A longer chain
+// also multiplies the worst-case latency of one turn by the retry budget of
+// each target it walks through.
+const maxFallbackTargets = 4
 
 // providerPath is the dotted path of the primary provider block: the prefix
 // every violation of that block is reported under, and the base apiKeyPath is
@@ -807,6 +872,12 @@ const providerPath = "provider"
 // EnvBinding.APIKey and credentialPath, which also covers sensitive MCP
 // headers).
 const apiKeyPath = providerPath + ".api_key"
+
+// fallbackAPIKeyPath is the dotted field path interpolateNode builds for a
+// fallback entry's api_key. There is no [i] in it: sequence elements inherit
+// their parent's path (see the walk in interpolateNode), and credential-ness is
+// the same answer for every entry anyway.
+const fallbackAPIKeyPath = providerPath + ".fallback.api_key"
 
 // interpolateNode substitutes ${VAR} references inside every scalar VALUE of
 // the parsed YAML tree and returns one EnvBinding per referenced variable, in
@@ -1097,10 +1168,35 @@ func (c *Config) Violations() []string {
 	return msgs
 }
 
-// validateProvider checks the provider block. Split from Validate to keep
-// each function under the complexity budget.
+// validateProvider checks the provider block: the primary target under the
+// path "provider", then the rules provider.fallback adds on top of it. Split
+// from Validate to keep each function under the complexity budget.
 func (c *Config) validateProvider(add func(format string, args ...any)) {
 	c.Provider.validateTarget(providerPath, add)
+
+	// Reported once, and the entries are still checked below: validate's
+	// contract is one pass reporting everything actionable, so an operator who
+	// wrote five entries fixes the count AND whatever is wrong inside them in
+	// a single round rather than one violation per run.
+	if n := len(c.Provider.Fallback); n > maxFallbackTargets {
+		add("%s.fallback: at most %d entries (got %d)", providerPath, maxFallbackTargets, n)
+	}
+	for i := range c.Provider.Fallback {
+		target := &c.Provider.Fallback[i]
+		prefix := fmt.Sprintf("%s.fallback[%d]", providerPath, i)
+		if target.Model == "" {
+			// Never defaulted to the top-level model: see FallbackTarget.Model.
+			add("%s.model is required", prefix)
+		}
+		if len(target.Fallback) > 0 {
+			// CONTRACT: the list is flat. An entry can carry this key only
+			// because it embeds ProviderConfig inline, and a nested list would
+			// describe a failover order no reader of the file could reconstruct
+			// - so it is refused here rather than flattened or ignored.
+			add("%s.fallback: fallback entries cannot nest", prefix)
+		}
+		target.validateTarget(prefix, add)
+	}
 }
 
 // validateTarget checks one provider target - the primary `provider` block, or

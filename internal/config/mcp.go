@@ -555,9 +555,14 @@ var mcpHeaderPathRe = regexp.MustCompile(`^mcp\.servers\.transport\.headers\.(.+
 
 // credentialPath reports whether a dotted field path names a field whose
 // ${VAR} references are credentials regardless of the variable's name (see
-// EnvBinding.APIKey): provider.api_key and any sensitive MCP header.
+// EnvBinding.APIKey): provider.api_key - the primary's or a fallback target's -
+// and any sensitive MCP header.
 func credentialPath(path string) bool {
-	if path == apiKeyPath {
+	// SECURITY: fallbackAPIKeyPath is the SAME field on a backup target, and it
+	// holds the same kind of secret, so it earns the same flag. Sequence
+	// elements inherit their parent's path (interpolateNode adds no index), so
+	// one constant covers every entry.
+	if path == apiKeyPath || path == fallbackAPIKeyPath {
 		return true
 	}
 	if m := mcpHeaderPathRe.FindStringSubmatch(path); m != nil {

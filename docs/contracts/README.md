@@ -207,6 +207,19 @@ Within a frozen version, changes must be additive and backwards-compatible:
   premium with no read to recoup it - set `provider.prompt_cache: false`
   there. Not on the `--set` allowlist: it reshapes every request rather than
   retuning one.
+- **2026-09-07 - config schema: `provider.fallback`.** `provider` gains one
+  optional list, `fallback`: up to four complete provider targets, each
+  written like the primary block plus its own required `model`, tried in
+  order when the current backend fails with a provider error (the exit-5
+  class, after that backend's own retries). The switch is sequential and
+  sticky - a run that moved to a fallback stays on it - and entries cannot
+  nest. Every entry is validated by the primary's rules under its own path
+  (`provider.fallback[1].base_url ...`), including the `${VAR}`-only rule for
+  `api_key`. Additive: the key is optional and `additionalProperties: false`
+  still holds; a config without it validates with exactly the messages it
+  had and sends exactly the requests it sent. Migration: none required.
+  `--set model=` keeps overriding the primary only; no fallback key is on
+  the allowlist (they name where credentials go).
 
 ## Schema versioning note (`$id`)
 

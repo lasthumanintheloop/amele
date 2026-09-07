@@ -116,6 +116,12 @@
         "params": {
           "type": "object",
           "description": "Escape hatch: arbitrary keys merged verbatim into the request body root, for provider extras amele has no neutral field for (e.g. verbosity, or OpenRouter's provider routing block). Keys amele writes itself ON THE ACTIVE TARGET are rejected at load time - model, messages, tools, response_format, temperature, top_p, the dialect's cap and reasoning spellings, thinking/output_config/system on the anthropic wire, and contents/systemInstruction/tools/toolConfig/generationConfig/safetySettings/cachedContent (in either spelling) on the gemini wire - so params can extend a request but never rewrite one. stream and tool_choice are refused everywhere: amele's transport reads a single JSON body and its loop owns the tool protocol. A key the active target never writes (thinking on kimi) stays available. Values must be JSON-serializable."
+        },
+        "fallback": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "Ordered provider targets tried when the current one fails with a provider error (exit-5 class), after its own retries. Sequential and sticky: once a fallback is in use the run stays on it. Each entry is a complete provider block plus its own model; entries cannot nest.",
+          "items": { "$ref": "#/$defs/providerTarget" }
         }
       }
     },
@@ -418,6 +424,121 @@
     }
   },
   "$defs": {
+    "providerTarget": {
+      "type": "object",
+      "description": "One entry of provider.fallback: a complete provider target, written exactly like the primary provider block, plus the model to ask it for. The keys mean what they mean on provider; fallback itself is absent, because entries cannot nest.",
+      "additionalProperties": false,
+      "required": ["model"],
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model identifier sent to THIS target. Required and never inherited from the top-level model: a backup endpoint is a different vendor as often as not, so forwarding the primary's model name would turn a failover into a 404."
+        },
+        "type": {
+          "enum": ["openai", "anthropic", "gemini"],
+          "description": "As provider.type: the wire protocol this target speaks. Omitted means \"openai\"."
+        },
+        "base_url": {
+          "type": "string",
+          "description": "As provider.base_url: required for OpenAI-compatible targets, optional (and without the version suffix) with type \"anthropic\" or \"gemini\"."
+        },
+        "api_key": {
+          "type": "string",
+          "description": "As provider.api_key: this target's own credential. Must be built only from environment references (api_key: ${MY_BACKUP_KEY}); literal secrets in YAML are rejected at load time, in a fallback entry exactly as in the primary block."
+        },
+        "request_timeout": {
+          "$ref": "#/$defs/duration",
+          "description": "As provider.request_timeout: upper bound for a single HTTP round-trip to this target."
+        },
+        "max_output_tokens": {
+          "type": ["integer", "string"],
+          "minimum": 0,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "As provider.max_output_tokens: this target's per-request output ceiling. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "dialect": {
+          "enum": ["openai", "deepseek", "glm", "kimi", "groq", "openrouter"],
+          "description": "As provider.dialect: the variation of the OpenAI-compatible wire this target speaks. Rejected at load time when this entry's type is \"gemini\"."
+        },
+        "reasoning": {
+          "type": "object",
+          "description": "As provider.reasoning: the provider-neutral thinking knob for this target.",
+          "additionalProperties": false,
+          "properties": {
+            "effort": {
+              "enum": ["none", "low", "medium", "high", "xhigh", "max"],
+              "description": "As provider.reasoning.effort."
+            },
+            "budget_tokens": {
+              "type": ["integer", "string"],
+              "minimum": 0,
+              "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+              "description": "As provider.reasoning.budget_tokens. May also be a whole-value ${VAR} environment reference resolved at load time."
+            }
+          }
+        },
+        "temperature": {
+          "type": ["number", "string"],
+          "minimum": 0,
+          "maximum": 2,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "As provider.temperature, narrowed by this entry's own type and dialect. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "top_p": {
+          "type": ["number", "string"],
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+          "description": "As provider.top_p. May also be a whole-value ${VAR} environment reference resolved at load time."
+        },
+        "retry": {
+          "type": "object",
+          "description": "As provider.retry: this target's own transient-failure policy, exhausted before the run moves on to the next entry.",
+          "additionalProperties": false,
+          "properties": {
+            "max_attempts": {
+              "type": ["integer", "string"],
+              "minimum": 0,
+              "maximum": 10,
+              "pattern": "^\\$\\{[A-Za-z_][A-Za-z0-9_]*\\}$",
+              "description": "As provider.retry.max_attempts. May also be a whole-value ${VAR} environment reference resolved at load time."
+            },
+            "initial_backoff": {
+              "$ref": "#/$defs/duration",
+              "description": "As provider.retry.initial_backoff."
+            }
+          }
+        },
+        "vertex": {
+          "type": "object",
+          "description": "As provider.vertex: points this entry's gemini wire at Vertex AI. Valid only when this entry's type is \"gemini\", and never together with its api_key.",
+          "additionalProperties": false,
+          "required": ["project", "location"],
+          "properties": {
+            "project": {
+              "type": "string",
+              "description": "As provider.vertex.project."
+            },
+            "location": {
+              "type": "string",
+              "description": "As provider.vertex.location."
+            },
+            "credentials": {
+              "type": "string",
+              "description": "As provider.vertex.credentials."
+            }
+          }
+        },
+        "prompt_cache": {
+          "type": "boolean",
+          "description": "As provider.prompt_cache: valid only when this entry's type is \"anthropic\"."
+        },
+        "params": {
+          "type": "object",
+          "description": "As provider.params: raw request-body extras for THIS target, checked against the keys that target writes itself."
+        }
+      }
+    },
     "duration": {
       "type": "string",
       "anyOf": [
