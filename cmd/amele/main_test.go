@@ -4199,18 +4199,24 @@ func TestProgressLoggerRedactsLateSecret(t *testing.T) {
 	}
 }
 
-// TestBuildAgentParallelWiring: the YAML's tools.parallel and the permission
-// profile must both reach the loop. They are the two halves of the concurrency
-// gate, and a loop that received neither would either never parallelize or -
-// worse - parallelize a profile that asks a human.
-func TestBuildAgentParallelWiring(t *testing.T) {
+// TestBuildAgentLoopWiring: the config fields the loop cannot re-derive must
+// reach the loop struct. tools.parallel and the permission profile are the two
+// halves of the concurrency gate - a loop that received neither would either
+// never parallelize or, worse, parallelize a profile that asks a human.
+// limits.max_tool_result_bytes is here for a different reason: every tool
+// family caps its own output too, so an end-to-end run cannot tell the loop's
+// ceiling from the tool's. This is the only assertion that can.
+func TestBuildAgentLoopWiring(t *testing.T) {
 	parallelOff := false
+	capBytes := 4096
 	tests := []struct {
-		name         string
-		tools        config.ToolsConfig
-		perms        config.Permissions
-		wantParallel bool
-		wantAuto     bool
+		name          string
+		tools         config.ToolsConfig
+		perms         config.Permissions
+		limits        config.Limits
+		wantParallel  bool
+		wantAuto      bool
+		wantResultCap int
 	}{
 		{name: "default", wantParallel: true, wantAuto: true},
 		{name: "opted out", tools: config.ToolsConfig{Parallel: &parallelOff}, wantParallel: false, wantAuto: true},
@@ -4218,6 +4224,17 @@ func TestBuildAgentParallelWiring(t *testing.T) {
 			name:         "ask profile",
 			perms:        config.Permissions{Default: config.PolicyAsk},
 			wantParallel: true, wantAuto: false,
+		},
+		{
+			// The absent key must leave the ceiling OFF rather than land a
+			// zero-ish cap that would cut every result to nothing.
+			name:         "no result cap",
+			wantParallel: true, wantAuto: true, wantResultCap: 0,
+		},
+		{
+			name:         "result cap set",
+			limits:       config.Limits{MaxToolResultBytes: &capBytes},
+			wantParallel: true, wantAuto: true, wantResultCap: capBytes,
 		},
 	}
 	for _, tt := range tests {
@@ -4227,6 +4244,7 @@ func TestBuildAgentParallelWiring(t *testing.T) {
 				Workspace:   t.TempDir(),
 				Tools:       tt.tools,
 				Permissions: tt.perms,
+				Limits:      tt.limits,
 				Provider:    config.ProviderConfig{BaseURL: "https://api.example.com/v1", APIKey: "k"},
 			}
 			agent, _, _, err := buildAgent(cfg, nil, newLineReader(strings.NewReader("")), io.Discard, nil, false)
@@ -4235,6 +4253,9 @@ func TestBuildAgentParallelWiring(t *testing.T) {
 			}
 			if agent.ParallelTools != tt.wantParallel {
 				t.Errorf("ParallelTools = %v, want %v", agent.ParallelTools, tt.wantParallel)
+			}
+			if agent.MaxToolResultBytes != tt.wantResultCap {
+				t.Errorf("MaxToolResultBytes = %d, want %d", agent.MaxToolResultBytes, tt.wantResultCap)
 			}
 			if agent.AutoApprove == nil {
 				t.Fatal("AutoApprove was not wired: the loop would fall back to sequential forever")
@@ -4488,22 +4509,34 @@ func TestE2EPrintSessionPath(t *testing.T) {
 	}
 }
 
-// TestRunToolResultCap is the end-to-end proof that limits.max_tool_result_bytes
-// reaches the tool constructors AND the loop ceiling: a subprocess printing
-// 3000 bytes is logged whole when the key is absent, and cut to the cap plus
-// TruncationMarker when it is present. The two cases share one fixture on
-// purpose - the key is the ONLY difference between them, so a size change
-// coming from anywhere else would fail both instead of masquerading as the
+// TestRunToolResultCap is the end-to-end proof that a real `amele run` honours
+// limits.max_tool_result_bytes and reports it honestly: a tool producing 3000
+// bytes leaves a tool_result of exactly the cap plus TruncationMarker, flagged
+// truncated, and an absent key leaves the result whole and unflagged.
+//
+// What it deliberately does NOT do is tell the LAYERS apart. The tool caps its
+// own output and the loop caps what the model reads, and either one alone
+// produces this same log line - removing either wire keeps this test green.
+// The individual wires are pinned where they can actually be observed:
+// TestBuildRegistryToolResultCap for the three constructors,
+// TestBuildAgentLoopWiring for the loop ceiling, and TestMCPDepsResultCap for
+// the MCP deps. This test is the one that proves they add up to the behaviour
+// an operator sees.
+//
+// The two cases share one fixture, the limits block being the only difference,
+// so a size change from any other source fails both instead of looking like the
 // feature working.
 func TestRunToolResultCap(t *testing.T) {
 	const outputBytes = 3000
 	const capBytes = 1024
-	// YAML double quotes would eat the escape, so the command is written with
-	// the backslash doubled: tr must receive a literal `\0`.
+	// `cat` on a fixture file rather than a shell pipeline: subprocess tools
+	// run with the workspace as their working directory, so the relative name
+	// is all the tool needs, and the test depends on no shell and no coreutils
+	// beyond cat.
 	const toolYAML = `  subprocess:
     - name: big_output
       description: prints 3000 bytes on stdout
-      command: ["sh", "-c", "head -c 3000 /dev/zero | tr '\\0' a"]
+      command: ["cat", "big.txt"]
 session_dir: sessions
 `
 	cases := []struct {
@@ -4522,16 +4555,17 @@ session_dir: sessions
 				textBody("done"),
 			)
 			cfgPath, dir := writeTestConfig(t, srv.URL, toolYAML+tc.limits)
+			if err := os.WriteFile(filepath.Join(dir, "big.txt"),
+				bytes.Repeat([]byte("a"), outputBytes), 0o600); err != nil {
+				t.Fatal(err)
+			}
 
 			code, _, stderr := execCLI(t, []string{"run", cfgPath, "emit the bytes"}, "")
 			if code != ExitOK {
 				t.Fatalf("exit %d, stderr: %s", code, stderr)
 			}
 
-			evt, ok := findEvent(sessionEvents(t, dir), "tool_result")
-			if !ok {
-				t.Fatal("session log has no tool_result event")
-			}
+			evt, raw := toolResultLine(t, dir)
 			if evt.ResultBytes != tc.wantBytes {
 				t.Errorf("result_bytes = %d, want %d", evt.ResultBytes, tc.wantBytes)
 			}
@@ -4540,17 +4574,108 @@ session_dir: sessions
 			}
 			// `truncated` is omitempty: the uncapped run must not carry the
 			// key at all, which decoding alone cannot tell from `false`.
-			files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
-			if err != nil || len(files) != 1 {
-				t.Fatalf("session files: %v, %v", files, err)
-			}
-			raw, err := os.ReadFile(files[0])
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := strings.Contains(string(raw), `"truncated"`); got != tc.wantCut {
+			if got := strings.Contains(raw, `"truncated"`); got != tc.wantCut {
 				t.Errorf("`truncated` key present = %v, want %v", got, tc.wantCut)
 			}
 		})
 	}
 }
+
+// toolResultLine returns the first tool_result event in dir's session log,
+// decoded, together with the raw line AS WRITTEN. The raw form is the point:
+// re-encoding the decoded event would round-trip through the same struct tags
+// the writer used and so could never catch an omitempty field the writer had
+// stopped omitting.
+func toolResultLine(t *testing.T, dir string) (session.Event, string) {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("session files: %v, %v", files, err)
+	}
+	data, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var e session.Event
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("decoding session line %q: %v", line, err)
+		}
+		if e.Type == "tool_result" {
+			return e, line
+		}
+	}
+	t.Fatal("session log has no tool_result event")
+	return session.Event{}, ""
+}
+
+// TestBuildRegistryToolResultCap pins the constructor half of the wiring: each
+// of the three builtin families must be HANDED limits.max_tool_result_bytes,
+// not merely be capped by the loop afterwards. The distinction matters because
+// the loop's ceiling only bounds what the model reads, while a tool's own cap
+// also bounds what amele buffers in memory - and because an end-to-end run
+// cannot tell the two layers apart (either one alone produces the same log).
+// The tools are therefore invoked straight off the registry, with no loop in
+// the picture.
+func TestBuildRegistryToolResultCap(t *testing.T) {
+	const outputBytes = 3000
+	const capBytes = 1024
+	calls := []struct {
+		tool string
+		args string
+	}{
+		{"fs_read", `{"path":"big.txt"}`},
+		{"shell", `{"command":"cat big.txt"}`},
+		{"big_output", `{}`},
+	}
+	cases := []struct {
+		name   string
+		limits config.Limits
+		want   int
+	}{
+		{"absent", config.Limits{}, outputBytes},
+		{"set", config.Limits{MaxToolResultBytes: ptrTo(capBytes)}, capBytes + len(tools.TruncationMarker)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := t.TempDir()
+			if err := os.WriteFile(filepath.Join(ws, "big.txt"),
+				bytes.Repeat([]byte("a"), outputBytes), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{
+				Workspace: ws,
+				Limits:    tc.limits,
+				Tools: config.ToolsConfig{
+					FS:    true,
+					Shell: config.ShellConfig{Enabled: true},
+					Subprocess: []config.SubprocessTool{{
+						Name: "big_output", Description: "prints the fixture",
+						Command: []string{"cat", "big.txt"},
+					}},
+				},
+			}
+			registry, err := buildRegistry(cfg)
+			if err != nil {
+				t.Fatalf("buildRegistry: %v", err)
+			}
+			for _, call := range calls {
+				tool, ok := registry.Get(call.tool)
+				if !ok {
+					t.Fatalf("%s was not registered", call.tool)
+				}
+				out, err := tool.Invoke(context.Background(), call.args)
+				if err != nil {
+					t.Fatalf("%s: %v", call.tool, err)
+				}
+				if len(out) != tc.want {
+					t.Errorf("%s returned %d bytes, want %d", call.tool, len(out), tc.want)
+				}
+			}
+		})
+	}
+}
+
+// ptrTo is the address-of helper the config's optional-int fields need in
+// table literals, where a plain `&4096` is not legal Go.
+func ptrTo[T any](v T) *T { return &v }

@@ -1131,3 +1131,49 @@ func TestExplainNoAuthBlockHasNoAuthRow(t *testing.T) {
 		t.Errorf("a server without an auth block got a credential line:\n%s", stdout)
 	}
 }
+
+// TestMCPDepsResultCap pins the number that governs MCP tool results. Connect
+// snapshots Deps.MaxResultBytes into every tool a server advertises, so a
+// dropped field here would not fail a connect or a dial - it would quietly hand
+// the model 64 KiB of a result the operator capped at 4 KiB. No end-to-end test
+// can see that, which is why the composition is asserted directly.
+func TestMCPDepsResultCap(t *testing.T) {
+	capBytes := 4096
+	cases := []struct {
+		name   string
+		limits config.Limits
+		want   int
+	}{
+		// 0 is what internal/mcp reads as "use DefaultMaxResultBytes", i.e.
+		// the behaviour of every config written before the key existed.
+		{"absent", config.Limits{}, 0},
+		{"set", config.Limits{MaxToolResultBytes: &capBytes}, capBytes},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Workspace: t.TempDir(), Limits: tc.limits}
+			deps := mcpDeps(cfg, nil, io.Discard, emptyEnv, map[string]bool{"fs_read": true},
+				"v-test", nil, func(...string) {})
+			if deps.MaxResultBytes != tc.want {
+				t.Errorf("Deps.MaxResultBytes = %d, want %d", deps.MaxResultBytes, tc.want)
+			}
+			// The extraction of mcpDeps out of dialMCP must not have dropped
+			// anything else on the way: these are the fields a connect needs.
+			if deps.Workspace != cfg.Workspace {
+				t.Errorf("Workspace = %q, want %q", deps.Workspace, cfg.Workspace)
+			}
+			if deps.Version != "v-test" {
+				t.Errorf("Version = %q, want %q", deps.Version, "v-test")
+			}
+			if !deps.ExistingNames["fs_read"] {
+				t.Error("ExistingNames did not reach the deps: MCP names would not be de-duplicated")
+			}
+			if deps.Clock == nil || deps.Rand == nil || deps.Env == nil ||
+				deps.Stderr == nil || deps.RegisterSecret == nil {
+				t.Errorf("a dependency was dropped: clock=%v rand=%v env=%v stderr=%v register=%v",
+					deps.Clock == nil, deps.Rand == nil, deps.Env == nil,
+					deps.Stderr == nil, deps.RegisterSecret == nil)
+			}
+		})
+	}
+}

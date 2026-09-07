@@ -156,31 +156,46 @@ func dialMCP(ctx context.Context, cfg *config.Config, set *mcpSet, observer mcp.
 		wg.Add(1)
 		go func(i int, s config.MCPServer) {
 			defer wg.Done()
-			// cmd is the composition root: it is the one place allowed to
-			// name the real clock and the real random source, which every
-			// package below takes injected (docs/engineering.md §5.4).
-			results[i].srv, results[i].err = mcp.Connect(ctx, s, mcp.Deps{
-				Clock:         time.Now,
-				Rand:          rand.Float64,
-				Env:           env,
-				Observer:      observer,
-				Stderr:        relay,
-				Workspace:     cfg.Workspace,
-				ExistingNames: existing,
-				Version:       version,
-				TokenStore:    store,
-				// Snapshotted into every discovered tool at Connect time, so
-				// it has to be set HERE and not after discovery.
-				MaxResultBytes: toolResultCap(cfg),
-				// A token refreshed mid-run must be scrubbed from every sink
-				// this invocation already redacts through, which is why the
-				// registry is the run's live SecretSet rather than a snapshot.
-				RegisterSecret: register,
-			})
+			results[i].srv, results[i].err = mcp.Connect(ctx, s,
+				mcpDeps(cfg, observer, relay, env, existing, version, store, register))
 		}(i, s)
 	}
 	wg.Wait()
 	return results
+}
+
+// mcpDeps composes the dependencies one server is connected with. It is a pure
+// function of its arguments so the composition can be asserted on directly: the
+// values it carries are snapshotted by Connect into every tool the server
+// advertises, and a field silently dropped here would only surface as a wrong
+// number in a transcript weeks later.
+//
+// relay is the per-server stderr sink, which is why it is a parameter rather
+// than something this function builds.
+func mcpDeps(cfg *config.Config, observer mcp.Observer, relay io.Writer, env config.LookupEnv,
+	existing map[string]bool, version string, store *oauthtoken.Store, register func(...string)) mcp.Deps {
+	return mcp.Deps{
+		// cmd is the composition root: it is the one place allowed to name the
+		// real clock and the real random source, which every package below
+		// takes injected (docs/engineering.md §5.4).
+		Clock:         time.Now,
+		Rand:          rand.Float64,
+		Env:           env,
+		Observer:      observer,
+		Stderr:        relay,
+		Workspace:     cfg.Workspace,
+		ExistingNames: existing,
+		Version:       version,
+		TokenStore:    store,
+		// CONTRACT: limits.max_tool_result_bytes governs MCP results too, and
+		// Connect snapshots this number into every discovered tool - so it has
+		// to be part of the Deps handed to the dial, not set after discovery.
+		MaxResultBytes: toolResultCap(cfg),
+		// A token refreshed mid-run must be scrubbed from every sink this
+		// invocation already redacts through, which is why the registry is the
+		// run's live SecretSet rather than a snapshot.
+		RegisterSecret: register,
+	}
 }
 
 // dedupRegistrar wraps a secret registrar so each distinct value is passed on
