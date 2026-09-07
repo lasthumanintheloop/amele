@@ -1386,3 +1386,155 @@ func nthLine(t *testing.T, path string, n int) string {
 	}
 	return lines[n]
 }
+
+// TestRunStartResumed pins the v1.9 origin fields: a resumed run_start says
+// which log it continued, how far that log got, and which tool calls were left
+// unanswered - and a run that started from nothing writes none of the three
+// keys, which is what keeps every pre-v1.9 log's bytes valid.
+func TestRunStartResumed(t *testing.T) {
+	tests := []struct {
+		name    string
+		resumed *Resumed // nil means "call RunStart instead"
+		want    []string
+		absent  []string
+	}{
+		{
+			name:    "all three fields",
+			resumed: &Resumed{From: "/var/log/amele/run-1.jsonl", Turn: 7, Pending: []string{"call_1", "call_2"}},
+			want: []string{
+				`"type":"run_start"`, `"model":"gpt-4o"`, `"provider":"openai"`, `"task":"scan the logs"`,
+				`"resumed_from":"/var/log/amele/run-1.jsonl"`, `"resumed_turn":7`,
+				`"resumed_pending":["call_1","call_2"]`,
+			},
+		},
+		{
+			name:    "no pending calls writes no key",
+			resumed: &Resumed{From: "run-1.jsonl", Turn: 3},
+			want:    []string{`"resumed_from":"run-1.jsonl"`, `"resumed_turn":3`},
+			absent:  []string{`"resumed_pending"`},
+		},
+		{
+			// Turn 0 cannot happen for a resumable log (a log with no answered
+			// turn is not resumable), so omitempty deleting it is harmless -
+			// but the path must still be recorded.
+			name:    "zero turn writes no key",
+			resumed: &Resumed{From: "run-1.jsonl"},
+			want:    []string{`"resumed_from":"run-1.jsonl"`},
+			absent:  []string{`"resumed_turn"`, `"resumed_pending"`},
+		},
+		{
+			name:   "a fresh run carries no origin at all",
+			want:   []string{`"type":"run_start"`, `"task":"scan the logs"`},
+			absent: []string{`"resumed_from"`, `"resumed_turn"`, `"resumed_pending"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.resumed == nil {
+				w.RunStart("gpt-4o", "openai", "scan the logs")
+			} else {
+				w.RunStartResumed("gpt-4o", "openai", "scan the logs", *tt.resumed)
+			}
+
+			line := firstLine(t, w.Path())
+			for _, want := range tt.want {
+				if !strings.Contains(line, want) {
+					t.Errorf("run_start does not carry %s:\n%s", want, line)
+				}
+			}
+			for _, absent := range tt.absent {
+				if strings.Contains(line, absent) {
+					t.Errorf("run_start must not carry %s:\n%s", absent, line)
+				}
+			}
+		})
+	}
+}
+
+// TestRunStartResumedRemembersBackend: RunStartResumed must be RunStart plus
+// three fields, and the half that is easy to lose in a second constructor is
+// the invisible one - remembering the model/provider pair so a later turn
+// served by that same backend stays silent about it.
+func TestRunStartResumedRemembersBackend(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := w.Path()
+	w.RunStartResumed("gpt-4o", "openai", "task", Resumed{From: "run-1.jsonl", Turn: 2})
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "ok", FinishReason: "stop", Model: "gpt-4o", Provider: "openai"})
+
+	line := nthLine(t, path, 1)
+	if strings.Contains(line, `"model":`) || strings.Contains(line, `"provider":`) {
+		t.Errorf("a turn served by the resumed run's own backend must name neither:\n%s", line)
+	}
+}
+
+// TestResumedFromIsRedactedNotClipped pins the deliberate exception: the path
+// is the one free-text field that is NOT length-bounded (a silent cut would
+// make the field lie about the one thing it exists to say), but it still goes
+// through the run's redactor, because "secrets are never logged" outranks path
+// fidelity.
+func TestResumedFromIsRedactedNotClipped(t *testing.T) {
+	w, err := New(t.TempDir(), Options{
+		Clock: fixedClock(), Secrets: []string{"sk-supersecret"},
+		// A bound small enough that any clipping at all would show.
+		MaxLoggedField: 16,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	long := "/home/op/" + strings.Repeat("d/", 200) + "run-1.jsonl"
+	w.RunStartResumed("gpt-4o", "openai", "task", Resumed{From: long + "?token=sk-supersecret", Turn: 1})
+
+	var ev Event
+	if err := json.Unmarshal([]byte(firstLine(t, w.Path())), &ev); err != nil {
+		t.Fatal(err)
+	}
+	if want := long + "?token=[REDACTED]"; ev.ResumedFrom != want {
+		t.Errorf("resumed_from = %q, want %q", ev.ResumedFrom, want)
+	}
+	if strings.Contains(ev.ResumedFrom, ClipMarker) {
+		t.Errorf("resumed_from must never be clipped:\n%s", ev.ResumedFrom)
+	}
+}
+
+// TestNilWriterResumedIsSafe: RunStartResumed obeys the same nil-writer
+// contract as every other method - callers hold a nil *Writer when session_dir
+// is unset and must not branch on it.
+func TestNilWriterResumedIsSafe(t *testing.T) {
+	var w *Writer
+	w.RunStartResumed("m", "openai", "t", Resumed{From: "run-1.jsonl", Turn: 2, Pending: []string{"id"}})
+}
+
+// TestGoldenResumed pins the resumed run_start as bytes: all three v1.9 fields
+// on one line, with a secret inside the path to prove redaction still runs on
+// the field the bound does not touch. It is a separate golden from
+// session.jsonl on purpose - that fixture stays the proof that a run started
+// from nothing writes none of these keys.
+func TestGoldenResumed(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock(), Secrets: []string{"sk-supersecret"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.RunStartResumed("gpt-4o", "openai", "scan the logs", Resumed{
+		From:    "/var/log/amele/sk-supersecret/run-20260906T031500Z-4211.jsonl",
+		Turn:    7,
+		Pending: []string{"call_7"},
+	})
+	// The resumed run numbers its own turns from 1 again: resumed_turn above
+	// is the only record that seven turns came before this one.
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop"})
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, TotalTokens: 180, Duration: 1500 * time.Millisecond})
+
+	got, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compareGolden(t, filepath.Join("testdata", "golden", "session-resumed.jsonl"), got)
+}

@@ -53,6 +53,21 @@ type Event struct {
 	Provider string `json:"provider,omitempty"`
 	Task     string `json:"task,omitempty"`
 
+	// run_start of a RESUMED run (v1.9, additive). Only Writer.RunStartResumed
+	// writes them, so absence is the shape of every run that started from
+	// nothing - including every log written before v1.9.
+	//
+	// ResumedFrom is the session log the history was rebuilt from, as the
+	// operator named it. ResumedTurn is the 1-based turn number that log ended
+	// at; the resumed run numbers its own turns from 1 again, so this line is
+	// the only record of how much came before. ResumedPending lists the tool
+	// call ids the interrupted run dispatched but never logged a result for -
+	// the resumed run stands a message in for each and RE-EXECUTES NONE, so a
+	// reader can see exactly which side effects are unaccounted for.
+	ResumedFrom    string   `json:"resumed_from,omitempty"`
+	ResumedTurn    int      `json:"resumed_turn,omitempty"`
+	ResumedPending []string `json:"resumed_pending,omitempty"`
+
 	// llm_response. Content is the assistant's text (clipped); ToolCallIDs
 	// are the IDs of the tool calls requested in the same message. Together
 	// with the tool_call/tool_result events these make the log a complete
@@ -559,6 +574,19 @@ func (w *Writer) clip(text string) string {
 	return text[:cut] + ClipMarker
 }
 
+// redactOnly redacts a field WITHOUT bounding its length.
+//
+// SECURITY: it runs the very same redaction clip runs - one definition of
+// redaction, w.redact - and skips only the byte bound. It exists for exactly
+// one field (Event.ResumedFrom, see Writer.RunStartResumed); a new caller has
+// to justify why a value the writer cannot bound belongs in the log.
+func (w *Writer) redactOnly(text string) string {
+	if w == nil {
+		return ""
+	}
+	return w.redact(text)
+}
+
 // RunStart records the beginning of a run: the model, the identity of the
 // backend that will serve it (see Event.Provider; "" writes no key), and the
 // task.
@@ -569,15 +597,63 @@ func (w *Writer) clip(text string) string {
 // turn that names one, which is the honest reading: there is no baseline to be
 // unchanged from.
 func (w *Writer) RunStart(model, provider, task string) {
+	w.runStart(Event{Type: "run_start", Model: model, Provider: provider, Task: w.clip(task)})
+}
+
+// Resumed is where a resumed run's history came from, as run_start records it
+// (JSONL v1.9). It is a struct rather than three more positional arguments
+// for the same reason LLMResponse is one: RunStartResumed would otherwise take
+// six, four of them strings, and a transposed call site compiles and then lies
+// in the log.
+type Resumed struct {
+	// From is the session log the history was rebuilt from, as the operator
+	// named it on the command line (--resume). It is recorded verbatim apart
+	// from secret redaction; see Writer.RunStartResumed.
+	From string
+	// Turn is the 1-based turn number the resumed history ended at
+	// (resume.Replay.LastTurn). The new run numbers its own turns from 1.
+	Turn int
+	// Pending lists the tool call ids the interrupted run dispatched but never
+	// logged a result for, in call order. The resumed run re-executes none of
+	// them; each got a synthetic tool message instead.
+	Pending []string
+}
+
+// RunStartResumed records the beginning of a run that CONTINUES an earlier
+// one: everything RunStart records - including remembering the model/provider
+// pair, so a later turn served by that same backend stays silent about it -
+// plus where the history came from (Event.ResumedFrom and friends, JSONL v1.9).
+//
+// SECURITY: Resumed.From passes through the run's redactor but is NOT clipped
+// and NOT length-bounded, unlike every other free-text field. The bound is
+// skipped because this is a filesystem path the OS has already bounded, and a
+// silent cut would make the field lie about the one thing it exists to say -
+// which log this run continued. Redaction stays because a path can carry a
+// credential (a token in a directory name, a secret-bearing mount) and the
+// project rule "secrets are never logged" (docs/engineering.md §5.5) outranks
+// path fidelity.
+func (w *Writer) RunStartResumed(model, provider, task string, r Resumed) {
+	w.runStart(Event{
+		Type: "run_start", Model: model, Provider: provider, Task: w.clip(task),
+		ResumedFrom: w.redactOnly(r.From), ResumedTurn: r.Turn, ResumedPending: r.Pending,
+	})
+}
+
+// runStart is the shared body of RunStart and RunStartResumed: remember the
+// backend pair the event announces, then emit it. Both entry points go through
+// here so the "remember, then emit" rule and the run_start shape cannot drift
+// apart - a second hand-written constructor that forgot the memory would make
+// every turn of a resumed run repeat its identity keys.
+func (w *Writer) runStart(ev Event) {
 	if w != nil {
 		// Set before emit rather than after: emit takes mu, which is not
 		// reentrant, and a turn cannot be logged before the run started
 		// anyway.
 		w.mu.Lock()
-		w.runModel, w.runProvider = model, provider
+		w.runModel, w.runProvider = ev.Model, ev.Provider
 		w.mu.Unlock()
 	}
-	w.emit(Event{Type: "run_start", Model: model, Provider: provider, Task: w.clip(task)})
+	w.emit(ev)
 }
 
 // LLMResponse is one model turn as the log records it.
