@@ -193,8 +193,9 @@ Within a frozen version, changes must be additive and backwards-compatible:
   for the anthropic wire: when omitted or true the client places
   `cache_control: {type: ephemeral}` markers on the last tool definition,
   the system prompt (sent as a one-block array) and the last content block
-  of the last message; false sends the pre-v0.3 request byte-for-byte. An
-  explicit value with any other `provider.type` is a config error - caching
+  of the last message (never on an echoed raw assistant content array, which
+  must go back byte-for-byte); false sends the pre-v0.3 request byte-for-byte.
+  An explicit value with any other `provider.type` is a config error - caching
   is automatic on those wires and the key would be a silently dropped field.
   Additive to the schema: the key is optional and `additionalProperties:
   false` still holds. **One behavior changed:** every anthropic config that

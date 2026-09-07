@@ -275,6 +275,16 @@ order the API renders the prompt:
    own tail, so the next turn reads back everything before it and writes only
    the delta.
 
+A breakpoint is also a *probe*: from where it sits the API looks back over
+roughly the last 20 content-block positions for an entry it already holds, and
+a run of consecutive `tool_use` blocks counts as one position there, as does a
+run of consecutive `tool_result` blocks. That is why the moving mark is enough
+on its own, and why a parallel tool fan-out - a dozen calls and a dozen results
+in two turns - never costs you the previous turn's entry. The limit that
+follows: a turn that appends more than that lookback of other, non-tool content
+can reach back past the previous entry, and that turn writes the whole prefix
+again instead of reading it.
+
 The API allows 4 breakpoints; amele places at most 3 and leaves the fourth
 alone. An empty system prompt gets none (a blank text block is a 400), and
 neither does an assistant turn amele is echoing back verbatim - the loop never
@@ -335,7 +345,11 @@ inside the system prompt is enough to lose it.
 Anthropic-compatible endpoints reached through `base_url` (DeepSeek, GLM, Kimi
 above) receive the same markers, because the marker is a property of the wire
 and amele does not special-case a host. Whether a given endpoint honors them,
-and what it charges, is that provider's documentation to answer.
+and what it charges, is that provider's documentation to answer. If one of them
+answers `400` instead - this API rejects a field it does not expect, and
+`cache_control` is then that field - the symptom is the run failing with exit 5
+and the provider's message quoted. The fix is `provider.prompt_cache: false`,
+which restores the pre-v0.3 request byte for byte.
 
 **A Claude model behind OpenRouter is not this wire.** `dialect: openrouter`
 sends OpenAI-shaped messages, where an explicit breakpoint has to travel as a
