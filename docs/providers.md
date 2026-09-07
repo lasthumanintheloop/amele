@@ -1017,15 +1017,27 @@ them: past a handful the order stops being something a person can hold in their
 head, and every extra entry is another endpoint nobody exercises until the day
 it has to work.
 
-**What triggers it.** Any provider-class failure, after that target's own
-`retry` policy is exhausted - the whole
+**What triggers it.** Any provider-class failure, once that target has nothing
+left to try - the whole
 [exit 5](contracts/exit-codes.md#5---provider-error) class: transport failures,
 non-2xx responses, undecodable replies. That includes a **400 and a 401**: a
 wrong key or a parameter this model rejects moves the run onto the backup
-rather than stopping it. The consequence is worth stating plainly - **a
-fallback that succeeds can mask a primary misconfiguration for the rest of the
-run.** The `provider_fallback` event in the session log and the `-v` line are
-how you notice:
+rather than stopping it.
+
+Only a **429 or a 5xx** spends the retry ladder first, though - those are the
+only statuses the clients call retryable (`internal/llm/wire.go`,
+`statusFailure`), and all three wires share the rule. A 400 or a 401 is not
+worth repeating at the same endpoint, so it is not repeated: the switch is
+**immediate**, and the [retry](#the-tuning-surface) block's `max_attempts`
+never enters into it. That matters for what a chain costs you in the bad case:
+a rate-limited primary can burn its whole ladder - up to 9 x 60s of backoff at
+`max_attempts: 10` - before the first fallback is even asked, while a
+misconfigured one hands over at once.
+
+The consequence of the second half is worth stating plainly - **a fallback that
+succeeds can mask a primary misconfiguration for the rest of the run.** The
+`provider_fallback` event in the session log and the `-v` line are how you
+notice:
 
 ```
 amele: turn 1: provider error on gpt-5.6 (openai); falling back to claude-opus-5 (anthropic)
@@ -1064,7 +1076,10 @@ speak the same wire family never meets this at all.
 
 **Every key is a key.** `api_key` in a fallback entry obeys the same rule as
 the primary's: `${VAR}` only, a literal is a validation error naming the entry
-(`provider.fallback[1].api_key`). Every entry's credential is registered with
+(`provider.fallback[1].api_key`). Mind the index: a validation path is
+**0-based** over the list, so that message is about the *second* entry - the
+one `amele explain` prints as `fallback 2:` (1-based) and the session log's
+`provider_fallback` event reaches as `to: 2` (0 being the primary). Every entry's credential is registered with
 the run's redactor **before the first call**, whether or not the run ever
 reaches that entry, so a backup that echoes its own key back in an error body
 cannot write it into the log. Every entry is also *built* before the run

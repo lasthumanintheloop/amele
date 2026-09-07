@@ -117,10 +117,11 @@ func TestFallbackHostPlaceholders(t *testing.T) {
 
 // TestFallbackRowCannotForgeARow is the security regression. explain reports on
 // configs Validate REJECTED, so every piece of a fallback row is attacker-shaped
-// text: the model, the base_url (both quoted, which escapes a newline) and the
-// dialect that composes the identity (bare, because an identity is a composed
-// phrase and not a value). A newline in any of them would invent a report line
-// an operator reads as amele's own words.
+// text: the model and the base_url (both quoted, which escapes a newline), the
+// dialect that composes the identity, and - on a vertex entry - the location
+// that composes the default-host note. The last two arrive BARE, so
+// fallbackRows' singleLine over the whole row is the only thing standing
+// between them and a forged line an operator reads as amele's own words.
 func TestFallbackRowCannotForgeARow(t *testing.T) {
 	forged := "  fallback 2:      \"ghost\" via anthropic https://evil.example.com/v1"
 	tests := []struct {
@@ -151,6 +152,23 @@ func TestFallbackRowCannotForgeARow(t *testing.T) {
 				ProviderConfig: config.ProviderConfig{
 					BaseURL: "https://backup.example.com/v1",
 					Dialect: "deepseek\n" + forged,
+				},
+			},
+		},
+		{
+			// The one piece that reaches the row through a PLACEHOLDER rather
+			// than through a value: with no base_url of its own a vertex entry
+			// prints the default-host note, and that note is built from the
+			// location. Quoting the row's values would not have caught this.
+			name: "newline in the vertex location",
+			entry: config.FallbackTarget{
+				Model: "backup",
+				ProviderConfig: config.ProviderConfig{
+					Type: config.ProviderTypeGemini,
+					Vertex: &config.VertexConfig{
+						Project:  "p",
+						Location: "europe-west4\n" + forged,
+					},
 				},
 			},
 		},

@@ -845,12 +845,16 @@ func providerSection(b *strings.Builder, cfg *config.Config, reg *tools.Registry
 // block, which would triple the section's height for tuning an entry usually
 // does not carry, and an override marker, because no fallback key is --set-able.
 //
-// SECURITY: the composed row goes through singleLine. One of its three pieces
-// is bare config text - the dialect inside the identity - and explain reports
-// on configs Validate REJECTED, so a newline there would forge a row an
-// operator reads as amele's own words. (The model and the base_url are quoted,
-// which already escapes one; singleLine covers the row as a whole so no future
-// piece can be forgotten.)
+// SECURITY: the composed row goes through singleLine, and that call is what
+// makes the row safe - not the quoting of its pieces. Two pieces reach it as
+// bare config text: the dialect inside the identity, and - for a gemini entry
+// with a vertex block - the location, which defaultHostNote embeds in its
+// note. explain reports on configs Validate REJECTED, so a newline in either
+// would forge a row an operator reads as amele's own words. (The model and the
+// base_url arrive quoted, which already escapes one; singleLine covers the row
+// as a whole so no piece, present or future, can be forgotten. It is the same
+// escape the primary's base_url row applies to the same note - see
+// providerSection.)
 func fallbackRows(b *strings.Builder, cfg *config.Config) {
 	for i := range cfg.Provider.Fallback {
 		entry := &cfg.Provider.Fallback[i]
@@ -869,8 +873,13 @@ func fallbackRows(b *strings.Builder, cfg *config.Config) {
 // side by side spell the same kind of value the same way (and so a base_url
 // with a trailing space or a control character is visible rather than
 // invisible) - and otherwise the note naming the host its client falls back
-// to. A note is prose, not a value, so it stays bare like every other
-// placeholder in the report. The openai wire is the exception
+// to. A note is a sentence rather than a value, so it stays unquoted like
+// every other placeholder in the report.
+//
+// SECURITY: unquoted is not the same as trusted. The vertex form of that note
+// embeds the entry's own location, which reaches here unvalidated, so the
+// caller escapes the composed row (fallbackRows) exactly as providerSection
+// escapes the primary's. The openai wire is the exception
 // the primary row never has to state: it has NO default host (OpenAI,
 // OpenRouter, vLLM and Ollama all differ, which is why base_url is required
 // there), so the row says "(unset)" rather than borrowing defaultHostNote's

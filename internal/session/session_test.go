@@ -1309,6 +1309,14 @@ func TestRunEndFallbacks(t *testing.T) {
 // names both model and provider, and run_end counts the switch. It is a
 // separate golden from session.jsonl on purpose - that fixture stays the proof
 // that a run WITHOUT a fallback is unchanged except for run_start.provider.
+//
+// The turn numbers are the loop's, not a convenience: turn 2 is the attempt
+// that FAILED (it produces the provider_fallback and no llm_response), and the
+// retry on the secondary is turn 3. The writer would happily record any
+// numbering, but a fixture is read as an example, and one showing the retry
+// reusing the failed turn's number would contradict
+// docs/contracts/jsonl-events.md - so it counts the way loop.RunMessages
+// counts, which its `for turn := 1; ; turn++` with `continue` decides.
 func TestGoldenFallback(t *testing.T) {
 	w, err := New(t.TempDir(), Options{Clock: fixedClock()})
 	if err != nil {
@@ -1324,9 +1332,11 @@ func TestGoldenFallback(t *testing.T) {
 		FromProvider: "openai", ToProvider: "anthropic",
 		Error: "provider error: 503 upstream unavailable",
 	})
-	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30,
+	w.LLMResponse(LLMResponse{Turn: 3, Content: "all clear", InputTokens: 150, OutputTokens: 30,
 		FinishReason: "stop", Model: "claude-sonnet-4", Provider: "anthropic"})
-	w.RunEnd(RunEnd{Status: "success", Turns: 2, TotalTokens: 300, Fallbacks: 1,
+	// Turns counts ATTEMPTS, so the failed turn 2 is in it: three attempts,
+	// two of them answered.
+	w.RunEnd(RunEnd{Status: "success", Turns: 3, TotalTokens: 300, Fallbacks: 1,
 		Duration: 1500 * time.Millisecond})
 
 	got, err := os.ReadFile(w.Path())
