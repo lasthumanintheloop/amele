@@ -288,10 +288,15 @@ round-trips must count `llm_response` events rather than read `run_end.turns`.
 
 A `provider.fallback` chain adds the same gap *mid-file*: the attempt that
 failed over is counted and numbered, has no `llm_response`, and carries a
-`provider_fallback` event instead - so `turn` values are strictly increasing
-but not contiguous across the `llm_response` events, and the highest `turn`
-can fall short of `run_end.turns` by one per switch plus one for a final
-failed attempt.
+`provider_fallback` event instead - so `turn` values stay strictly increasing
+across the `llm_response` events but are no longer contiguous. What falls
+short is the **count** of `llm_response` events, not the highest `turn`: it is
+`run_end.turns` minus one per switch, minus one more when the final attempt
+failed too. The highest logged `turn` still equals `run_end.turns`, except when
+the run ended on a failed attempt, where it is one less as above. The v1.8
+example below is the shape: `turns: 2` and `fallbacks: 1`, one `llm_response`
+(2 - 1), and its `turn` is 2 - the highest, because the run ended on an
+answered attempt.
 
 ## Clipping and redaction
 

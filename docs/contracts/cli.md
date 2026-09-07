@@ -175,6 +175,7 @@ session log.
 - `-v` adds one line per loop event, as it happens:
 
   ```
+  amele: turn 1: provider error on gpt-4o (openai); falling back to claude-opus-5 (anthropic)
   amele: turn 3: model requested fs_read {"path":"app.log"}
   amele: turn 3: fs_read ok (1.2s)
   amele: turn 3: shell exit 3 (0.4s)
@@ -182,7 +183,6 @@ session log.
   amele: turn 3: shell timed out (30.0s)
   amele: turn 3: shell rejected (0.0s)
   amele: turn 3: fs_read error: <message>
-  amele: turn 1: provider error on gpt-4o (openai); falling back to claude-opus-5 (anthropic)
   amele: turn 4: final answer (312 tokens)
   ```
 
@@ -193,7 +193,8 @@ session log.
   `provider.fallback` switch, names both ends as `<model> (<identity>)`, and
   is how an operator notices that a run answered from the backup - the same
   switch the session log records as a `provider_fallback` event. The turn it
-  names is the attempt that failed; the retry is the next turn. A tool call that ran but did not work is
+  names is the attempt that failed; the retry is the next turn.
+  A tool call that ran but did not work is
   named as such instead of `ok`: `exit N` (the command failed), `timed out`
   (the tool's own timeout fired), `aborted` (the run ended under the command)
   and `rejected` (the shell policy refused the command). A trailing
@@ -477,9 +478,12 @@ up yet.
   entry, in the order the run will walk it:
   `fallback 1:      "claude-opus-5" via anthropic (default: api.anthropic.com)`,
   `fallback 2:      "deepseek-v4" via openai/deepseek "https://api.deepseek.com/v1"`.
-  The number is 1-based (the YAML list's position; the session log's
-  `provider_fallback` event counts the same entries 0-based, where 0 is the
-  primary). The three pieces are the entry's own `model`, the backend identity
+  The number is 1-based, the YAML list's position. (Three numberings meet on
+  this feature and they do not agree: an explain row is 1-based over the
+  fallback list, a validation message's path is **0-based** over that same
+  list - `provider.fallback[1]` is the entry `fallback 2:` reports - and the
+  session log's `provider_fallback` counts the primary as `0`, so that entry
+  is `to: 2` there.) The three pieces are the entry's own `model`, the backend identity
   the session log names it by, and where its requests go - its `base_url`
   quoted, or the note naming the host its wire defaults to
   (`(unset)` on the openai wire, which has no default host). A config without
