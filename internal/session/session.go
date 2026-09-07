@@ -35,9 +35,20 @@ type Event struct {
 	Type string    `json:"type"`
 	TS   time.Time `json:"ts"`
 
-	// run_start
-	Model string `json:"model,omitempty"`
-	Task  string `json:"task,omitempty"`
+	// run_start, and llm_response for a turn NOT served by the backend
+	// run_start named (see Writer.LLMResponse).
+	//
+	// CONTRACT: `provider` is the backend's identity string - the wire family,
+	// narrowed by the variation that changes the request shape
+	// ("openai/deepseek", "gemini/vertex"). It answers "which endpoint
+	// produced this?" for a log whose model name alone cannot: two entries of
+	// a fallback chain may share a model, and a base_url is a secret-bearing
+	// URL the log has no business repeating. run_start carries it from v1.8
+	// on; on llm_response it appears only when the turn changed backend, so a
+	// run that never fell back keeps its historical bytes.
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Task     string `json:"task,omitempty"`
 
 	// llm_response. Content is the assistant's text (clipped); ToolCallIDs
 	// are the IDs of the tool calls requested in the same message. Together
@@ -123,13 +134,32 @@ type Event struct {
 	Reason     string           `json:"reason,omitempty"`
 	MCPErrors  int              `json:"mcp_errors,omitempty"`
 
+	// provider_fallback (v1.8): the run moved from one entry of the fallback
+	// chain to the next. FromBackend/ToBackend are the 0-based positions in
+	// that chain and are POINTERS because the interesting half of most
+	// switches is `"from":0` - the primary - which omitempty would delete.
+	// The models and identities are spelled out beside the ordinals so a
+	// reader needs no config to interpret the line, and Error above carries
+	// the failure that caused the move (clipped and redacted like every other
+	// free-text field).
+	FromBackend  *int   `json:"from,omitempty"`
+	ToBackend    *int   `json:"to,omitempty"`
+	FromModel    string `json:"from_model,omitempty"`
+	ToModel      string `json:"to_model,omitempty"`
+	FromProvider string `json:"from_provider,omitempty"`
+	ToProvider   string `json:"to_provider,omitempty"`
+
 	// run_end
 	Status      string `json:"status,omitempty"`
 	ExitCode    *int   `json:"exit_code,omitempty"`
 	Turns       int    `json:"turns,omitempty"`
 	ToolCalls   int    `json:"tool_calls,omitempty"`
 	TotalTokens int    `json:"total_tokens,omitempty"`
-	DurationMS  int64  `json:"duration_ms,omitempty"`
+	// Fallbacks counts the provider switches the run made (v1.8, additive).
+	// Zero writes no key, which is also the shape of every run recorded
+	// before fallback existed: absent means the primary served the whole run.
+	Fallbacks  int   `json:"fallbacks,omitempty"`
+	DurationMS int64 `json:"duration_ms,omitempty"`
 }
 
 // maxLoggedField is the DEFAULT bound on how much of args/results is persisted
@@ -162,6 +192,15 @@ type Writer struct {
 	// reported once, on run_end, so an operator grepping a single line can see
 	// that a degraded MCP server was in play. SetMCPErrors is the only writer.
 	mcpErrors int
+	// runModel and runProvider are what RunStart announced, kept so
+	// LLMResponse can stay silent about a turn served by that same backend.
+	// The comparison lives here rather than in the caller because the log's
+	// "absent means unchanged" rule is a property of the FILE, and a caller
+	// that forgot it would write a shape no reader expects. Both are guarded
+	// by mu, which the MCP connect phase already drives from several
+	// goroutines.
+	runModel    string
+	runProvider string
 }
 
 // Options configures New.
@@ -507,9 +546,25 @@ func (w *Writer) clip(text string) string {
 	return text[:cut] + "...[clipped]"
 }
 
-// RunStart records the beginning of a run.
-func (w *Writer) RunStart(model, task string) {
-	w.emit(Event{Type: "run_start", Model: model, Task: w.clip(task)})
+// RunStart records the beginning of a run: the model, the identity of the
+// backend that will serve it (see Event.Provider; "" writes no key), and the
+// task.
+//
+// It also REMEMBERS the pair, which is what makes a later llm_response able to
+// say "not this one" by writing its own model/provider (Writer.LLMResponse).
+// A caller that logs no run_start therefore gets the identity keys on every
+// turn that names one, which is the honest reading: there is no baseline to be
+// unchanged from.
+func (w *Writer) RunStart(model, provider, task string) {
+	if w != nil {
+		// Set before emit rather than after: emit takes mu, which is not
+		// reentrant, and a turn cannot be logged before the run started
+		// anyway.
+		w.mu.Lock()
+		w.runModel, w.runProvider = model, provider
+		w.mu.Unlock()
+	}
+	w.emit(Event{Type: "run_start", Model: model, Provider: provider, Task: w.clip(task)})
 }
 
 // LLMResponse is one model turn as the log records it.
@@ -546,6 +601,12 @@ type LLMResponse struct {
 	// and redaction. SECURITY: the writer DROPS it unless it was opened with
 	// Options.LogReasoning; passing it is always safe.
 	Reasoning string
+	// Model and Provider identify the backend that served THIS turn. Callers
+	// pass them unconditionally: the writer logs them only when they differ
+	// from what RunStart announced, so a run that never fell back writes the
+	// bytes it always did (see Writer.LLMResponse).
+	Model    string
+	Provider string
 }
 
 // LLMResponse records a model turn: content (clipped and redacted), the IDs of
@@ -566,7 +627,62 @@ func (w *Writer) LLMResponse(r LLMResponse) {
 	if w != nil && w.logReasoning {
 		e.Reasoning = w.clip(r.Reasoning)
 	}
+	// Difference, not repetition: naming the backend on every turn would grow
+	// each line of every existing log for no information. The keys are read
+	// under the lock and released before emit takes it again - mu is not
+	// reentrant. An empty value is never written: it says "unknown", and a
+	// reader must not mistake that for "it changed".
+	if w != nil {
+		w.mu.Lock()
+		runModel, runProvider := w.runModel, w.runProvider
+		w.mu.Unlock()
+		if r.Model != "" && r.Model != runModel {
+			e.Model = r.Model
+		}
+		if r.Provider != "" && r.Provider != runProvider {
+			e.Provider = r.Provider
+		}
+	}
 	w.emit(e)
+}
+
+// ProviderFallback is one move along the fallback chain, as the log records it.
+type ProviderFallback struct {
+	// Turn is the turn the switch happened on, numbered like every other
+	// event (the caller's TurnBase already applied).
+	Turn int
+	// From and To are the 0-based positions in the fallback chain: 0 is the
+	// primary. They are plain ints here and pointers in the Event only so
+	// `"from":0` survives omitempty.
+	From int
+	To   int
+	// FromModel/ToModel and FromProvider/ToProvider spell out both ends, so
+	// the line is readable without the config that produced it.
+	FromModel    string
+	ToModel      string
+	FromProvider string
+	ToProvider   string
+	// Error is the failure that caused the move, before clipping and
+	// redaction.
+	Error string
+}
+
+// ProviderFallback records that the run gave up on one backend and moved to
+// the next. The provider's error text goes through the same redact+clip path
+// as every other free-text field: it is remote text, and a 4xx body has been
+// seen to echo a request header back.
+func (w *Writer) ProviderFallback(f ProviderFallback) {
+	from, to := f.From, f.To
+	w.emit(Event{
+		Type: "provider_fallback", Turn: f.Turn,
+		Error:        w.clip(f.Error),
+		FromBackend:  &from,
+		ToBackend:    &to,
+		FromModel:    f.FromModel,
+		ToModel:      f.ToModel,
+		FromProvider: f.FromProvider,
+		ToProvider:   f.ToProvider,
+	})
 }
 
 // ToolCall records a tool invocation request from the model. callID links the
@@ -804,12 +920,35 @@ func (w *Writer) SetMCPErrors(n int) {
 	w.mcpErrors = n
 }
 
-// RunEnd records the final status and totals, then closes the file.
+// RunEnd is the closing accounting of one run.
 //
-// cacheReadTokens is the run's cumulative prompt-cache read count. It is a
-// SUBSET of totalTokens (which is already input+output), so it is reported
-// beside the total, never added to it; zero writes no key at all.
-func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalTokens, cacheReadTokens int, duration time.Duration) {
+// It is a struct rather than a parameter list for the reason LLMResponse is:
+// the positional form ended in five bare ints in a row, so a transposed call
+// site compiled and then lied in the log (issue #15). The type and the
+// Writer.RunEnd method share a name, which Go allows - the method set and the
+// package scope are different namespaces.
+type RunEnd struct {
+	// Status is "success" or "error"; ExitCode is the process exit code the
+	// run will use, and is written even when it is 0.
+	Status   string
+	ExitCode int
+	// Turns, ToolCalls and TotalTokens are the run's totals.
+	Turns       int
+	ToolCalls   int
+	TotalTokens int
+	// CacheReadTokens is the run's cumulative prompt-cache read count. It is a
+	// SUBSET of TotalTokens (which is already input+output), so it is reported
+	// beside the total, never added to it; zero writes no key at all.
+	CacheReadTokens int
+	// Fallbacks is how many times the run moved along the fallback chain (see
+	// Event.Fallbacks). Zero writes no key.
+	Fallbacks int
+	// Duration is the run's wall-clock time.
+	Duration time.Duration
+}
+
+// RunEnd records the final status and totals, then closes the file.
+func (w *Writer) RunEnd(r RunEnd) {
 	if w == nil {
 		return
 	}
@@ -818,11 +957,12 @@ func (w *Writer) RunEnd(status string, exitCode int, turns, toolCalls, totalToke
 	w.mu.Lock()
 	mcpErrors := w.mcpErrors
 	w.mu.Unlock()
+	exitCode := r.ExitCode
 	w.emit(Event{
-		Type: "run_end", Status: status, ExitCode: &exitCode,
-		Turns: turns, ToolCalls: toolCalls, TotalTokens: totalTokens,
-		CacheReadTokens: cacheReadTokens,
-		DurationMS:      duration.Milliseconds(), MCPErrors: mcpErrors,
+		Type: "run_end", Status: r.Status, ExitCode: &exitCode,
+		Turns: r.Turns, ToolCalls: r.ToolCalls, TotalTokens: r.TotalTokens,
+		CacheReadTokens: r.CacheReadTokens, Fallbacks: r.Fallbacks,
+		DurationMS: r.Duration.Milliseconds(), MCPErrors: mcpErrors,
 	})
 	_ = w.w.Close()
 }

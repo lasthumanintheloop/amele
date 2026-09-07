@@ -248,6 +248,12 @@ type Loop struct {
 
 	Model        string
 	SystemPrompt string
+
+	// Identity is the primary backend's identity string, written to
+	// run_start.provider so a log says which endpoint served the run and not
+	// only which model was asked for. Empty writes no key, which is what a
+	// caller that never set it gets.
+	Identity string
 }
 
 // Result summarizes a completed (or aborted) run.
@@ -286,7 +292,7 @@ func (l *Loop) Run(ctx context.Context, task string) (*Result, error) {
 	// run_start lives here rather than in RunMessages because only this entry
 	// point knows the task string; callers driving their own history (chat,
 	// resume) log their own opening event.
-	l.Session.RunStart(l.Model, task)
+	l.Session.RunStart(l.Model, l.Identity, task)
 
 	return l.RunMessages(ctx, messages)
 }

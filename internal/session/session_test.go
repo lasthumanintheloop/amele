@@ -33,7 +33,7 @@ func TestWriterGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w.RunStart("test-model", "scan the logs")
+	w.RunStart("test-model", "openai", "scan the logs")
 	// A turn that carried reasoning reports its SIZE only - the log never
 	// carries the thinking itself.
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "let me read the log", ToolCallIDs: []string{"call_1"}, InputTokens: 100, OutputTokens: 20, FinishReason: "tool_calls", ReasoningBytes: len(`"the log is where the errors are"`)})
@@ -48,7 +48,7 @@ func TestWriterGolden(t *testing.T) {
 	// so this is the one line in the golden carrying the v1.7 cache keys -
 	// which makes turn 1 above the proof that a cache-less turn omits them.
 	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30, FinishReason: "stop", CacheReadTokens: 120, CacheWriteTokens: 25})
-	w.RunEnd("success", 0, 2, 1, 300, 0, 1500*time.Millisecond)
+	w.RunEnd(RunEnd{Status: "success", Turns: 2, ToolCalls: 1, TotalTokens: 300, Duration: 1500 * time.Millisecond})
 
 	got, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -87,7 +87,7 @@ func TestWriterAppendsUnconditionally(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.RunStart("test-model", "first")
+	w.RunStart("test-model", "openai", "first")
 
 	// A second writer - a rotator, an operator's `echo >>`, a concurrent run
 	// that got the same name - extends the file behind the writer's back.
@@ -103,7 +103,7 @@ func TestWriterAppendsUnconditionally(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w.RunEnd("success", 0, 1, 0, 10, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, TotalTokens: 10, Duration: time.Second})
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -213,7 +213,7 @@ func TestRunEndCacheReadTokens(t *testing.T) {
 				t.Fatal(err)
 			}
 			path := w.Path()
-			w.RunEnd("success", 0, 1, 0, 1000, tt.cacheRead, time.Second)
+			w.RunEnd(RunEnd{Status: "success", Turns: 1, TotalTokens: 1000, CacheReadTokens: tt.cacheRead, Duration: time.Second})
 
 			data, err := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
 			if err != nil {
@@ -247,7 +247,7 @@ func TestRedaction(t *testing.T) {
 	// The model may echo a secret in its answer text; that path must be
 	// redacted too now that content is logged.
 	w.LLMResponse(LLMResponse{Turn: 2, Content: "the key is sk-verysecret", InputTokens: 1, OutputTokens: 1, FinishReason: "stop"})
-	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 10, Duration: time.Second})
 
 	data, _ := os.ReadFile(w.Path())
 	if strings.Contains(string(data), "sk-verysecret") {
@@ -270,7 +270,7 @@ func TestClipLongFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	w.ToolResult(ToolResult{CallID: "call_1", Tool: "t", Result: strings.Repeat("x", maxLoggedField*2), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 10, Duration: time.Second})
 
 	data, _ := os.ReadFile(w.Path())
 	if len(data) > maxLoggedField+1024 {
@@ -294,7 +294,7 @@ func TestReplaySource(t *testing.T) {
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "reading the log now", ToolCallIDs: []string{"call_9"}, InputTokens: 10, OutputTokens: 5, FinishReason: "tool_calls"})
 	w.ToolCall("call_9", "fs_read", `{"path":"x"}`)
 	w.ToolResult(ToolResult{CallID: "call_9", Tool: "fs_read", Result: "data", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 15, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 15, Duration: time.Second})
 
 	data, _ := os.ReadFile(w.Path())
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
@@ -332,7 +332,7 @@ func TestClipRuneBoundary(t *testing.T) {
 	// "€" is 3 bytes; maxLoggedField is not a multiple of 3, so a naive
 	// byte-index cut lands mid-rune.
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: strings.Repeat("€", maxLoggedField), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 1, Duration: time.Second})
 
 	data, _ := os.ReadFile(w.Path())
 	var ev Event
@@ -349,7 +349,7 @@ func TestClipRuneBoundary(t *testing.T) {
 // directly when session_dir is unset.
 func TestNilWriterIsSafe(t *testing.T) {
 	var w *Writer
-	w.RunStart("m", "t")
+	w.RunStart("m", "openai", "t")
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "c", ToolCallIDs: []string{"id"}, InputTokens: 1, OutputTokens: 1, FinishReason: "stop"})
 	w.ToolCall("id", "t", "{}")
 	w.ToolResult(ToolResult{CallID: "id", Tool: "t", Result: "r", Outcome: OutcomeOK})
@@ -357,7 +357,7 @@ func TestNilWriterIsSafe(t *testing.T) {
 	w.MCPToolsListed(MCPToolsListed{Server: "s", Tools: []MCPToolListed{{Name: "s__t"}}})
 	w.MCPDisconnect(MCPDisconnect{Server: "s", Reason: "run_end"})
 	w.SetMCPErrors(2)
-	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 1, Duration: time.Second})
 	if w.Path() != "" {
 		t.Error("nil writer path should be empty")
 	}
@@ -507,7 +507,7 @@ func TestToolResultOutcomeFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			w.ToolResult(tt.result)
-			w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
+			w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 1, Duration: time.Second})
 
 			ev := firstEvent(t, w.Path())
 			if got := ev["outcome"]; got != tt.wantOutcome {
@@ -540,7 +540,7 @@ func TestToolResultBytesArePreClip(t *testing.T) {
 	}
 	const size = maxLoggedField * 3
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: strings.Repeat("x", size), Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 1, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 1, Duration: time.Second})
 
 	ev := firstEvent(t, w.Path())
 	if got := ev["result_bytes"]; got != float64(size) {
@@ -561,7 +561,7 @@ func TestToolResultTruncatedFlag(t *testing.T) {
 	}
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "fs_read", Result: "x", Outcome: OutcomeOK, Truncated: true})
 	w.ToolResult(ToolResult{CallID: "c2", Tool: "fs_read", Result: "y", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 2, 2, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 2, TotalTokens: 2, Duration: time.Second})
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -586,11 +586,11 @@ func TestOutcomeFieldsAreToolResultOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.RunStart("m", "task")
+	w.RunStart("m", "openai", "task")
 	w.LLMResponse(LLMResponse{Turn: 1, Content: "text", ToolCallIDs: []string{"c1"}, InputTokens: 1, OutputTokens: 1, FinishReason: "tool_calls"})
 	w.ToolCall("c1", "shell", "{}")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "shell", Result: "out", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 2, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 2, Duration: time.Second})
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -656,7 +656,7 @@ func TestGoldenMCP(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	w.RunStart("test-model", "list issues")
+	w.RunStart("test-model", "openai", "list issues")
 	w.MCPConnect(MCPConnect{
 		Server: "github", Transport: "http", OK: true, DurationMS: 12,
 		ProtocolVersion: "2025-06-18", ServerName: "gh", ServerVersion: "1.0",
@@ -680,7 +680,7 @@ func TestGoldenMCP(t *testing.T) {
 	w.ToolResult(ToolResult{CallID: "call_2", Tool: "github__x", Result: "no response", Outcome: OutcomeIndeterminate})
 	w.MCPDisconnect(MCPDisconnect{Server: "github", Reason: "run_end"})
 	w.SetMCPErrors(1)
-	w.RunEnd("success", 0, 2, 2, 300, 0, 1500*time.Millisecond)
+	w.RunEnd(RunEnd{Status: "success", Turns: 2, ToolCalls: 2, TotalTokens: 300, Duration: 1500 * time.Millisecond})
 
 	got, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -739,7 +739,7 @@ func TestWriterConcurrentUse(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	w.RunEnd("success", 0, 1, 0, 0, 0, 0)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1})
 
 	data, rerr := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
 	if rerr != nil {
@@ -982,7 +982,7 @@ func TestWriterRedactsSecretAddedAfterNew(t *testing.T) {
 	}
 	secrets.Add("tok-123")
 	w.ToolResult(ToolResult{CallID: "c1", Tool: "mcp__x__y", Result: "auth used tok-123", Outcome: OutcomeOK})
-	w.RunEnd("success", 0, 1, 1, 10, 0, time.Second)
+	w.RunEnd(RunEnd{Status: "success", Turns: 1, ToolCalls: 1, TotalTokens: 10, Duration: time.Second})
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
@@ -1143,4 +1143,236 @@ func firstLLMEvent(t *testing.T, path string) Event {
 		t.Fatal(err)
 	}
 	return ev
+}
+
+// TestRunStartRecordsProvider: run_start names the BACKEND that will serve the
+// run, not only the model. Without it a log whose model was swapped mid-run
+// (provider fallback) has no baseline to compare a later turn against, and an
+// operator reading a single file cannot tell an OpenAI-compatible proxy from
+// the native Anthropic wire.
+func TestRunStartRecordsProvider(t *testing.T) {
+	tests := []struct {
+		name     string
+		provider string
+		want     string // "" means the key must be absent
+	}{
+		{"identity written", "openai/deepseek", `"provider":"openai/deepseek"`},
+		{"empty stays absent", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.RunStart("test-model", tt.provider, "scan the logs")
+
+			line := firstLine(t, w.Path())
+			if tt.want == "" {
+				if strings.Contains(line, "provider") {
+					t.Errorf("an unnamed provider must write no key:\n%s", line)
+				}
+				return
+			}
+			if !strings.Contains(line, tt.want) {
+				t.Errorf("run_start does not carry %s:\n%s", tt.want, line)
+			}
+			if !strings.Contains(line, `"model":"test-model"`) {
+				t.Errorf("run_start lost its model:\n%s", line)
+			}
+		})
+	}
+}
+
+// TestLLMResponseIdentityOnlyWhenChanged pins the "silence means unchanged"
+// rule: a turn served by the backend run_start already named writes neither
+// key, so every pre-fallback log keeps its exact bytes, and the keys appear
+// exactly on the turns a reader must look twice at.
+func TestLLMResponseIdentityOnlyWhenChanged(t *testing.T) {
+	tests := []struct {
+		name           string
+		model          string
+		provider       string
+		wantModel      bool
+		wantProviderTo string // "" means the provider key must be absent
+	}{
+		{"same backend", "gpt-4o", "openai", false, ""},
+		{"unset stays silent", "", "", false, ""},
+		{"both differ", "claude-x", "anthropic", true, `"provider":"anthropic"`},
+		{"model differs only", "gpt-4o-mini", "openai", true, ""},
+		{"provider differs only", "gpt-4o", "openai/openrouter", false, `"provider":"openai/openrouter"`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := w.Path()
+			w.RunStart("gpt-4o", "openai", "task")
+			w.LLMResponse(LLMResponse{
+				Turn: 1, Content: "ok", FinishReason: "stop",
+				Model: tt.model, Provider: tt.provider,
+			})
+
+			line := nthLine(t, path, 1)
+			hasModel := strings.Contains(line, `"model":`)
+			if hasModel != tt.wantModel {
+				t.Errorf("llm_response model key present = %v, want %v:\n%s", hasModel, tt.wantModel, line)
+			}
+			if tt.wantProviderTo == "" {
+				if strings.Contains(line, `"provider":`) {
+					t.Errorf("llm_response must omit an unchanged provider:\n%s", line)
+				}
+				return
+			}
+			if !strings.Contains(line, tt.wantProviderTo) {
+				t.Errorf("llm_response does not carry %s:\n%s", tt.wantProviderTo, line)
+			}
+		})
+	}
+}
+
+// TestProviderFallbackEvent pins the switch event: the ordinals are pointers
+// so the PRIMARY (`"from":0`) survives omitempty, and the provider's error
+// text goes through the same redact+clip path as every other free-text field.
+func TestProviderFallbackEvent(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock(), Secrets: []string{"sk-leak"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := w.Path()
+	w.RunStart("gpt-4o", "openai", "task")
+	w.ProviderFallback(ProviderFallback{
+		Turn: 2, From: 0, To: 1,
+		FromModel: "gpt-4o", ToModel: "claude-x",
+		FromProvider: "openai", ToProvider: "anthropic",
+		Error: "429 rate limited for key sk-leak",
+	})
+
+	line := nthLine(t, path, 1)
+	for _, want := range []string{
+		`"type":"provider_fallback"`, `"turn":2`, `"from":0`, `"to":1`,
+		`"from_model":"gpt-4o"`, `"to_model":"claude-x"`,
+		`"from_provider":"openai"`, `"to_provider":"anthropic"`,
+		`"error":"429 rate limited for key [REDACTED]"`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("provider_fallback does not carry %s:\n%s", want, line)
+		}
+	}
+	// The ordinals belong to this event alone: run_start must not grow them.
+	if start := nthLine(t, path, 0); strings.Contains(start, `"from"`) {
+		t.Errorf("run_start must not carry backend ordinals:\n%s", start)
+	}
+}
+
+// TestRunEndFallbacks: the run's switch count is the one line an operator
+// greps to learn the primary was down. Zero writes no key, which is also the
+// shape of every run recorded before fallback existed.
+func TestRunEndFallbacks(t *testing.T) {
+	tests := []struct {
+		name      string
+		fallbacks int
+		want      string // "" means the key must be absent
+	}{
+		{"no fallback", 0, ""},
+		{"one fallback", 1, `"fallbacks":1`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := w.Path()
+			w.RunEnd(RunEnd{Status: "success", Turns: 1, TotalTokens: 10,
+				Fallbacks: tt.fallbacks, Duration: time.Second})
+
+			line := firstLine(t, path)
+			if tt.want == "" {
+				if strings.Contains(line, "fallbacks") {
+					t.Errorf("a run that never switched must omit the key:\n%s", line)
+				}
+				return
+			}
+			if !strings.Contains(line, tt.want) {
+				t.Errorf("run_end does not carry %s:\n%s", tt.want, line)
+			}
+		})
+	}
+}
+
+// TestGoldenFallback pins the whole switch as bytes: run_start names the
+// primary, a turn it served stays silent about its backend, the
+// provider_fallback event records the move, the turn the secondary served
+// names both model and provider, and run_end counts the switch. It is a
+// separate golden from session.jsonl on purpose - that fixture stays the proof
+// that a run WITHOUT a fallback is unchanged except for run_start.provider.
+func TestGoldenFallback(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w.RunStart("gpt-4o", "openai", "scan the logs")
+	w.LLMResponse(LLMResponse{Turn: 1, Content: "reading", InputTokens: 100, OutputTokens: 20,
+		FinishReason: "stop", Model: "gpt-4o", Provider: "openai"})
+	w.ProviderFallback(ProviderFallback{
+		Turn: 2, From: 0, To: 1,
+		FromModel: "gpt-4o", ToModel: "claude-sonnet-4",
+		FromProvider: "openai", ToProvider: "anthropic",
+		Error: "provider error: 503 upstream unavailable",
+	})
+	w.LLMResponse(LLMResponse{Turn: 2, Content: "all clear", InputTokens: 150, OutputTokens: 30,
+		FinishReason: "stop", Model: "claude-sonnet-4", Provider: "anthropic"})
+	w.RunEnd(RunEnd{Status: "success", Turns: 2, TotalTokens: 300, Fallbacks: 1,
+		Duration: 1500 * time.Millisecond})
+
+	got, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	compareGolden(t, filepath.Join("testdata", "golden", "session-fallback.jsonl"), got)
+}
+
+// compareGolden compares got against the golden file at path, rewriting it
+// instead when -update was passed.
+func compareGolden(t *testing.T, path string, got []byte) {
+	t.Helper()
+	if *update {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, got, 0o600); err != nil { //nolint:gosec // G703: path is a fixed testdata constant, not tainted input.
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path) //nolint:gosec // G304: fixed testdata path.
+	if err != nil {
+		t.Fatalf("reading golden (run with -update to create): %v", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("session log differs from golden.\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// firstLine returns the first event line of a session file.
+func firstLine(t *testing.T, path string) string {
+	t.Helper()
+	return nthLine(t, path, 0)
+}
+
+// nthLine returns the n-th (0-based) event line of a session file.
+func nthLine(t *testing.T, path string, n int) string {
+	t.Helper()
+	data, err := os.ReadFile(path) //nolint:gosec // G304: path comes from t.TempDir
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if n >= len(lines) {
+		t.Fatalf("want at least %d events, got:\n%s", n+1, data)
+	}
+	return lines[n]
 }

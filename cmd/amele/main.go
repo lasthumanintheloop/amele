@@ -1812,7 +1812,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// (docs/contracts/jsonl-events.md, Ordering). loop.Run's contract already
 	// hands that choice to callers driving their own history - `chat` has
 	// always done it - so the run below goes through RunMessages.
-	agent.Session.RunStart(cfg.Model, task)
+	agent.Session.RunStart(cfg.Model, providerIdentity(&cfg.Provider), task)
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
@@ -1957,7 +1957,7 @@ func reportInterruptedRead(agent *loop.Loop, cfg *config.Config, taskArgs string
 	stderr io.Writer, secrets *session.SecretSet) int {
 	err := interruptedError(cause)
 	code := exitCodeFor(err)
-	agent.Session.RunStart(cfg.Model, taskArgs)
+	agent.Session.RunStart(cfg.Model, providerIdentity(&cfg.Provider), taskArgs)
 	// Zero accounting: nothing was spent, and the summary must not invent turns.
 	reportRun(agent, &loop.Result{}, err, code, schemaMode, quiet, stderr, secrets.Redact)
 	return code
@@ -1985,7 +1985,12 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 	// CONTRACT: Usage.Total() is input+output with the cached share already
 	// inside input; the cache-read count rides beside it as a subset, never as
 	// an addition (docs/contracts/jsonl-events.md).
-	agent.Session.RunEnd(status, code, res.Turns, res.ToolCalls, res.Usage.Total(), res.Usage.CacheReadTokens, res.Duration)
+	agent.Session.RunEnd(session.RunEnd{
+		Status: status, ExitCode: code,
+		Turns: res.Turns, ToolCalls: res.ToolCalls,
+		TotalTokens: res.Usage.Total(), CacheReadTokens: res.Usage.CacheReadTokens,
+		Duration: res.Duration,
+	})
 	if quiet {
 		return
 	}
@@ -2058,7 +2063,7 @@ func reportGateFailure(cfg *config.Config, validator *schema.Validator, parsed a
 	}
 	// The task recorded is what the operator typed: nothing was rendered, and
 	// stdin was never read.
-	agent.Session.RunStart(cfg.Model, taskArgs)
+	agent.Session.RunStart(cfg.Model, providerIdentity(&cfg.Provider), taskArgs)
 	agent.Session.SetMCPErrors(gateMCPErrors(gateErr))
 	// Zero accounting: nothing was spent, and the summary must not invent turns.
 	reportRun(agent, &loop.Result{}, gateErr, code, validator != nil, parsed.quiet, stderr, secrets.Redact)
@@ -2203,7 +2208,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	// it. A refusal still ends through the normal path, so a chat that never
 	// opened is as auditable as a run that never started.
 	if gateErr := mcpCredentialGate(ctx, cfg, parsed.configPath, lines, stderr, env, secrets, parsed.quiet); gateErr != nil {
-		agent.Session.RunStart(cfg.Model, chatTaskLabel)
+		agent.Session.RunStart(cfg.Model, providerIdentity(&cfg.Provider), chatTaskLabel)
 		s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet,
 			mcp: &mcpSet{failed: gateMCPErrors(gateErr)}, runCtx: ctx, secrets: secrets}
 		return s.finish(stderr, exitCodeFor(gateErr), gateErr)
@@ -2211,7 +2216,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 
 	// A chat writes ONE run_start for the whole session, and the MCP servers
 	// belong inside it like every other event (docs/contracts/jsonl-events.md).
-	agent.Session.RunStart(cfg.Model, chatTaskLabel)
+	agent.Session.RunStart(cfg.Model, providerIdentity(&cfg.Provider), chatTaskLabel)
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
@@ -2435,7 +2440,12 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 		// SECURITY: same rule as reportRun - the error may quote remote text.
 		_, _ = fmt.Fprintln(stderr, s.secrets.Redact(err.Error()))
 	}
-	s.agent.Session.RunEnd(status, code, s.turns, s.toolCalls, s.tokens, s.cached, s.duration)
+	s.agent.Session.RunEnd(session.RunEnd{
+		Status: status, ExitCode: code,
+		Turns: s.turns, ToolCalls: s.toolCalls,
+		TotalTokens: s.tokens, CacheReadTokens: s.cached,
+		Duration: s.duration,
+	})
 	if !s.quiet {
 		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, s.turns, s.toolCalls, s.tokens, s.cached, s.duration))
 	}
@@ -2666,6 +2676,7 @@ func buildAgent(cfg *config.Config, validator *schema.Validator, lines *lineRead
 		// and does not pass through the ceiling (internal/loop.runCall).
 		MaxToolResultBytes: toolResultCap(cfg),
 		Model:              cfg.Model,
+		Identity:           providerIdentity(&cfg.Provider),
 		SystemPrompt:       cfg.SystemPrompt,
 		Tuning:             tuning,
 	}
@@ -2778,6 +2789,40 @@ func buildProvider(cfg *config.Config, registerSecret func(...string)) (llm.Prov
 		MaxAttempts:    maxAttempts,
 		InitialBackoff: initialBackoff,
 	}, nil
+}
+
+// providerIdentity names the backend a run is talking to, for
+// run_start.provider and the fallback events: the wire family, narrowed by the
+// variation that changes the request shape ("openai/deepseek",
+// "gemini/vertex").
+//
+// It is deliberately NOT the base_url. A log is pasted into issues and shipped
+// to log collectors, and a base_url can carry a credential in its query string
+// or name an internal host; the family plus the variation is what a reader
+// actually needs to explain a response's shape. The dialect narrows only the
+// openai wire, because that is the only place it changes anything: config
+// refuses it with gemini and documents it as ignored with anthropic, so
+// repeating it there would describe a request nobody sent.
+//
+// It lives in cmd only until the fallback chain needs it too: the config
+// package owns ProviderConfig and will carry this as a method on it, which is
+// also where the chain's non-primary entries can reach it.
+func providerIdentity(p *config.ProviderConfig) string {
+	switch p.Type {
+	case config.ProviderTypeAnthropic:
+		return config.ProviderTypeAnthropic
+	case config.ProviderTypeGemini:
+		if p.Vertex != nil {
+			return config.ProviderTypeGemini + "/vertex"
+		}
+		return config.ProviderTypeGemini
+	}
+	// "" and "openai" are the same wire (config.ProviderConfig.Type), and a
+	// dialect spelled "openai" is the baseline rather than a variation.
+	if p.Dialect != "" && p.Dialect != config.ProviderTypeOpenAI {
+		return config.ProviderTypeOpenAI + "/" + p.Dialect
+	}
+	return config.ProviderTypeOpenAI
 }
 
 // promptCacheOn resolves provider.prompt_cache into the client's plain bool.

@@ -4726,3 +4726,31 @@ func TestBuildRegistryToolResultCap(t *testing.T) {
 // ptrTo is the address-of helper the config's optional-int fields need in
 // table literals, where a plain `&4096` is not legal Go.
 func ptrTo[T any](v T) *T { return &v }
+
+// TestProviderIdentity pins the identity string written to run_start.provider:
+// the wire family, narrowed by the variation that changes the request shape.
+// The base_url is deliberately NOT part of it - it can carry a credential in a
+// query string, and the log must stay safe to paste.
+func TestProviderIdentity(t *testing.T) {
+	tests := []struct {
+		name string
+		p    config.ProviderConfig
+		want string
+	}{
+		{"default is openai", config.ProviderConfig{}, "openai"},
+		{"explicit openai", config.ProviderConfig{Type: config.ProviderTypeOpenAI}, "openai"},
+		{"openai dialect narrows", config.ProviderConfig{Dialect: "deepseek"}, "openai/deepseek"},
+		{"the openai dialect does not repeat itself", config.ProviderConfig{Dialect: "openai"}, "openai"},
+		{"anthropic", config.ProviderConfig{Type: config.ProviderTypeAnthropic}, "anthropic"},
+		{"anthropic ignores a leftover dialect", config.ProviderConfig{Type: config.ProviderTypeAnthropic, Dialect: "groq"}, "anthropic"},
+		{"gemini", config.ProviderConfig{Type: config.ProviderTypeGemini}, "gemini"},
+		{"vertex is its own target", config.ProviderConfig{Type: config.ProviderTypeGemini, Vertex: &config.VertexConfig{Project: "p", Location: "us-central1"}}, "gemini/vertex"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := providerIdentity(&tt.p); got != tt.want {
+				t.Errorf("providerIdentity() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

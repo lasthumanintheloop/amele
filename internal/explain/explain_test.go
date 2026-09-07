@@ -1228,7 +1228,7 @@ func TestExplainDefaultMatchesSessionDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w.RunStart("m", strings.Repeat("t", defaultMaxLoggedField*2))
+	w.RunStart("m", "openai", strings.Repeat("t", defaultMaxLoggedField*2))
 
 	data, err := os.ReadFile(w.Path())
 	if err != nil {
