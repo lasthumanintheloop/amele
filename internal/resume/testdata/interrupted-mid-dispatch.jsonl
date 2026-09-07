@@ -1,0 +1,5 @@
+{"v":1,"type":"run_start","ts":"2026-09-05T04:00:00Z","model":"gpt-4o","provider":"openai","task":"check the disk and the queue"}
+{"v":1,"type":"llm_response","ts":"2026-09-05T04:00:01Z","turn":1,"content":"Checking disk, queue and uptime.","tool_call_ids":["call_1","call_2","call_3"],"input_tokens":640,"output_tokens":88,"finish_reason":"tool_calls"}
+{"v":1,"type":"tool_call","ts":"2026-09-05T04:00:01Z","tool_call_id":"call_1","tool":"disk","args":"{}"}
+{"v":1,"type":"tool_result","ts":"2026-09-05T04:00:02Z","tool_call_id":"call_1","tool":"disk","result":"/dev/sda1 61% used","outcome":"ok","result_bytes":18,"exit_code":0}
+{"v":1,"type":"tool_call","ts":"2026-09-05T04:00:02Z","tool_call_id":"call_2","tool":"queue","args":"{\"name\":\"mail\"}"}

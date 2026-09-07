@@ -165,6 +165,16 @@ type Event struct {
 	DurationMS int64 `json:"duration_ms,omitempty"`
 }
 
+// ClipMarker terminates a free-text field that the writer had to shorten. It is
+// appended ON TOP of the byte bound (see Writer.clip), so a clipped value is up
+// to the bound plus this marker.
+//
+// CONTRACT: it is the published shape of a clipped field
+// (docs/contracts/jsonl-events.md) and consumers match it literally - the
+// resume reader refuses a log whose needed fields end in it - so the string
+// never changes.
+const ClipMarker = "...[clipped]"
+
 // maxLoggedField is the DEFAULT bound on how much of args/results is persisted
 // per event, so a single huge tool result cannot balloon the session file. It
 // applies whenever Options.MaxLoggedField is zero, which is every caller that
@@ -546,7 +556,7 @@ func (w *Writer) clip(text string) string {
 	}
 	// 8192 + the 12-byte marker = 8204, exactly as the contract doc states;
 	// do not change the cap to absorb the marker.
-	return text[:cut] + "...[clipped]"
+	return text[:cut] + ClipMarker
 }
 
 // RunStart records the beginning of a run: the model, the identity of the

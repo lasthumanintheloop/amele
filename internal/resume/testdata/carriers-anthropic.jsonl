@@ -1,0 +1,6 @@
+{"v":1,"type":"run_start","ts":"2026-09-05T09:00:00Z","model":"claude-sonnet-4","provider":"anthropic","task":"check app.log for anything unusual"}
+{"v":1,"type":"llm_response","ts":"2026-09-05T09:00:02Z","turn":1,"tool_call_ids":["call_1"],"input_tokens":900,"output_tokens":140,"finish_reason":"tool_calls","reasoning_bytes":96,"reasoning":"[{\"type\":\"thinking\",\"thinking\":\"The log lives at app.log; read it first.\",\"signature\":\"Ej8BCkYIBBgCIkA=\"}]"}
+{"v":1,"type":"tool_call","ts":"2026-09-05T09:00:02Z","tool_call_id":"call_1","tool":"fs_read","args":"{\"path\":\"app.log\"}"}
+{"v":1,"type":"tool_result","ts":"2026-09-05T09:00:03Z","tool_call_id":"call_1","tool":"fs_read","result":"WARN retrying in 5s","outcome":"ok","result_bytes":19}
+{"v":1,"type":"llm_response","ts":"2026-09-05T09:00:06Z","turn":2,"content":"One retry warning, nothing unusual.","input_tokens":1020,"output_tokens":40,"finish_reason":"stop","reasoning_bytes":72,"reasoning":"[{\"type\":\"thinking\",\"thinking\":\"A retry warning is routine.\",\"signature\":\"Ej8BCkYIBBgCIkB=\"}]"}
+{"v":1,"type":"run_end","ts":"2026-09-05T09:00:06Z","status":"success","exit_code":0,"turns":2,"tool_calls":1,"total_tokens":2100,"duration_ms":6100}
