@@ -551,12 +551,25 @@ func (b *builder) closeTurn() {
 		// drop rule. Left nil when the turn dispatched nothing, so a
 		// tool-less turn keeps a nil slice.
 		var calls []llm.ToolCall
+		dropped := false
 		for _, id := range b.expected {
 			if st := b.calls[id]; st != nil && st.called {
 				calls = append(calls, st.call)
+			} else {
+				dropped = true
 			}
 		}
 		b.rep.Messages[b.assistant].ToolCalls = calls
+		if dropped {
+			// The carrier is the turn's raw content array, and that array
+			// still announces the tool_use blocks the drop rule just removed.
+			// Echoed verbatim it would rebuild exactly the announced-but-
+			// unanswered history the rule exists to avoid (a 400 on the
+			// wires that verify it), so the turn loses its carrier with the
+			// call and is replayed from its text alone - or, with no text,
+			// not at all (dropEmptyAssistant).
+			b.rep.Messages[b.assistant].Reasoning = nil
+		}
 		b.dropEmptyAssistant()
 	}
 	for _, id := range b.expected {

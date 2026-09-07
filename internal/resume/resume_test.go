@@ -679,3 +679,23 @@ func readFixture(t *testing.T, name string) string {
 	}
 	return string(b)
 }
+
+// A carrier is the raw content array, and for a turn whose calls were never
+// dispatched that array still announces those tool_use blocks - echoing it
+// would rebuild exactly the unanswered-call history the drop rule exists to
+// avoid. So a turn that loses a call to the drop rule loses its carrier too.
+func TestUndispatchedCallDropsTheCarrier(t *testing.T) {
+	const log = `{"v":1,"type":"run_start","ts":"2026-09-05T09:00:00Z","model":"claude-sonnet-4","provider":"anthropic","task":"check the log"}
+{"v":1,"type":"llm_response","ts":"2026-09-05T09:00:02Z","turn":1,"tool_call_ids":["call_1"],"finish_reason":"tool_use","reasoning_bytes":150,"reasoning":"[{\"type\":\"thinking\",\"thinking\":\"Read it.\",\"signature\":\"Ej8=\"},{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"fs_read\",\"input\":{\"path\":\"app.log\"}}]"}
+`
+	got, err := resume.ReadFrom(strings.NewReader(log), resume.Options{Provider: "anthropic", Model: "claude-sonnet-4"})
+	if err != nil {
+		t.Fatalf("ReadFrom = %v, want no error", err)
+	}
+	// No text, no dispatched call, and the carrier is gone with the call:
+	// the empty turn is dropped and the history is the task alone.
+	assertMessages(t, got.Messages, []llm.Message{user("check the log")})
+	if len(got.Pending) != 0 {
+		t.Errorf("Pending = %v, want none (the call was never dispatched)", got.Pending)
+	}
+}
