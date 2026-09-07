@@ -236,6 +236,22 @@ type oaResponse struct {
 	Usage *struct {
 		PromptTokens     int64 `json:"prompt_tokens"`
 		CompletionTokens int64 `json:"completion_tokens"`
+		// PromptTokensDetails is the canonical spelling of the cached share of
+		// the prompt (OpenAI, and the gateways that copy it). It is a POINTER
+		// so "the provider sent the object" is distinguishable from "it sent
+		// no object at all" - only the latter falls back to the DeepSeek
+		// spelling below. cache_write_tokens is not OpenAI's own field; it is
+		// what several compatible gateways report there, and a wire that
+		// omits it decodes to zero.
+		PromptTokensDetails *struct {
+			CachedTokens     int64 `json:"cached_tokens"`
+			CacheWriteTokens int64 `json:"cache_write_tokens"`
+		} `json:"prompt_tokens_details"`
+		// PromptCacheHitTokens is DeepSeek's top-level spelling of the same
+		// read count. Its sibling prompt_cache_miss_tokens is deliberately not
+		// decoded: it is the non-cached remainder, which prompt_tokens already
+		// covers, so reading it would only invite double-counting.
+		PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens"`
 	} `json:"usage"`
 }
 
@@ -426,6 +442,19 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 		// so the loop's budget arithmetic only ever sees non-negative bounded
 		// values (see parseUsage).
 		usage, trustworthy := parseUsage(wire.Usage.PromptTokens, wire.Usage.CompletionTokens)
+		// CONTRACT: prompt_tokens ALREADY includes the cached share on this
+		// wire, so InputTokens is left alone and the cache counts are recorded
+		// as a subset of it. Adding them in (as the Anthropic client must)
+		// would charge the cached tokens twice against limits.max_tokens.
+		//
+		// The details object wins whenever the provider sent one, even empty:
+		// it is the field that belongs to this response, so a stale or
+		// duplicated top-level count must not override it.
+		read, write := wire.Usage.PromptCacheHitTokens, int64(0)
+		if d := wire.Usage.PromptTokensDetails; d != nil {
+			read, write = d.CachedTokens, d.CacheWriteTokens
+		}
+		usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(read, write)
 		resp.Usage = usage
 		resp.UsageMissing = !trustworthy
 	} else {

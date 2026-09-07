@@ -1007,3 +1007,74 @@ func TestGeminiChatResponseBodyIsBounded(t *testing.T) {
 		t.Fatalf("oversized body: got %v, want a provider error", err)
 	}
 }
+
+// TestGeminiCacheTokenAccounting: this wire reports the cached share as
+// cachedContentTokenCount, and promptTokenCount ALREADY includes it, so the
+// input total is untouched and the cached count is reported as a subset.
+func TestGeminiCacheTokenAccounting(t *testing.T) {
+	tests := []struct {
+		name        string
+		usage       string
+		wantIn      int
+		wantRead    int
+		wantMissing bool
+	}{
+		{
+			"cached content is a subset of the prompt count",
+			`{"promptTokenCount": 2000, "candidatesTokenCount": 10, "cachedContentTokenCount": 1500}`,
+			2000, 1500, false,
+		},
+		{
+			// The tool-use prompt is input the prompt count does not include,
+			// so it still joins the total; the cached share does not.
+			"tool-use prompt tokens still join the total",
+			`{"promptTokenCount": 2000, "toolUsePromptTokenCount": 50,
+			  "candidatesTokenCount": 10, "cachedContentTokenCount": 1500}`,
+			2050, 1500, false,
+		},
+		{
+			"absent cached count reads as zero",
+			`{"promptTokenCount": 2000, "candidatesTokenCount": 10}`,
+			2000, 0, false,
+		},
+		{
+			// A broken sub-count clamps to 0 without failing the run closed:
+			// the counts the budget enforces on are still honest.
+			"negative cached count clamps without poisoning the report",
+			`{"promptTokenCount": 2000, "candidatesTokenCount": 10, "cachedContentTokenCount": -1}`,
+			2000, 0, false,
+		},
+		{
+			"absurd cached count saturates",
+			`{"promptTokenCount": 2000, "candidatesTokenCount": 10,
+			  "cachedContentTokenCount": 9000000000000000000}`,
+			2000, maxTokensPerResponse, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := geminiServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				_, _ = w.Write([]byte(`{"candidates": [{"content": {"role": "model", "parts": [{"text": "hi"}]},
+					"finishReason": "STOP"}], "usageMetadata": ` + tt.usage + `}`))
+			})
+			client := &GeminiClient{BaseURL: srv.URL}
+			resp, err := client.Chat(context.Background(), gemUserRequest())
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if resp.Usage.InputTokens != tt.wantIn {
+				t.Errorf("InputTokens: got %d, want %d", resp.Usage.InputTokens, tt.wantIn)
+			}
+			if resp.Usage.CacheReadTokens != tt.wantRead {
+				t.Errorf("CacheReadTokens: got %d, want %d", resp.Usage.CacheReadTokens, tt.wantRead)
+			}
+			if resp.Usage.CacheWriteTokens != 0 {
+				t.Errorf("CacheWriteTokens: got %d, want 0 (this wire reports no write count)",
+					resp.Usage.CacheWriteTokens)
+			}
+			if resp.UsageMissing != tt.wantMissing {
+				t.Errorf("UsageMissing: got %v, want %v", resp.UsageMissing, tt.wantMissing)
+			}
+		})
+	}
+}

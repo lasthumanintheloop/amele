@@ -952,14 +952,124 @@ func TestChatResponseBodyIsBounded(t *testing.T) {
 
 // TestUsageAddSaturates pins the accumulator helper: adding two huge usages
 // must saturate instead of wrapping into a negative total that would defeat
-// the max_tokens budget.
+// the max_tokens budget. The cache fields accumulate the same way - they are
+// reported to the user per run, and a wrapped negative there would be a lie
+// about how much of the run was cached.
 func TestUsageAddSaturates(t *testing.T) {
-	huge := Usage{InputTokens: maxInt - 1, OutputTokens: maxInt - 1}
-	got := huge.Add(Usage{InputTokens: 100, OutputTokens: 100})
+	huge := Usage{
+		InputTokens: maxInt - 1, OutputTokens: maxInt - 1,
+		CacheReadTokens: maxInt - 1, CacheWriteTokens: maxInt - 1,
+	}
+	got := huge.Add(Usage{
+		InputTokens: 100, OutputTokens: 100,
+		CacheReadTokens: 100, CacheWriteTokens: 100,
+	})
 	if got.InputTokens != maxInt || got.OutputTokens != maxInt {
 		t.Errorf("Add did not saturate: %+v", got)
 	}
+	if got.CacheReadTokens != maxInt || got.CacheWriteTokens != maxInt {
+		t.Errorf("Add did not saturate the cache fields: %+v", got)
+	}
 	if got.Total() != maxInt {
 		t.Errorf("Total did not saturate: %d", got.Total())
+	}
+}
+
+// TestUsageTotalIgnoresCacheFields pins that the cache counts are a SUBSET of
+// InputTokens, not extra spend: Total stays input+output, so adding them in
+// would double-count the cached share against limits.max_tokens.
+func TestUsageTotalIgnoresCacheFields(t *testing.T) {
+	u := Usage{InputTokens: 100, OutputTokens: 10, CacheReadTokens: 80, CacheWriteTokens: 20}
+	if got := u.Total(); got != 110 {
+		t.Errorf("Total: got %d, want 110 (input+output only)", got)
+	}
+}
+
+// TestChatCacheTokenAccounting pins the two spellings this wire uses for the
+// cached share of the prompt. Unlike Anthropic, prompt_tokens ALREADY includes
+// the cached tokens, so InputTokens is untouched and the cache counts are
+// reported as a subset of it.
+//
+// The client decodes ONE response shape for every dialect, so this table also
+// covers the DeepSeek spelling (prompt_cache_hit_tokens) without a dialect
+// round-trip: dialects shape the request, not the response.
+func TestChatCacheTokenAccounting(t *testing.T) {
+	tests := []struct {
+		name        string
+		usage       string
+		wantIn      int
+		wantRead    int
+		wantWrite   int
+		wantMissing bool
+	}{
+		{
+			"prompt_tokens_details carries read and write",
+			`{"prompt_tokens": 2600, "completion_tokens": 10,
+			  "prompt_tokens_details": {"cached_tokens": 2000, "cache_write_tokens": 400}}`,
+			2600, 2000, 400, false,
+		},
+		{
+			"deepseek top-level hit count",
+			`{"prompt_tokens": 20, "completion_tokens": 10,
+			  "prompt_cache_hit_tokens": 16, "prompt_cache_miss_tokens": 4}`,
+			20, 16, 0, false,
+		},
+		{
+			// The details object is the canonical spelling, so when the
+			// provider sends it, it wins outright - a stale or duplicated
+			// top-level count must not override the object it belongs to.
+			"details present and empty wins over the top-level count",
+			`{"prompt_tokens": 20, "completion_tokens": 10,
+			  "prompt_tokens_details": {}, "prompt_cache_hit_tokens": 16}`,
+			20, 0, 0, false,
+		},
+		{
+			"no cache fields at all",
+			`{"prompt_tokens": 20, "completion_tokens": 10}`,
+			20, 0, 0, false,
+		},
+		{
+			// A broken sub-count clamps to 0 and leaves the report trusted:
+			// prompt_tokens and completion_tokens - the counts the budget
+			// enforces on - are still honest.
+			"negative cached_tokens clamps without poisoning the report",
+			`{"prompt_tokens": 20, "completion_tokens": 10,
+			  "prompt_tokens_details": {"cached_tokens": -1}}`,
+			20, 0, 0, false,
+		},
+		{
+			"absurd cache counts saturate",
+			`{"prompt_tokens": 9000000000000000000, "completion_tokens": 10,
+			  "prompt_tokens_details": {"cached_tokens": 9000000000000000000,
+			  "cache_write_tokens": 9000000000000000000}}`,
+			maxTokensPerResponse, maxTokensPerResponse, maxTokensPerResponse, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := chatServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				_, _ = w.Write([]byte(`{"choices": [{"message": {"role": "assistant", "content": "hi"},
+					"finish_reason": "stop"}], "usage": ` + tt.usage + `}`))
+			})
+			client := &OpenAIClient{BaseURL: srv.URL + "/v1"}
+			resp, err := client.Chat(context.Background(), Request{
+				Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}},
+			})
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if resp.Usage.InputTokens != tt.wantIn {
+				t.Errorf("InputTokens: got %d, want %d", resp.Usage.InputTokens, tt.wantIn)
+			}
+			if resp.Usage.CacheReadTokens != tt.wantRead {
+				t.Errorf("CacheReadTokens: got %d, want %d", resp.Usage.CacheReadTokens, tt.wantRead)
+			}
+			if resp.Usage.CacheWriteTokens != tt.wantWrite {
+				t.Errorf("CacheWriteTokens: got %d, want %d", resp.Usage.CacheWriteTokens, tt.wantWrite)
+			}
+			if resp.UsageMissing != tt.wantMissing {
+				t.Errorf("UsageMissing: got %v, want %v", resp.UsageMissing, tt.wantMissing)
+			}
+		})
 	}
 }

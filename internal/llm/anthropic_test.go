@@ -695,3 +695,92 @@ func TestAnthropicRefusesRedirects(t *testing.T) {
 		t.Error("the api key followed a redirect to another host")
 	}
 }
+
+// TestAnthropicCacheTokenAccounting pins the one wire whose input_tokens is
+// NOT the whole billed input: Anthropic reports the cached share in two
+// counters of its own, so the neutral InputTokens must be the sum of all
+// three or limits.max_tokens undercounts every cached turn by exactly the
+// cache share. The cache sub-counts are reported alongside it as a subset of
+// that total.
+func TestAnthropicCacheTokenAccounting(t *testing.T) {
+	tests := []struct {
+		name        string
+		usage       string
+		wantIn      int
+		wantRead    int
+		wantWrite   int
+		wantMissing bool
+	}{
+		{
+			"cache read and write join the input total",
+			`{"input_tokens": 100, "output_tokens": 5,
+			  "cache_creation_input_tokens": 900, "cache_read_input_tokens": 3000}`,
+			4000, 3000, 900, false,
+		},
+		{
+			// A broken sub-count clamps to 0 but must NOT fail the run closed:
+			// input_tokens and output_tokens are still honest, so the budget
+			// keeps the numbers it enforces on.
+			"negative cache read clamps without poisoning the report",
+			`{"input_tokens": 1000, "output_tokens": 5, "cache_read_input_tokens": -1}`,
+			1000, 0, 0, false,
+		},
+		{
+			"absent cache fields read as zero",
+			`{"input_tokens": 100, "output_tokens": 5}`,
+			100, 0, 0, false,
+		},
+		{
+			// Each reported count is clamped before the sum, and the sum
+			// itself saturates: the total stays positive and bounded rather
+			// than wrapping into "cheap".
+			"absurd cache counts saturate",
+			`{"input_tokens": 9000000000000000000, "output_tokens": 5,
+			  "cache_creation_input_tokens": 9000000000000000000,
+			  "cache_read_input_tokens": 9000000000000000000}`,
+			3 * maxTokensPerResponse, maxTokensPerResponse, maxTokensPerResponse, false,
+		},
+		{
+			// The trustworthy rule stays on the two main counts only: a
+			// negative input_tokens still fails the report closed. The total
+			// it leaves behind (clamped 0 plus the honest cache read) is not
+			// load-bearing once UsageMissing is set, but it must still be a
+			// non-negative number rather than a wrapped one.
+			"negative input still fails closed",
+			`{"input_tokens": -1, "output_tokens": 5, "cache_read_input_tokens": 10}`,
+			10, 10, 0, true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := anthropicServer(t, func(w http.ResponseWriter, _ map[string]any) {
+				_, _ = w.Write([]byte(`{"content": [{"type": "text", "text": "hi"}],
+					"stop_reason": "end_turn", "usage": ` + tt.usage + `}`))
+			})
+			client := &AnthropicClient{BaseURL: srv.URL}
+			resp, err := client.Chat(context.Background(), Request{
+				Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}},
+			})
+			if err != nil {
+				t.Fatalf("Chat: %v", err)
+			}
+			if resp.Usage.InputTokens != tt.wantIn {
+				t.Errorf("InputTokens: got %d, want %d", resp.Usage.InputTokens, tt.wantIn)
+			}
+			if resp.Usage.CacheReadTokens != tt.wantRead {
+				t.Errorf("CacheReadTokens: got %d, want %d", resp.Usage.CacheReadTokens, tt.wantRead)
+			}
+			if resp.Usage.CacheWriteTokens != tt.wantWrite {
+				t.Errorf("CacheWriteTokens: got %d, want %d", resp.Usage.CacheWriteTokens, tt.wantWrite)
+			}
+			if resp.UsageMissing != tt.wantMissing {
+				t.Errorf("UsageMissing: got %v, want %v", resp.UsageMissing, tt.wantMissing)
+			}
+			// CONTRACT: the cache counts are a SUBSET of the input total, so a
+			// report where they exceed it would double-count in every consumer.
+			if resp.Usage.CacheReadTokens+resp.Usage.CacheWriteTokens > resp.Usage.InputTokens {
+				t.Errorf("cache counts exceed the input total: %+v", resp.Usage)
+			}
+		})
+	}
+}

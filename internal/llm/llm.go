@@ -148,11 +148,33 @@ type Request struct {
 // Usage is the token accounting reported by the provider for one call.
 // CONTRACT: these provider-reported numbers are the primary budget unit of
 // amele (docs/engineering.md §7) - never substitute local estimates. Every field is
-// non-negative and bounded by maxTokensPerResponse: providers do not get to
-// decide the arithmetic the budget runs on (see parseUsage).
+// non-negative, and every count as REPORTED is bounded by maxTokensPerResponse:
+// providers do not get to decide the arithmetic the budget runs on (see
+// parseUsage). InputTokens may exceed that bound only because one wire reports
+// the billed input in several counters that are summed here (see the Anthropic
+// client); the sum saturates, so it is still positive and bounded.
 type Usage struct {
+	// InputTokens is the TOTAL billed input of the call, INCLUDING any part
+	// of the prompt that was served from the provider's cache. Wires differ
+	// on how they report that (OpenAI's prompt_tokens and Gemini's
+	// promptTokenCount already include the cached share; Anthropic's
+	// input_tokens excludes it and its client sums the pieces back together),
+	// but this field means the same thing everywhere.
 	InputTokens  int
 	OutputTokens int
+
+	// CacheReadTokens and CacheWriteTokens are SUBSETS of InputTokens, never
+	// additional spend: the tokens served from a prompt cache and the tokens
+	// billed to populate one. They exist to report what caching did for a run
+	// (they are priced differently from ordinary input), so Total deliberately
+	// ignores them - adding them in would charge the cached share twice
+	// against limits.max_tokens.
+	//
+	// Zero is the honest reading of "this wire did not report it": not every
+	// wire reports both counts (Gemini reports no write count at all), and
+	// none reports either when nothing was cached.
+	CacheReadTokens  int
+	CacheWriteTokens int
 }
 
 // maxInt is the largest value of the platform int, the saturation point of
@@ -185,6 +207,11 @@ func (u Usage) Add(other Usage) Usage {
 	return Usage{
 		InputTokens:  saturatingAdd(u.InputTokens, other.InputTokens),
 		OutputTokens: saturatingAdd(u.OutputTokens, other.OutputTokens),
+		// The cache counts accumulate the same way. They do not gate the
+		// budget, but a wrapped negative would misreport the run's cache hit
+		// rate to the user, which is the only reason they are carried at all.
+		CacheReadTokens:  saturatingAdd(u.CacheReadTokens, other.CacheReadTokens),
+		CacheWriteTokens: saturatingAdd(u.CacheWriteTokens, other.CacheWriteTokens),
 	}
 }
 
@@ -211,6 +238,21 @@ func saturatingAdd(a, b int) int {
 func parseUsage(input, output int64) (usage Usage, trustworthy bool) {
 	usage = Usage{InputTokens: clampTokens(input), OutputTokens: clampTokens(output)}
 	return usage, input >= 0 && output >= 0
+}
+
+// parseCacheTokens normalizes the cache sub-counts one provider reported into
+// the neutral Usage fields, clamped to [0, maxTokensPerResponse] like every
+// other count. A wire that reports neither passes two zeros.
+//
+// CONTRACT: unlike parseUsage this returns no trustworthiness signal, and a
+// negative sub-count clamps to 0 instead of failing the run closed. The
+// difference is deliberate: these counts are a SUBSET of an input total the
+// provider reported separately, so a broken one costs the user an accurate
+// cache report - it does not weaken the budget, which still enforces on the
+// main input/output counts. Failing closed on it would kill runs over a
+// reporting field nothing depends on.
+func parseCacheTokens(read, write int64) (readTok, writeTok int) {
+	return clampTokens(read), clampTokens(write)
 }
 
 // clampTokens maps one reported count into [0, maxTokensPerResponse].

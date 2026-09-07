@@ -223,6 +223,12 @@ type anResponse struct {
 	Usage *struct {
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
+		// CacheCreationInputTokens and CacheReadInputTokens are the two halves
+		// of the prompt cache on this wire, and input_tokens above EXCLUDES
+		// both of them. They are absent when nothing was cached, which decodes
+		// to zero - the honest reading here.
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -408,7 +414,22 @@ func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []
 		// CONTRACT: same sanitizing boundary as the OpenAI client - the loop
 		// must never accumulate a negative or unbounded provider count.
 		usage, trustworthy := parseUsage(wire.Usage.InputTokens, wire.Usage.OutputTokens)
+		usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(
+			wire.Usage.CacheReadInputTokens, wire.Usage.CacheCreationInputTokens)
+		// CONTRACT: on THIS wire alone, input_tokens excludes the cached
+		// share, so the neutral InputTokens - which means "total billed
+		// input" everywhere - must add the two cache counters back in. Left
+		// out, limits.max_tokens would undercount every cached turn by exactly
+		// the cache share, and the better the cache worked the further the
+		// budget would drift from the truth. The sum saturates for the same
+		// reason each part is clamped: a total that wrapped negative would
+		// read as "under budget" forever.
+		usage.InputTokens = saturatingAdd(usage.InputTokens,
+			saturatingAdd(usage.CacheReadTokens, usage.CacheWriteTokens))
 		resp.Usage = usage
+		// The trustworthy signal stays keyed on input_tokens/output_tokens
+		// only: parseCacheTokens clamps a broken sub-count rather than
+		// failing the whole report closed (see its doc).
 		resp.UsageMissing = !trustworthy
 	} else {
 		resp.UsageMissing = true

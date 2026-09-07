@@ -422,6 +422,11 @@ type gemResponse struct {
 		// large MCP toolset pays for it on every turn while a budget reading
 		// only the prompt count never saw it.
 		ToolUsePromptTokenCount int64 `json:"toolUsePromptTokenCount"`
+		// CachedContentTokenCount is the part of promptTokenCount that was
+		// served from cached content - a SUBSET of it, not an extra counter
+		// like toolUsePromptTokenCount above, so it must not join the input
+		// sum. It is absent when nothing was cached, which decodes to zero.
+		CachedContentTokenCount int64 `json:"cachedContentTokenCount"`
 		CandidatesTokenCount    int64 `json:"candidatesTokenCount"`
 		ThoughtsTokenCount      int64 `json:"thoughtsTokenCount"`
 	} `json:"usageMetadata"`
@@ -959,6 +964,12 @@ func geminiResponse(wire gemResponse) (*Response, error) {
 		geminiTokenSum(wire.UsageMetadata.PromptTokenCount, wire.UsageMetadata.ToolUsePromptTokenCount),
 		geminiTokenSum(wire.UsageMetadata.CandidatesTokenCount, wire.UsageMetadata.ThoughtsTokenCount),
 	)
+	// This wire reports no cache-write count, so the neutral field stays 0 and
+	// that is honest rather than a gap: populating a cache here is either a
+	// separate cachedContents API call or implicit, never a line item on a
+	// generateContent response.
+	usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(
+		wire.UsageMetadata.CachedContentTokenCount, 0)
 	resp.Usage = usage
 	resp.UsageMissing = !trustworthy
 	return resp, nil
