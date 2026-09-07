@@ -343,8 +343,9 @@ Headless operation is the design center, not an afterthought:
 
 With `session_dir` set, every run appends one JSONL file: the task, every
 model turn, every tool call with its outcome and exit code, token
-accounting, final status - the observability trail and future replay source
-in one format ([contract](docs/contracts/jsonl-events.md)). Every
+accounting, final status - the observability trail and the resume source in
+one format ([contract](docs/contracts/jsonl-events.md)): `amele run --resume`
+reads this file back and continues the run it recorded. Every
 `${VAR}`-interpolated value is redacted from the log by value; see the
 caveat about interpolating broad non-secrets like `${HOME}` in
 [docs/session-logging.md](docs/session-logging.md).

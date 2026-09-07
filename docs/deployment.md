@@ -243,7 +243,8 @@ is chosen by amele (`run-<UTC timestamp>-<pid>.jsonl`), so the way to find
 amele run agent.yaml -q --set "session_dir=out/$item" "process $item"
 ```
 
-The one file in `out/$item/` is that item's log. Two notes on the path: a
+The file in `out/$item/` is that item's log - one per attempt, since a
+retried item resumes into a new file (below). Two notes on the path: a
 `session_dir` given as an override resolves against the **current working
 directory**, not the config's directory (the [CLI
 contract](contracts/cli.md)), and the item name becomes a path component -
@@ -340,14 +341,15 @@ log_reasoning: true     # the model's reasoning payload, not just its size
 
 The first is also what makes a run **resumable** at all, which is the second
 reason to set it on a batch that costs real money. Both are deliberate, and
-the second key is a **data-governance decision, not a verbosity setting**. Redaction still runs unconditionally - `${VAR}` values are
-replaced by value before anything is written, whatever the bound - but
-redaction is by value, and a reasoning trace is where a model *paraphrases*:
-"the key starts with sk-live and ends in 7f" survives a redactor that is
-looking for the key itself. Turn it on for batches whose logs you would be
-comfortable reading aloud, keep it off for the rest, and remember that
-`max_logged_field: 0` makes files as large as the tool output they carry -
-§3's cleanup story matters more, not less, once a batch runs nightly.
+the second key is a **data-governance decision, not a verbosity setting**.
+Redaction still runs unconditionally - `${VAR}` values are replaced by value
+before anything is written, whatever the bound - but redaction is by value,
+and a reasoning trace is where a model *paraphrases*: "the key starts with
+sk-live and ends in 7f" survives a redactor that is looking for the key
+itself. Turn it on for batches whose logs you would be comfortable reading
+aloud, keep it off for the rest, and remember that `max_logged_field: 0`
+makes files as large as the tool output they carry - §3's cleanup story
+matters more, not less, once a batch runs nightly.
 
 ## 5. Embedding amele as an agent core from another program
 

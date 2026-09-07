@@ -319,9 +319,10 @@ and before any session log is opened - a refused resume leaves no file behind:
   crashed run `--resume` exists for;
 - an interactive chat's log (`session log is not resumable: it records an
   interactive chat, which has no task to continue`);
-- a file that does not begin with a `run_start`, one whose `run_start` carries
-  no task, or one written to a schema version this build does not read - the
-  same `not resumable` sentence with its own reason;
+- an empty file, a file that does not begin with a `run_start`, one whose
+  `run_start` carries no task, or one written to a schema version this build
+  does not read - each the same `not resumable` sentence with its own reason
+  (`the log is empty`, `the log does not begin with a run_start event`, ...);
 - a log whose run took an `output.schema` retry: the validator's feedback is a
   user turn the log does not record, so rebuilding it would hand the model a
   conversation that never happened (`the log skips a user turn (an
@@ -372,9 +373,9 @@ resume the credential gate refuses (exit **8**) writes an ordinary `run_start`
 with none of the `resumed_*` keys: that run never got as far as the log. MCP
 servers themselves connect exactly as they do for any other run; if the
 resumed config no longer declares the server that produced a pending call, the
-history references a tool that is not in the request's tool list - providers
-tolerate that, and the model has already been told that call's result is
-unknown.
+history references a tool that is not in the request's tool list. amele sends
+that history as it stands, and the model has already been told that call's
+result is unknown.
 
 **`amele chat` has no `--resume`.** `amele chat cfg.yaml --resume x` prints
 `chat has no --resume` and exits 2 - a chat builds its own history at the

@@ -46,6 +46,7 @@ model can do small, auditable, and bounded in time and cost.
  `--set`/`-w` CLI overrides     │  the LLM provider's responses
  the amele binary               │  MCP tool definitions, `instructions`,
  the set of MCP servers listed  │   annotations and tool results
+ the session log --resume reads │
 ```
 
 Three boundaries matter:
