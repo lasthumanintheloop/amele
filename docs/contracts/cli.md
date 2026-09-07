@@ -129,8 +129,9 @@ on `run`, `chat`, `validate` and `explain`.
   Empty is a setting here, as for `limits.max_logged_field`:
   `--set limits.max_tool_result_bytes=` drops a bound the file set and falls
   back to the built-in per-tool caps for this run (fs_read 256 KiB,
-  fs_list/subprocess/shell 64 KiB per stream, MCP 64 KiB). There is no
-  unbounded spelling: `=0` and anything else below 1024 are exit 2.
+  subprocess/shell 64 KiB per stream, fs_list 64 KiB of entries, MCP 64 KiB).
+  There is no unbounded spelling: `=0` and anything else below 1024 are
+  exit 2.
 - **Migration (2026-08-12): the allowlist shrank.** `lock` was settable when
   overrides shipped and no longer is: `--set lock=true|false` is now exit 2
   like any other non-settable key. It was the one entry that could *weaken* a

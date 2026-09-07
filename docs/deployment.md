@@ -309,7 +309,8 @@ turn each session file into the complete record:
 
 ```yaml
 limits:
-  max_logged_field: 0   # no per-field clip: tool output and args are whole
+  max_logged_field: 0   # no per-field clip: tool output and args whole as
+                        # the model read them (the tool-result cap cuts first)
 log_reasoning: true     # the model's reasoning payload, not just its size
 ```
 

@@ -269,10 +269,13 @@ variables like `${HOME}`: see
 [docs/session-logging.md](session-logging.md).
 
 A `tool_result` whose text was cut before the model read it carries
-`truncated: true`, and the text itself ends in `[output truncated by amele]`.
-The cap is per tool family - `fs_read` 256 KiB, `fs_list`, subprocess and
-shell 64 KiB per stream, MCP 64 KiB - unless `limits.max_tool_result_bytes`
-sets one number for all of them and for the framed result the loop hands back:
+`truncated: true`, and the text itself ends in `[output truncated by amele]`
+(`fs_list` appends its entry counts to the same marker:
+`[output truncated by amele: N of M entries shown]`). The cap is per tool
+family - `fs_read` 256 KiB, subprocess and shell 64 KiB per stream, `fs_list`
+64 KiB of directory entries, MCP 64 KiB - unless
+`limits.max_tool_result_bytes` sets one number for all of them and for the
+framed result the loop hands back:
 
 ```yaml
 limits:
