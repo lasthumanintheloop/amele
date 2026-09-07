@@ -23,16 +23,31 @@ import (
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/llm"
+	"github.com/lasthumanintheloop/amele/internal/resume"
 	"github.com/lasthumanintheloop/amele/internal/runlock"
 	"github.com/lasthumanintheloop/amele/internal/schema"
 	"github.com/lasthumanintheloop/amele/internal/session"
 	"github.com/lasthumanintheloop/amele/internal/tools"
 )
 
-// capturedMessage is one conversation entry as it appeared on the wire.
+// capturedMessage is one conversation entry as it appeared on the wire. The
+// tool fields are decoded because a resumed run's whole claim is about them:
+// the assistant turn must carry back the SAME call id and argument string the
+// log recorded, and the tool message must answer that id.
 type capturedMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string             `json:"role"`
+	Content    string             `json:"content"`
+	ToolCallID string             `json:"tool_call_id"`
+	ToolCalls  []capturedToolCall `json:"tool_calls"`
+}
+
+// capturedToolCall is one entry of an assistant message's tool_calls array.
+type capturedToolCall struct {
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
 }
 
 // capturedRequest is the subset of an OpenAI-compatible request body the e2e
@@ -1114,7 +1129,7 @@ func TestHelpPageContent(t *testing.T) {
 	}{
 		{"run", []string{
 			"--model MODEL", "-h, --help", "-q, --quiet", "-v, --verbose",
-			"--set KEY=VALUE", "-w, --workspace DIR", "last entry for a key wins",
+			"--set KEY=VALUE", "-w, --workspace DIR", "--resume PATH", "last entry for a key wins",
 			"amele: turn 3: model requested fs_read",
 			"10 MB", "[input truncated at 10MB by amele]",
 			"output.schema", "lock: true", "exits 7",
@@ -4982,5 +4997,321 @@ func TestAgentSecretsCoversEveryFallbackTarget(t *testing.T) {
 		if !slices.Contains(got, want) {
 			t.Errorf("agentSecrets() = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// --- run --resume -----------------------------------------------------------
+
+// writeResumeConfig renders a config for the resume tests: the shared test
+// shape, plus a session_dir (so a run leaves the log the next one resumes
+// from) and a single provider attempt (so a test that drives a run into a
+// provider failure does not pay the client's backoff to get there).
+func writeResumeConfig(t *testing.T, baseURL, extra string) (string, string) {
+	t.Helper()
+	dir := t.TempDir()
+	yaml := fmt.Sprintf(`
+model: test-model
+provider:
+  base_url: %s/v1
+  api_key: ${TEST_KEY}
+  retry:
+    max_attempts: 1
+system_prompt: "You are a test agent."
+tools:
+  fs: true
+session_dir: sessions
+%s`, baseURL, extra)
+	path := filepath.Join(dir, "agent.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path, dir
+}
+
+// sessionLogPath returns the single session file under dir - the path an
+// operator would pass to --resume.
+func sessionLogPath(t *testing.T, dir string) string {
+	t.Helper()
+	files, err := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("session files: %v, %v", files, err)
+	}
+	return files[0]
+}
+
+// writeSessionLog writes events as one JSONL file inside a fresh temp dir and
+// returns its path. It builds the lines from session.Event values rather than
+// from hand-written JSON so a field rename cannot leave the fixture describing
+// a log format that no longer exists.
+func writeSessionLog(t *testing.T, events ...session.Event) string {
+	t.Helper()
+	var buf bytes.Buffer
+	for _, ev := range events {
+		ev.V = session.SchemaVersion
+		ev.TS = time.Unix(0, 0).UTC()
+		line, err := json.Marshal(ev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	path := filepath.Join(t.TempDir(), "run-1.jsonl")
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// interruptedRunLog drives one run into a provider failure mid-conversation
+// and returns the session log it left behind: turn 1 asked for a file and got
+// its answer, turn 2 never arrived. It is the "what an operator actually has
+// after a run died" fixture the resume tests continue from.
+//
+// The config writes FULL records (limits.max_logged_field: 0), which is what
+// makes a log resumable at all - the fidelity gate refuses anything the writer
+// shortened.
+func interruptedRunLog(t *testing.T) string {
+	t.Helper()
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			_, _ = w.Write([]byte(toolCallBody("fs_read", `{"path":"note.txt"}`)))
+			return
+		}
+		http.Error(w, "upstream is down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfgPath, dir := writeResumeConfig(t, srv.URL, "limits:\n  max_logged_field: 0\n")
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("remember the milk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := execCLI(t, []string{"run", cfgPath, "read", "the", "note"}, "")
+	if code != ExitProviderError {
+		t.Fatalf("the interrupted run exited %d, want %d; stderr: %s", code, ExitProviderError, stderr)
+	}
+
+	var turns []int
+	for _, ev := range readSessionEvents(t, dir) {
+		if ev.Type == "llm_response" {
+			turns = append(turns, ev.Turn)
+		}
+	}
+	if len(turns) != 1 || turns[0] != 1 {
+		t.Fatalf("the log carries llm_response turns %v, want exactly [1]", turns)
+	}
+	raw := readSessionRaw(t, dir)
+	if !strings.Contains(raw, `"type":"tool_call"`) || !strings.Contains(raw, `"type":"tool_result"`) {
+		t.Fatalf("the log lacks the answered tool call:\n%s", raw)
+	}
+	return sessionLogPath(t, dir)
+}
+
+// assertResumedConversation checks the request body of a resumed run against
+// the conversation the interrupted run was having: the CURRENT config's system
+// prompt, the old task, the assistant turn carrying the SAME call id and
+// argument string the log recorded, and the tool message answering that id
+// with the text the model was shown.
+func assertResumedConversation(t *testing.T, msgs []capturedMessage) {
+	t.Helper()
+	if len(msgs) != 4 {
+		t.Fatalf("the resumed request carries %d messages, want 4:\n%+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "system" || msgs[0].Content != "You are a test agent." {
+		t.Errorf("message 0 = %+v, want the current config's system prompt", msgs[0])
+	}
+	if msgs[1].Role != "user" || msgs[1].Content != "read the note" {
+		t.Errorf("message 1 = %+v, want the old run's task", msgs[1])
+	}
+	if msgs[2].Role != "assistant" || len(msgs[2].ToolCalls) != 1 {
+		t.Fatalf("message 2 = %+v, want the assistant turn with its tool call", msgs[2])
+	}
+	if call := msgs[2].ToolCalls[0]; call.ID != "c1" ||
+		call.Function.Name != "fs_read" || call.Function.Arguments != `{"path":"note.txt"}` {
+		t.Errorf("replayed tool call = %+v, want c1/fs_read with the logged arguments", call)
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "c1" {
+		t.Fatalf("message 3 = %+v, want the tool result answering c1", msgs[3])
+	}
+	if !strings.Contains(msgs[3].Content, "remember the milk") {
+		t.Errorf("replayed tool result = %q, want the text the model was shown", msgs[3].Content)
+	}
+}
+
+// TestE2EResumeContinuesAnInterruptedRun is the whole slice end to end: a run
+// dies mid-conversation, and a second run started with --resume sends the
+// FIRST run's conversation back to the provider before adding a turn of its
+// own.
+//
+// The assertion that matters is the request body of the resumed run, not its
+// exit code: "the model sees the conversation it was having" is a claim about
+// what went on the wire.
+func TestE2EResumeContinuesAnInterruptedRun(t *testing.T) {
+	logPath := interruptedRunLog(t)
+
+	srv, reqs := capturingServer(t, textBody("the note says to remember the milk"))
+	cfgPath, dir := writeResumeConfig(t, srv.URL, "")
+
+	code, stdout, stderr := execCLI(t, []string{"run", cfgPath, "--resume", logPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(stdout, "remember the milk") {
+		t.Errorf("stdout does not carry the answer: %q", stdout)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("provider calls = %d, want 1", len(*reqs))
+	}
+	assertResumedConversation(t, (*reqs)[0].Messages)
+
+	// The new log says where it came from, and numbers its own turns from 1.
+	raw := readSessionRaw(t, dir)
+	if !strings.Contains(raw, `"resumed_from":`+strconv.Quote(logPath)) {
+		t.Errorf("run_start does not name the log it continued:\n%s", raw)
+	}
+	if !strings.Contains(raw, `"resumed_turn":1`) {
+		t.Errorf("run_start does not record the turn it continued from:\n%s", raw)
+	}
+	if strings.Contains(raw, `"resumed_pending"`) {
+		t.Errorf("nothing was left unanswered, so no pending key belongs in run_start:\n%s", raw)
+	}
+	for _, ev := range readSessionEvents(t, dir) {
+		if ev.Type == "llm_response" && ev.Turn != 1 {
+			t.Errorf("the resumed run numbered its first turn %d, want 1 (the old log is never appended to)", ev.Turn)
+		}
+	}
+}
+
+// TestE2EResumePendingToolCall pins the half of the contract that costs money
+// to get wrong: a tool call the interrupted run dispatched but never recorded
+// a result for is NOT re-executed. The model is told what happened in the tool
+// message's own place, and the new run_start names the id so an operator can
+// audit the side effect nobody accounted for.
+func TestE2EResumePendingToolCall(t *testing.T) {
+	logPath := writeSessionLog(t,
+		session.Event{Type: "run_start", Model: "test-model", Provider: "openai", Task: "sweep the logs"},
+		session.Event{Type: "llm_response", Turn: 1, ToolCallIDs: []string{"c9"}, FinishReason: "tool_calls"},
+		session.Event{Type: "tool_call", CallID: "c9", Tool: "fs_read", Args: `{"path":"app.log"}`},
+	)
+
+	srv, reqs := capturingServer(t, textBody("nothing to report"))
+	cfgPath, _ := writeResumeConfig(t, srv.URL, "")
+
+	code, _, stderr := execCLI(t, []string{"run", cfgPath, "--resume", logPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	msgs := (*reqs)[0].Messages
+	last := msgs[len(msgs)-1]
+	if last.Role != "tool" || last.ToolCallID != "c9" {
+		t.Fatalf("last message = %+v, want a tool message answering the unanswered call", last)
+	}
+	if last.Content != resume.PendingResultMessage {
+		t.Errorf("stand-in tool result = %q, want %q", last.Content, resume.PendingResultMessage)
+	}
+	if !strings.Contains(readSessionRaw(t, filepath.Dir(cfgPath)), `"resumed_pending":["c9"]`) {
+		t.Errorf("run_start does not list the unanswered call:\n%s", readSessionRaw(t, filepath.Dir(cfgPath)))
+	}
+}
+
+// TestE2EResumeRefusesClippedLog: the default log clips a large tool result,
+// and a conversation rebuilt from clipped text is a DIFFERENT conversation
+// than the one the model had. The refusal must name the config key that makes
+// a log resumable, because that is the only action the operator can take.
+func TestE2EResumeRefusesClippedLog(t *testing.T) {
+	srvA := scriptedServer(t, toolCallBody("fs_read", `{"path":"big.txt"}`), textBody("read it"))
+	// No max_logged_field override: this is the DEFAULT bound, which is what
+	// every log an operator already has was written under.
+	cfgA, dirA := writeResumeConfig(t, srvA.URL, "")
+	big := strings.Repeat("log line that says nothing\n", 800) // ~20 KB, well past the 8 KiB clip
+	if err := os.WriteFile(filepath.Join(dirA, "big.txt"), []byte(big), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, _, stderr := execCLI(t, []string{"run", cfgA, "read", "the", "file"}, "")
+	if code != ExitOK {
+		t.Fatalf("run A: exit %d, stderr: %s", code, stderr)
+	}
+	if !strings.Contains(readSessionRaw(t, dirA), session.ClipMarker) {
+		t.Fatalf("the fixture did not produce a clipped log; the refusal below would prove nothing")
+	}
+	logPath := sessionLogPath(t, dirA)
+
+	srvB := scriptedServer(t)
+	cfgB, _ := writeResumeConfig(t, srvB.URL, "")
+	code, stdout, stderr := execCLI(t, []string{"run", cfgB, "--resume", logPath, "keep going"}, "")
+	if code != ExitConfigError {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitConfigError, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("a refused resume wrote to stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "limits.max_logged_field: 0") {
+		t.Errorf("stderr = %q, want it to name the key that makes a log resumable", stderr)
+	}
+}
+
+// TestE2EResumeCompletedRun covers the log that has nothing left to do on its
+// own: it already carries a final answer, so continuing it is only meaningful
+// with a new instruction.
+func TestE2EResumeCompletedRun(t *testing.T) {
+	srvA := scriptedServer(t, textBody("all clear"))
+	cfgA, dirA := writeResumeConfig(t, srvA.URL, "")
+	code, _, stderr := execCLI(t, []string{"run", cfgA, "check", "the", "logs"}, "")
+	if code != ExitOK {
+		t.Fatalf("run A: exit %d, stderr: %s", code, stderr)
+	}
+	logPath := sessionLogPath(t, dirA)
+
+	t.Run("no instruction is refused", func(t *testing.T) {
+		srv := scriptedServer(t)
+		cfgB, _ := writeResumeConfig(t, srv.URL, "")
+		code, stdout, stderr := execCLI(t, []string{"run", cfgB, "--resume", logPath}, "")
+		if code != ExitConfigError {
+			t.Fatalf("exit %d, want %d; stderr: %s", code, ExitConfigError, stderr)
+		}
+		if stdout != "" {
+			t.Errorf("a refused resume wrote to stdout: %q", stdout)
+		}
+		if !strings.Contains(stderr, "run already produced a final answer; pass an instruction to continue") {
+			t.Errorf("stderr = %q, want the instruction-needed refusal", stderr)
+		}
+	})
+
+	t.Run("the instruction is the last user message, verbatim", func(t *testing.T) {
+		srv, reqs := capturingServer(t, textBody("summary"))
+		// A prompt template AND piped stdin, both of which must be ignored:
+		// the template shaped the ORIGINAL task, and a resumed run reads no
+		// stdin at all.
+		cfgB, _ := writeResumeConfig(t, srv.URL, "prompt: \"TEMPLATE {{input}}\"\n")
+		code, _, stderr := execCLI(t, []string{"run", cfgB, "--resume", logPath, "and now", "summarize"}, "piped data")
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, stderr)
+		}
+		msgs := (*reqs)[0].Messages
+		last := msgs[len(msgs)-1]
+		if last.Role != "user" || last.Content != "and now summarize" {
+			t.Errorf("last message = %+v, want the instruction verbatim (no prompt template, no stdin)", last)
+		}
+		if strings.Contains(lastContent(msgs, "user"), "piped data") {
+			t.Errorf("a resumed run read stdin: %+v", msgs)
+		}
+	})
+}
+
+// TestChatRejectsResume: --resume is registered on chat only so the refusal
+// can say what is actually wrong. A conversation is resumed by having it, not
+// by replaying a log.
+func TestChatRejectsResume(t *testing.T) {
+	code, stdout, stderr := execCLI(t, []string{"chat", "no-such-config.yaml", "--resume", "run-1.jsonl"}, "")
+	if code != ExitConfigError {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitConfigError, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("wrote to stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "chat has no --resume") {
+		t.Errorf("stderr = %q, want the chat refusal", stderr)
 	}
 }

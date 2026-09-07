@@ -40,6 +40,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/loop"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
 	"github.com/lasthumanintheloop/amele/internal/perm"
+	"github.com/lasthumanintheloop/amele/internal/resume"
 	"github.com/lasthumanintheloop/amele/internal/runlock"
 	"github.com/lasthumanintheloop/amele/internal/schema"
 	"github.com/lasthumanintheloop/amele/internal/session"
@@ -155,7 +156,7 @@ Exit codes:
 // [--model MODEL] after -q/-v shipped), which is why they are consts here
 // rather than literals at the call sites.
 const (
-	usageRun        = "usage: amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v] [task...]"
+	usageRun        = "usage: amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [--resume PATH] [-q|-v] [task...]"
 	usageChat       = "usage: amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]"
 	usageValidate   = "usage: amele validate <config.yaml|dir> [--set key=value] [-w DIR]"
 	usageExplain    = "usage: amele explain <config.yaml|dir> [--set key=value] [-w DIR]"
@@ -180,7 +181,7 @@ const (
 const helpRun = `amele run - one-shot agent run
 
 SYNOPSIS
-  amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v] [task...]
+  amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [--resume PATH] [-q|-v] [task...]
 
 DESCRIPTION
   Loads the config, runs the agent on the task, prints the final answer and
@@ -241,6 +242,29 @@ FLAGS
   -w, --workspace DIR
                   Shortcut for --set workspace=DIR. Default: the config's
                   workspace (its own directory unless the YAML says otherwise).
+  --resume PATH   Continue the run recorded in the session log at PATH: its
+                  conversation is rebuilt and sent again before this run's
+                  first turn, so the model picks up where it stopped. The task
+                  comes from the log; task text given alongside is a follow-up
+                  INSTRUCTION, appended as the last user message VERBATIM -
+                  the config's prompt template is not applied to it, and stdin
+                  is never read on this path.
+                  The log must be a complete record of what the model saw:
+                  write it with limits.max_logged_field: 0, or the resume is
+                  refused (exit 2) rather than continued from text the log
+                  shortened. A log of an interactive chat, of a run that never
+                  answered a turn, or of a different schema version is refused
+                  the same way.
+                  No tool call is ever re-executed. A call the interrupted run
+                  dispatched but never logged a result for gets a message in
+                  its place telling the model the result is unknown, and the
+                  new run's run_start records the origin (resumed_from,
+                  resumed_turn, resumed_pending) so an operator can see which
+                  side effects are unaccounted for. Turn numbering starts at 1
+                  again; the log named by PATH is never appended to.
+                  A log whose run already produced a final answer has nothing
+                  to continue on its own: resuming it without an instruction
+                  is exit 2. Default: off - the run starts from the task text.
   -q, --quiet     Drop the summary line and the non-error notes, so a run that
                   works says nothing at all. Errors, permission questions and
                   permission decisions still print, and the session log is
@@ -261,7 +285,8 @@ FLAGS
 
 STDIN
   Read only when it is actually needed: the config's prompt template
-  references {{input}}, or there is no prompt and no task text.
+  references {{input}}, or there is no prompt and no task text. A --resume run
+  never reads it at all: its message history comes from the log.
   amele run cfg.yaml "task" never touches stdin, so it cannot hang on an open
   pipe. When stdin is an interactive terminal, nothing is read - a run never
   blocks waiting for typing. Piped input is capped at 10 MB; the cut is marked
@@ -349,6 +374,10 @@ EXAMPLES
 
   Watch what the agent is doing while it does it:
     amele run agent.yaml -v "triage the failing tests"
+
+  Continue a run the provider killed halfway, then push it further:
+    amele run agent.yaml --resume sessions/20260907T101500Z-4f2a.jsonl
+    amele run agent.yaml --resume sessions/20260907T101500Z-4f2a.jsonl "now open a ticket"
 `
 
 const helpChat = `amele chat - interactive conversation with the agent
@@ -1487,6 +1516,15 @@ type agentArgs struct {
 	// exclusive (parseAgentArgs rejects the combination).
 	quiet   bool
 	verbose bool
+	// resume is the session log --resume named, empty when the flag was not
+	// given. It is `run`-only in meaning but parsed for both commands, so
+	// `chat --resume x` can be answered with what is actually wrong instead
+	// of an unknown-flag error (cmdChat rejects a non-empty value).
+	//
+	// CONTRACT: the string is the path exactly as the operator typed it. It is
+	// what run_start.resumed_from records, so the log names the file the
+	// operator can find rather than a resolved form they never wrote.
+	resume string
 	// rest is the free-form remainder: task text for `run`; for `chat` any
 	// remainder is a usage error, because a chat reads its input from stdin.
 	rest []string
@@ -1559,6 +1597,11 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 	quietLong := fs.Bool("quiet", false, "suppress the summary line and non-error notes")
 	verboseShort := fs.Bool("v", false, "print a progress line per loop event to stderr")
 	verboseLong := fs.Bool("verbose", false, "print a progress line per loop event to stderr")
+	// Registered for BOTH commands although only `run` can act on it: an
+	// unknown-flag error would tell a chat user that the flag does not exist,
+	// which is not the useful half of the truth. cmdChat refuses a non-empty
+	// value with the reason.
+	resumeFlag := fs.String("resume", "", "continue the run recorded in this session log")
 	if err := fs.Parse(args[1:]); err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n%s\n", name, err, usage)
 		return agentArgs{}, false
@@ -1569,6 +1612,7 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 		help:       *helpShort || *helpLong,
 		quiet:      *quietShort || *quietLong,
 		verbose:    *verboseShort || *verboseLong,
+		resume:     *resumeFlag,
 		rest:       fs.Args(),
 	}
 	// Help wins over the conflict below: someone who asked for the manual gets
@@ -1777,7 +1821,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		defer cancel()
 	}
 
-	task, taskErr := buildTask(ctx, cfg, taskArgs, stdin)
+	task, history, resumed, taskErr := prepareRun(ctx, cfg, parsed, taskArgs, stdin)
 	// Reading stdin is already part of the run, so an interruption there is an
 	// interrupted RUN, not a config error: it is carried past the agent
 	// construction below and reported through the normal ending path.
@@ -1786,7 +1830,12 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// was the configured limits.timeout.
 	interrupted := errors.Is(taskErr, context.Canceled) || errors.Is(taskErr, context.DeadlineExceeded)
 	if taskErr != nil && !interrupted {
-		// Nothing started: no task was given at all, or stdin itself failed.
+		// Nothing started: no task was given at all, stdin itself failed, or
+		// the log --resume named cannot be continued. CONTRACT: exit 2 for all
+		// three, and a resume failure is printed as internal/resume phrased it
+		// - those messages are written for the operator and already name both
+		// the file and the config key that would make it resumable, so
+		// wrapping them here would only add a prefix in front of the advice.
 		_, _ = fmt.Fprintln(stderr, taskErr)
 		return ExitConfigError
 	}
@@ -1812,7 +1861,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// (docs/contracts/jsonl-events.md, Ordering). loop.Run's contract already
 	// hands that choice to callers driving their own history - `chat` has
 	// always done it - so the run below goes through RunMessages.
-	agent.Session.RunStart(cfg.Model, cfg.Provider.Identity(), task)
+	logRunStart(agent, cfg, task, resumed)
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
@@ -1841,7 +1890,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// likely to lose a keyword, and they do not exist until this point.
 	warnSanitizedToolSchemas(cfg, agent.Registry, stderr, parsed.quiet, secrets)
 
-	res, runErr := agent.RunMessages(ctx, openingHistory(cfg, task))
+	res, runErr := agent.RunMessages(ctx, history)
 	code := exitCodeFor(runErr)
 
 	finish()
@@ -1921,6 +1970,107 @@ func interruptedError(cause error) error {
 		return fmt.Errorf("%w: %v", loop.ErrBudgetExceeded, cause)
 	}
 	return fmt.Errorf("run interrupted: %w", cause)
+}
+
+// prepareRun decides what conversation this run starts from, and reports
+// whether it continues an earlier one.
+//
+// There are exactly two openings. A normal run renders its task
+// (buildTask, which is the only thing that may read stdin) and opens with the
+// system prompt plus that task. A --resume run rebuilds the conversation of an
+// earlier run from its session log and opens with THAT, optionally followed by
+// a new instruction; it does not call buildTask at all, so stdin is untouched
+// and the prompt template never runs.
+//
+// It returns the task the session log should record, the history the loop is
+// driven with, the origin fields for a resumed run (nil for a normal one), and
+// the error that stops the run. CONTRACT: every error here is exit 2 at the
+// call site, EXCEPT a context error from the stdin read, which is an
+// interrupted run - cmdRun makes that split, exactly as it did when it called
+// buildTask itself.
+func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskArgs string,
+	stdin io.Reader) (string, []llm.Message, *session.Resumed, error) {
+	if parsed.resume == "" {
+		task, err := buildTask(ctx, cfg, taskArgs, stdin)
+		if err != nil {
+			return "", nil, nil, err
+		}
+		return task, openingHistory(cfg, task), nil, nil
+	}
+	// The provider identity decides whether the log's reasoning payloads come
+	// back: they are signed or hash-checked by the backend that produced them
+	// (internal/resume Options), so replaying one into a different provider is
+	// at best rejected.
+	replay, err := resume.Read(parsed.resume, resume.Options{Provider: cfg.Provider.Identity()})
+	if err != nil {
+		return "", nil, nil, err
+	}
+	// Whitespace-only arguments are no instruction at all - the same rule
+	// buildTask applies to a one-shot task, so `--resume log " "` cannot buy a
+	// round trip that asks the model nothing. Anything that survives it is
+	// sent exactly as typed (resumeHistory).
+	var instruction string
+	if strings.TrimSpace(taskArgs) != "" {
+		instruction = taskArgs
+	}
+	if replay.Completed && instruction == "" {
+		return "", nil, nil, errResumeCompleted
+	}
+	// The task is the OLD run's task: it is what the conversation is about,
+	// and repeating it in the new log is what lets the two be read as one
+	// story. The origin fields say the rest.
+	return replay.Task, resumeHistory(cfg, replay, instruction), &session.Resumed{
+		From: parsed.resume, Turn: replay.LastTurn, Pending: replay.Pending,
+	}, nil
+}
+
+// errResumeCompleted is the refusal for a log whose run already answered.
+//
+// CONTRACT: exit 2, before a token is spent. Such a log has nothing left to
+// do on its own - resending it would ask the model to repeat an answer it
+// already gave - so continuing it takes a new instruction from the operator,
+// and the message says so rather than reporting an empty success.
+var errResumeCompleted = errors.New("run already produced a final answer; pass an instruction to continue")
+
+// resumeHistory builds the conversation a --resume run starts from: the
+// CURRENT config's system prompt, the rebuilt history of the run being
+// continued, and the operator's follow-up instruction when there is one.
+//
+// The system prompt is taken from the config rather than from the log because
+// no log records one (internal/resume never yields a system message): the
+// prompt is the current config's business, so editing it between the two runs
+// is how an operator steers the continuation.
+//
+// CONTRACT: the instruction is sent VERBATIM as the last user message. The
+// config's `prompt` template is deliberately NOT applied to it - the template
+// shaped the ORIGINAL task, which the log already carries as the first user
+// message, and re-rendering it around a follow-up would send the model a
+// second copy of the framing it has been reading all along.
+func resumeHistory(cfg *config.Config, replay *resume.Replay, instruction string) []llm.Message {
+	history := make([]llm.Message, 0, len(replay.Messages)+2)
+	if cfg.SystemPrompt != "" {
+		history = append(history, llm.Message{Role: llm.RoleSystem, Content: cfg.SystemPrompt})
+	}
+	history = append(history, replay.Messages...)
+	if instruction != "" {
+		history = append(history, llm.Message{Role: llm.RoleUser, Content: instruction})
+	}
+	return history
+}
+
+// logRunStart writes the run's opening event, naming the log it continued when
+// there was one.
+//
+// CONTRACT (docs/contracts/jsonl-events.md): a resumed run writes run_start
+// with the three v1.9 origin fields and a normal run writes none of them, so
+// absence keeps meaning "this run started from nothing" - including in every
+// log written before the fields existed.
+func logRunStart(agent *loop.Loop, cfg *config.Config, task string, resumed *session.Resumed) {
+	if resumed == nil {
+		agent.Session.RunStart(cfg.Model, cfg.Provider.Identity(), task)
+		return
+	}
+	agent.Session.RunStartResumed(cfg.Model, cfg.Provider.Identity(), task, *resumed)
 }
 
 // openingHistory builds the one-shot conversation `run` starts from: the
@@ -2162,6 +2312,16 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		// of silently ignoring them. Checked before the config is loaded so
 		// the reported problem is the one the operator can act on.
 		_, _ = fmt.Fprintf(stderr, "amele chat takes no task arguments (got %q); use `amele run` for a one-shot task\n", strings.Join(parsed.rest, " "))
+		return ExitConfigError
+	}
+	if parsed.resume != "" {
+		// The flag exists on this command only to make this sentence
+		// possible. A conversation is continued by having it - the REPL keeps
+		// its own history - and a chat log is refused by internal/resume
+		// anyway, since "interactive chat" is not a task to finish.
+		// CONTRACT: exit 2, like every other usage error, before anything is
+		// loaded.
+		_, _ = fmt.Fprintln(stderr, "chat has no --resume")
 		return ExitConfigError
 	}
 
