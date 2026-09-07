@@ -1974,12 +1974,16 @@ func TestProviderFallbackStripsCarriersAcrossIdentities(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Turn 1 answers with a tool call carrying reasoning; turn 2 fails.
+			// The wire key is set explicitly (WithReasoning only fills the
+			// payload) because the field travels WITH the payload and must be
+			// dropped with it: echoing a carrier under a key the new family
+			// does not spell is the same mistake as echoing the carrier.
+			answer := llm.ToolCallResponse("c1", "echo_tool", `{"stdin": "ping"}`, usage(10, 5)).
+				WithReasoning(carrier)
+			answer.Message.ReasoningField = "reasoning_content"
 			primary := &llm.Fake{
-				Responses: []llm.Response{
-					llm.ToolCallResponse("c1", "echo_tool", `{"stdin": "ping"}`, usage(10, 5)).
-						WithReasoning(carrier),
-				},
-				Errs: []error{nil, providerErr("502")},
+				Responses: []llm.Response{answer},
+				Errs:      []error{nil, providerErr("502")},
 			}
 			backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("done", usage(10, 5))}}
 
@@ -2004,14 +2008,35 @@ func TestProviderFallbackStripsCarriersAcrossIdentities(t *testing.T) {
 					t.Errorf("assistant message carrier present = %v, want %v (%q)",
 						has, tc.wantCarriers, m.Reasoning)
 				}
+				if hasField := m.ReasoningField != ""; hasField != tc.wantCarriers {
+					t.Errorf("assistant message carrier key present = %v, want %v (%q)",
+						hasField, tc.wantCarriers, m.ReasoningField)
+				}
 			}
 			if assistants != 1 {
 				t.Fatalf("assistant messages in the fallback's history = %d, want 1", assistants)
 			}
-			// The caller's history and the primary's own request must be
-			// untouched: stripping copies, it never edits in place.
-			if len(primary.Requests[0].Messages) == 0 {
-				t.Fatal("primary saw no messages")
+			// The history the PRIMARY was already sent must be untouched:
+			// stripping copies, it never edits the backing array - which
+			// would rewrite a turn the session log has already recorded.
+			// Requests[1] is the failed second turn, the first one whose
+			// history contains the assistant message.
+			if len(primary.Requests) != 2 {
+				t.Fatalf("primary requests = %d, want 2", len(primary.Requests))
+			}
+			var checked bool
+			for _, m := range primary.Requests[1].Messages {
+				if m.Role != llm.RoleAssistant {
+					continue
+				}
+				checked = true
+				if string(m.Reasoning) != string(carrier) || m.ReasoningField != "reasoning_content" {
+					t.Errorf("the primary's own history was rewritten: %q / %q",
+						m.Reasoning, m.ReasoningField)
+				}
+			}
+			if !checked {
+				t.Fatal("the primary's second request carried no assistant message")
 			}
 		})
 	}
@@ -2132,5 +2157,52 @@ func TestProviderFallbackProgressLine(t *testing.T) {
 	}
 	if !reflect.DeepEqual(*events, want) {
 		t.Errorf("progress events:\n got %q\nwant %q", *events, want)
+	}
+}
+
+// TestNonProviderErrorNeverFallsBack pins the OTHER half of the fallback
+// guard. Only llm.ErrProvider warrants a second endpoint: a failure that did
+// not come off the wire (a bug in our own request assembly, a tool registry
+// error, anything a client returns unwrapped) says nothing about the
+// endpoint's health, so re-asking somebody else would spend a second quota to
+// reproduce the same fault - and would hide it behind a fallback line in the
+// log. TestProviderFallbackIgnoresContextFailures does NOT cover this: its
+// error DOES wrap ErrProvider, and it pins the ctx-first ordering instead.
+func TestNonProviderErrorNeverFallsBack(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primary := &llm.Fake{Errs: []error{errors.New("boom")}}
+	backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Session = w
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+	res, err := l.Run(context.Background(), "task")
+	if err == nil {
+		t.Fatal("expected the primary's error")
+	}
+	// Propagated as-is: the loop neither swallows it nor re-labels it as a
+	// provider outage.
+	if errors.Is(err, llm.ErrProvider) {
+		t.Errorf("a non-provider error must not become one: %v", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("error = %v, want the primary's own text", err)
+	}
+	if res.Fallbacks != 0 {
+		t.Errorf("Result.Fallbacks = %d, want 0", res.Fallbacks)
+	}
+	if len(backup.Requests) != 0 {
+		t.Errorf("fallback was asked %d times, want 0", len(backup.Requests))
+	}
+	for _, ev := range sessionEvents(t, w) {
+		if ev.Type == "provider_fallback" {
+			t.Errorf("a switch was logged that never happened: %+v", ev)
+		}
 	}
 }
