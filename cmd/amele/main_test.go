@@ -5246,8 +5246,8 @@ func TestE2EResumeVerboseNote(t *testing.T) {
 		}
 		// The log carries no reasoning (log_reasoning is off by default), so
 		// the verdict is "not restored" even though provider and model match.
-		want := fmt.Sprintf("amele: resuming %s: 1 turns of test-model on openai; "+
-			"0 pending tool call(s); reasoning carriers not restored", logPath)
+		want := fmt.Sprintf("amele: resuming %s: 1 turn of test-model on openai; "+
+			"0 pending tool calls; reasoning carriers not restored", logPath)
 		if !strings.Contains(stderr, want) {
 			t.Errorf("stderr = %q, want it to carry %q", stderr, want)
 		}
@@ -5266,7 +5266,7 @@ func TestE2EResumeVerboseNote(t *testing.T) {
 		if code != ExitOK {
 			t.Fatalf("exit %d, stderr: %s", code, stderr)
 		}
-		if !strings.Contains(stderr, "1 pending tool call(s)") {
+		if !strings.Contains(stderr, "1 pending tool call;") {
 			t.Errorf("stderr = %q, want it to count the unanswered call", stderr)
 		}
 	})

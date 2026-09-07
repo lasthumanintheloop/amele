@@ -1112,9 +1112,12 @@ func mapGeminiFinishReason(reason string) (string, error) {
 		// table explains on the 4xx path - the API can report it EITHER way, and
 		// only the error table would see the 4xx one. amele echoes the raw parts
 		// array precisely so neither can happen (gemContent.MarshalJSON), which
-		// makes this amele's bug rather than the operator's; and a turn that
-		// carried a plausible-looking answer alongside it would otherwise exit 0.
-		return "", fmt.Errorf("%w: the model's step is missing a thought signature (finish reason MISSING_THOUGHT_SIGNATURE); amele echoes thought signatures automatically - this is a bug; please report it with the session log", ErrProvider)
+		// makes this amele's bug rather than the operator's - with the one
+		// legitimate exception the 4xx table names too: a resumed run whose
+		// log carried no reasoning carrier replays without signatures by
+		// design. A turn that carried a plausible-looking answer alongside it
+		// would otherwise exit 0.
+		return "", fmt.Errorf("%w: the model's step is missing a thought signature (finish reason MISSING_THOUGHT_SIGNATURE); a resumed run replays without signatures when its log carried no reasoning carrier (log_reasoning off, a changed model or provider, or a fallback); otherwise amele echoes thought signatures automatically - this is a bug; please report it with the session log", ErrProvider)
 	case "OTHER", "FINISH_REASON_UNSPECIFIED":
 		// The API's own "something went wrong / nothing to say" values. Neither
 		// describes a finished answer, and both can arrive with text attached.

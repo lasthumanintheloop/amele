@@ -2107,9 +2107,19 @@ func logResumeNote(stderr io.Writer, parsed agentArgs, replay *resume.Replay, se
 	if replay.Carriers {
 		carriers = "restored"
 	}
-	note := fmt.Sprintf("resuming %s: %d turns of %s on %s; %d pending tool call(s); reasoning carriers %s",
-		parsed.resume, replay.LastTurn, replay.Model, replay.Provider, len(replay.Pending), carriers)
+	note := fmt.Sprintf("resuming %s: %d %s of %s on %s; %d pending %s; reasoning carriers %s",
+		parsed.resume, replay.LastTurn, pluralNoun(replay.LastTurn, "turn"), replay.Model, replay.Provider,
+		len(replay.Pending), pluralNoun(len(replay.Pending), "tool call"), carriers)
 	_, _ = fmt.Fprintf(stderr, "amele: %s\n", safeForTerminal(secrets.Redact(note), maxProgressLine))
+}
+
+// pluralNoun returns noun for a count of one and noun+"s" otherwise, so the
+// human-facing lines read "1 turn" and "2 turns" like the summary line does.
+func pluralNoun(n int, noun string) string {
+	if n == 1 {
+		return noun
+	}
+	return noun + "s"
 }
 
 // openingHistory builds the one-shot conversation `run` starts from: the

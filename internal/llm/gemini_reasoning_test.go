@@ -394,7 +394,7 @@ const (
 	adviceGemThinkingBoth   = "set only one of provider.reasoning.effort or budget_tokens"
 	adviceGemCannotDisable  = "this model cannot disable thinking; remove reasoning.effort: none"
 	adviceGemUnknownField   = "the gemini API rejects unknown fields; if this key came from provider.params, remove it"
-	adviceGemMissingSigTurn = "amele echoes thought signatures automatically - this is a bug; please report it with the session log"
+	adviceGemMissingSigTurn = "a resumed run replays without signatures when its log carried no reasoning carrier (log_reasoning off, a changed model or provider, or a fallback); otherwise amele echoes thought signatures automatically - this is a bug; please report it with the session log"
 )
 
 // TestGemini400AdviceForKnownSignatures: a recognized 400 keeps the API's own

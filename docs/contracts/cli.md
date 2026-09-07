@@ -372,7 +372,7 @@ With **`-v`**, a resumed run prints one line to stderr before its first turn,
 saying what came back:
 
 ```
-amele: resuming out/item/run-1.jsonl: 3 turns of claude-sonnet-4 on anthropic; 1 pending tool call(s); reasoning carriers restored
+amele: resuming out/item/run-1.jsonl: 3 turns of claude-sonnet-4 on anthropic; 1 pending tool call; reasoning carriers restored
 ```
 
 The verdict is `restored` or `not restored`; the line is redacted and clipped
