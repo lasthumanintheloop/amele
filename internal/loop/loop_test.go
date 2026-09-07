@@ -1777,3 +1777,360 @@ func TestParallelDispatchKeepsTruncationFlag(t *testing.T) {
 		t.Errorf("result %q was re-cut; the ceiling is a bound, not a rewrite", results[1].Result)
 	}
 }
+
+// providerErr builds an error shaped like the one every real client returns
+// for an endpoint-side failure: wrapped in llm.ErrProvider, which is the ONLY
+// signal the loop uses to decide a fallback is warranted.
+func providerErr(text string) error {
+	return fmt.Errorf("%w: %s", llm.ErrProvider, text)
+}
+
+// sessionEvents reads back every event a writer logged, in order. It is the
+// whole-log counterpart of toolResultEvents, which filters to one type.
+func sessionEvents(t *testing.T, w *session.Writer) []session.Event {
+	t.Helper()
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []session.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var ev session.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("invalid JSONL line %q: %v", line, err)
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+// TestProviderFallbackSwitchesOnProviderError is the headline case: the
+// primary endpoint fails, the run moves to the next backend and finishes
+// there, and the log says so - which is the whole point of the feature, since
+// a cron job that silently answered from a different model would be worse than
+// one that failed.
+func TestProviderFallbackSwitchesOnProviderError(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	primary := &llm.Fake{Errs: []error{providerErr("503 upstream unavailable")}}
+	backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(10, 5))}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Session = w
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+	res, err := l.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.FinalText != "answer" {
+		t.Errorf("final text = %q, want %q", res.FinalText, "answer")
+	}
+	if res.Fallbacks != 1 {
+		t.Errorf("Result.Fallbacks = %d, want 1", res.Fallbacks)
+	}
+	// The fallback must be asked for its OWN model, not the primary's.
+	if len(backup.Requests) != 1 {
+		t.Fatalf("fallback requests = %d, want 1", len(backup.Requests))
+	}
+	if got := backup.Requests[0].Model; got != "backup-model" {
+		t.Errorf("fallback request model = %q, want %q", got, "backup-model")
+	}
+
+	events := sessionEvents(t, w)
+	checkEventTypes(t, events, "run_start", "provider_fallback", "llm_response")
+	checkFallbackEvent(t, events[1])
+	// The turn that a DIFFERENT backend served must name it; a run that never
+	// fell back keeps writing the bytes it always did (Task 2's difference
+	// rule), which is why these keys are only expected here.
+	if events[2].Model != "backup-model" || events[2].Provider != "anthropic" {
+		t.Errorf("llm_response identity = %q/%q, want backup-model/anthropic",
+			events[2].Model, events[2].Provider)
+	}
+}
+
+// checkEventTypes asserts the log holds exactly the given event types, in
+// order. It is a helper rather than an inline loop so the fallback tests stay
+// under the gocyclo ceiling.
+func checkEventTypes(t *testing.T, events []session.Event, want ...string) {
+	t.Helper()
+	if len(events) != len(want) {
+		t.Fatalf("event count = %d, want %d (%+v)", len(events), len(want), events)
+	}
+	for i, w := range want {
+		if events[i].Type != w {
+			t.Errorf("event[%d] type = %q, want %q", i, events[i].Type, w)
+		}
+	}
+}
+
+// checkFallbackEvent asserts the provider_fallback line spells out both ends of
+// the move: an operator reading it must not need the config that produced it.
+func checkFallbackEvent(t *testing.T, sw session.Event) {
+	t.Helper()
+	if sw.FromBackend == nil || *sw.FromBackend != 0 || sw.ToBackend == nil || *sw.ToBackend != 1 {
+		t.Errorf("provider_fallback ordinals = %v -> %v, want 0 -> 1", sw.FromBackend, sw.ToBackend)
+	}
+	if sw.Turn != 1 {
+		t.Errorf("provider_fallback turn = %d, want 1", sw.Turn)
+	}
+	if sw.FromModel != "test-model" || sw.ToModel != "backup-model" {
+		t.Errorf("provider_fallback models = %q -> %q", sw.FromModel, sw.ToModel)
+	}
+	if sw.FromProvider != "openai" || sw.ToProvider != "anthropic" {
+		t.Errorf("provider_fallback providers = %q -> %q", sw.FromProvider, sw.ToProvider)
+	}
+	if !strings.Contains(sw.Error, "503 upstream unavailable") {
+		t.Errorf("provider_fallback error = %q, want the provider's text", sw.Error)
+	}
+}
+
+// TestProviderFallbackExhaustedPropagatesLastError: when the last backend
+// fails too there is nothing left to try, and the error the operator sees must
+// be the one the LAST endpoint reported - the primary's is already in the log,
+// and repeating it would send the reader to a machine that is not the one that
+// finally refused.
+func TestProviderFallbackExhaustedPropagatesLastError(t *testing.T) {
+	primary := &llm.Fake{Errs: []error{providerErr("primary down")}}
+	backup := &llm.Fake{Errs: []error{providerErr("backup down")}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+	res, err := l.Run(context.Background(), "task")
+	if !errors.Is(err, llm.ErrProvider) {
+		t.Fatalf("want ErrProvider, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "backup down") {
+		t.Errorf("error = %v, want the LAST backend's failure", err)
+	}
+	if res.Fallbacks != 1 {
+		t.Errorf("Result.Fallbacks = %d, want 1", res.Fallbacks)
+	}
+}
+
+// cancelThenFailProvider cancels the run and then reports a provider error,
+// which is exactly what a real client does when a SIGINT kills an in-flight
+// request: the transport error IS wrapped in ErrProvider, but the cause is
+// ours, not the endpoint's.
+type cancelThenFailProvider struct {
+	cancel context.CancelFunc
+}
+
+func (p *cancelThenFailProvider) Chat(context.Context, llm.Request) (*llm.Response, error) {
+	p.cancel()
+	return nil, providerErr("connection reset")
+}
+
+// TestProviderFallbackIgnoresContextFailures: a run the operator (or the run
+// timeout) killed must not spend a second endpoint's quota re-asking the same
+// question. The context mapping runs first and stays unchanged.
+func TestProviderFallbackIgnoresContextFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+	l := newLoop(t, &llm.Fake{}, Limits{})
+	l.Provider = &cancelThenFailProvider{cancel: cancel}
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+	res, err := l.Run(ctx, "task")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("want a context error, got %v", err)
+	}
+	if errors.Is(err, ErrBudgetExceeded) {
+		t.Errorf("cancellation must not be a budget error: %v", err)
+	}
+	if res.Fallbacks != 0 {
+		t.Errorf("Result.Fallbacks = %d, want 0", res.Fallbacks)
+	}
+	if len(backup.Requests) != 0 {
+		t.Errorf("fallback was asked %d times, want 0", len(backup.Requests))
+	}
+}
+
+// TestProviderFallbackStripsCarriersAcrossIdentities: reasoning carriers are
+// provider-scoped. Handing a DeepSeek reasoning_content hash to Anthropic (or
+// an Anthropic signature to anyone else) is at best meaningless and at worst a
+// 400, so a switch that crosses provider families drops them - and a switch
+// inside one family must NOT, because that family may require them back.
+func TestProviderFallbackStripsCarriersAcrossIdentities(t *testing.T) {
+	carrier := json.RawMessage(`"opaque-signed-blob"`)
+
+	cases := []struct {
+		name         string
+		toIdentity   string
+		wantCarriers bool
+	}{
+		{name: "across families", toIdentity: "anthropic", wantCarriers: false},
+		{name: "same family", toIdentity: "openai/deepseek", wantCarriers: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Turn 1 answers with a tool call carrying reasoning; turn 2 fails.
+			primary := &llm.Fake{
+				Responses: []llm.Response{
+					llm.ToolCallResponse("c1", "echo_tool", `{"stdin": "ping"}`, usage(10, 5)).
+						WithReasoning(carrier),
+				},
+				Errs: []error{nil, providerErr("502")},
+			}
+			backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("done", usage(10, 5))}}
+
+			l := newLoop(t, primary, Limits{})
+			l.Identity = "openai/deepseek"
+			l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: tc.toIdentity}}
+
+			if _, err := l.Run(context.Background(), "task"); err != nil {
+				t.Fatal(err)
+			}
+			if len(backup.Requests) != 1 {
+				t.Fatalf("fallback requests = %d, want 1", len(backup.Requests))
+			}
+			var assistants int
+			for _, m := range backup.Requests[0].Messages {
+				if m.Role != llm.RoleAssistant {
+					continue
+				}
+				assistants++
+				has := len(m.Reasoning) > 0
+				if has != tc.wantCarriers {
+					t.Errorf("assistant message carrier present = %v, want %v (%q)",
+						has, tc.wantCarriers, m.Reasoning)
+				}
+			}
+			if assistants != 1 {
+				t.Fatalf("assistant messages in the fallback's history = %d, want 1", assistants)
+			}
+			// The caller's history and the primary's own request must be
+			// untouched: stripping copies, it never edits in place.
+			if len(primary.Requests[0].Messages) == 0 {
+				t.Fatal("primary saw no messages")
+			}
+		})
+	}
+}
+
+// TestProviderFallbackCarrierStrippingCopies: the strip must not reach back
+// into the slice the primary already sent - a mutated backing array would
+// rewrite history that is already in the log.
+func TestProviderFallbackCarrierStrippingCopies(t *testing.T) {
+	carrier := json.RawMessage(`"signed"`)
+	msgs := []llm.Message{
+		{Role: llm.RoleUser, Content: "task"},
+		{Role: llm.RoleAssistant, Content: "thinking", Reasoning: carrier, ReasoningField: "reasoning_content"},
+	}
+	out := stripCarriers(msgs)
+	if len(out[1].Reasoning) != 0 || out[1].ReasoningField != "" {
+		t.Errorf("carrier survived the strip: %+v", out[1])
+	}
+	if len(msgs[1].Reasoning) == 0 || msgs[1].ReasoningField == "" {
+		t.Errorf("stripCarriers mutated its input: %+v", msgs[1])
+	}
+	if out[0].Content != "task" {
+		t.Errorf("non-assistant message altered: %+v", out[0])
+	}
+}
+
+// TestProviderFallbackCountsTheRetriedTurn: a fallback attempt is an ordinary
+// turn. It costs a round-trip, so it must be counted and it must be refused
+// when max_turns has nothing left - a budget the operator set is not something
+// a second endpoint may overspend.
+func TestProviderFallbackCountsTheRetriedTurn(t *testing.T) {
+	t.Run("budget allows the retry", func(t *testing.T) {
+		primary := &llm.Fake{Errs: []error{providerErr("down")}}
+		backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+		l := newLoop(t, primary, Limits{MaxTurns: 2})
+		l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+		res, err := l.Run(context.Background(), "task")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Turns != 2 {
+			t.Errorf("Turns = %d, want 2 (the failed attempt plus the retry)", res.Turns)
+		}
+	})
+
+	t.Run("budget forbids the retry", func(t *testing.T) {
+		primary := &llm.Fake{Errs: []error{providerErr("down")}}
+		backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+		l := newLoop(t, primary, Limits{MaxTurns: 1})
+		l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+		_, err := l.Run(context.Background(), "task")
+		if !errors.Is(err, ErrBudgetExceeded) {
+			t.Fatalf("want ErrBudgetExceeded, got %v", err)
+		}
+		if len(backup.Requests) != 0 {
+			t.Errorf("fallback was asked %d times, want 0", len(backup.Requests))
+		}
+	})
+}
+
+// TestProviderFallbackIsSticky: once a backend has failed the run stays on the
+// next one - for the rest of the turn loop AND for the rest of the session.
+// Re-probing a known-down endpoint on every turn would pay its timeout again
+// and again, which is the cost the fallback exists to avoid.
+func TestProviderFallbackIsSticky(t *testing.T) {
+	primary := &llm.Fake{Errs: []error{providerErr("down")}}
+	backup := &llm.Fake{Responses: []llm.Response{
+		llm.ToolCallResponse("c1", "echo_tool", `{"stdin": "ping"}`, usage(10, 5)),
+		llm.TextResponse("done", usage(10, 5)),
+		llm.TextResponse("second call", usage(10, 5)),
+	}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	if len(primary.Requests) != 1 || len(backup.Requests) != 2 {
+		t.Fatalf("requests after the first run: primary %d, fallback %d; want 1 and 2",
+			len(primary.Requests), len(backup.Requests))
+	}
+
+	// A second RunMessages on the same Loop is what chat does per user turn:
+	// the switch must survive it rather than restarting on the dead endpoint.
+	if _, err := l.RunMessages(context.Background(), []llm.Message{{Role: llm.RoleUser, Content: "again"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(primary.Requests) != 1 {
+		t.Errorf("primary was re-probed: %d requests, want 1", len(primary.Requests))
+	}
+	if len(backup.Requests) != 3 {
+		t.Errorf("fallback requests = %d, want 3", len(backup.Requests))
+	}
+}
+
+// TestProviderFallbackProgressLine: the operator watching a -v run must see
+// the switch happen. A run that quietly answered from a different model would
+// be indistinguishable from one that never had trouble.
+func TestProviderFallbackProgressLine(t *testing.T) {
+	primary := &llm.Fake{Errs: []error{providerErr("down")}}
+	backup := &llm.Fake{Responses: []llm.Response{llm.TextResponse("answer", usage(1, 1))}}
+
+	l := newLoop(t, primary, Limits{})
+	l.Identity = "openai"
+	l.Fallbacks = []Backend{{Provider: backup, Model: "backup-model", Identity: "anthropic"}}
+	events := recordProgress(l)
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"turn 1: provider error on test-model (openai); falling back to backup-model (anthropic)",
+		"turn 2: final answer (1 tokens)",
+	}
+	if !reflect.DeepEqual(*events, want) {
+		t.Errorf("progress events:\n got %q\nwant %q", *events, want)
+	}
+}

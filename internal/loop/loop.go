@@ -134,6 +134,34 @@ type Tuning struct {
 	Extra map[string]json.RawMessage
 }
 
+// Backend is one provider target the run can talk to: the client, the model
+// name it is asked for, the request knobs tuned for it, and the family it
+// belongs to. It is the unit of provider.fallback - a chain entry is a whole
+// target, not a spare model name, because a second endpoint generally needs
+// its own client, its own model id and its own tuning.
+//
+// The zero value is not usable; Provider and Model are always set by the
+// caller that builds the chain.
+type Backend struct {
+	// Provider is the client that speaks to this target.
+	Provider llm.Provider
+	// Model is the model id THIS target is asked for.
+	Model string
+	// Tuning holds the request knobs for this target; the zero value asks for
+	// nothing, exactly as it does on Loop.
+	Tuning Tuning
+	// Identity names the backend's wire family - "openai", "openai/<dialect>",
+	// "anthropic", "gemini", "gemini/vertex". It is what run_start.provider
+	// records, and it is what decides whether reasoning carriers survive a
+	// switch (see stripCarriers).
+	//
+	// CONTRACT: it names the FAMILY, not an endpoint. base_url is deliberately
+	// excluded: it is operator-supplied text that can carry a host, a path and
+	// occasionally a key-bearing query string, and the session log is not the
+	// place for it.
+	Identity string
+}
+
 // Loop wires one run's collaborators together.
 type Loop struct {
 	Provider llm.Provider
@@ -249,11 +277,33 @@ type Loop struct {
 	Model        string
 	SystemPrompt string
 
-	// Identity is the primary backend's identity string, written to
-	// run_start.provider so a log says which endpoint served the run and not
-	// only which model was asked for. Empty writes no key, which is what a
-	// caller that never set it gets.
+	// Identity is the primary backend's wire family (see Backend.Identity),
+	// written to run_start.provider so a log says which KIND of backend served
+	// the run and not only which model was asked for. Empty writes no key,
+	// which is what a caller that never set it gets.
 	Identity string
+
+	// Fallbacks are the alternate backends, in the order the config listed
+	// them: the run moves to Fallbacks[0] when the primary fails with a
+	// provider error, to Fallbacks[1] when that one does too, and so on. Nil
+	// (the default) means a provider error ends the run, which is the
+	// pre-v0.3 behavior.
+	Fallbacks []Backend
+
+	// active indexes the backend currently serving the run: 0 is the primary
+	// (Provider/Model/Tuning/Identity), n is Fallbacks[n-1]. It only ever
+	// moves forward - a backend that failed is never re-probed, because
+	// re-probing would pay its timeout again on every remaining turn, which is
+	// the cost the fallback exists to avoid.
+	//
+	// CONTRACT: it is STICKY ACROSS RunMessages CALLS. A chat session that
+	// fell back on one user turn keeps the fallback for the rest of the
+	// session rather than returning to a known-dead endpoint at every prompt.
+	//
+	// CONCURRENCY: read and written only from the goroutine running
+	// RunMessages, which is also the only goroutine that calls the provider;
+	// one Loop must not drive two concurrent runs (it never has).
+	active int
 }
 
 // Result summarizes a completed (or aborted) run.
@@ -275,6 +325,12 @@ type Result struct {
 	// being set (see llm.Response.SchemaEnforcementDropped). The loop only
 	// aggregates the flag; cmd decides whether and how to warn the operator.
 	SchemaEnforcementDropped bool
+	// Fallbacks counts how many times the run moved along the fallback chain.
+	// It is a count of SWITCHES, not of failed attempts: 1 means the answer
+	// (or the final failure) came from Fallbacks[0]. It is carried on the
+	// failure paths too, so a run that exhausted the chain still reports how
+	// far it got.
+	Fallbacks int
 }
 
 // Run executes the loop for one user task: it builds the opening history
@@ -338,24 +394,37 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 		// claim fewer provider round-trips than were actually made.
 		res.Turns = turn
 
-		resp, err := l.Provider.Chat(ctx, llm.Request{
-			Model:          l.Model,
+		// Read once per turn: the backend can change mid-run (switchBackend),
+		// and the request, the log line and the failure message must all name
+		// the same one.
+		b := l.backend()
+		resp, err := b.Provider.Chat(ctx, llm.Request{
+			Model:          b.Model,
 			Messages:       messages,
 			Tools:          l.Registry.Defs(),
 			ResponseFormat: l.ResponseFormat,
 			// The tuning knobs are repeated on every turn by design - see
 			// Tuning's contract note.
-			MaxOutputTokens: l.Tuning.MaxOutputTokens,
-			Reasoning:       l.Tuning.Reasoning,
-			Temperature:     l.Tuning.Temperature,
-			TopP:            l.Tuning.TopP,
-			Extra:           l.Tuning.Extra,
+			MaxOutputTokens: b.Tuning.MaxOutputTokens,
+			Reasoning:       b.Tuning.Reasoning,
+			Temperature:     b.Tuning.Temperature,
+			TopP:            b.Tuning.TopP,
+			Extra:           b.Tuning.Extra,
 		})
 		if err != nil {
 			// A provider failure caused by our own context ending is not a
-			// provider outage - map it to the context cause instead.
+			// provider outage - map it to the context cause instead. This
+			// check stays FIRST: a run the operator killed must not spend a
+			// second endpoint's quota re-asking the same question.
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return finish(wrapContextErr(ctxErr))
+			}
+			if next, ok := l.switchBackend(err, res, turn, messages); ok {
+				// The retry is an ordinary turn: the loop head re-counts it
+				// and re-checks max_turns, so a budget the operator set is
+				// never overspent by the chain.
+				messages = next
+				continue
 			}
 			return finish(err)
 		}
@@ -386,6 +455,10 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 			CacheReadTokens: resp.Usage.CacheReadTokens, CacheWriteTokens: resp.Usage.CacheWriteTokens,
 			FinishReason: resp.FinishReason, ReasoningBytes: len(resp.Message.Reasoning),
 			Reasoning: string(resp.Message.Reasoning),
+			// Passed unconditionally: the writer logs them only when they
+			// differ from what run_start announced, so a run that never fell
+			// back writes the bytes it always did.
+			Model: b.Model, Provider: b.Identity,
 		})
 
 		if err := l.checkTokenBudget(res, resp); err != nil {
@@ -531,6 +604,91 @@ func (l *Loop) checkTokenBudget(res *Result, resp *llm.Response) error {
 		return fmt.Errorf("%w: max_tokens (%d) exceeded: %d used", ErrBudgetExceeded, l.Limits.MaxTokens, res.Usage.Total())
 	}
 	return nil
+}
+
+// backend returns the target currently serving the run: the Loop's own
+// Provider/Model/Tuning/Identity while active is 0, and the corresponding
+// chain entry afterwards.
+//
+// The primary lives in the Loop's own fields rather than in Fallbacks[0] so
+// that every caller and test written before fallbacks existed keeps working
+// unchanged: a Loop with no chain behaves exactly as it always did.
+func (l *Loop) backend() Backend {
+	if l.active == 0 {
+		return Backend{Provider: l.Provider, Model: l.Model, Tuning: l.Tuning, Identity: l.Identity}
+	}
+	return l.Fallbacks[l.active-1]
+}
+
+// switchBackend decides whether the failure that just ended a turn warrants
+// moving to the next backend. It returns the history the retry must use and
+// true when the run switched; on false the caller returns the error as it
+// always did.
+//
+// It is a separate function rather than an inline block because RunMessages is
+// already at the cyclomatic ceiling, and because "may this failure fall back"
+// is one question with one answer worth reading on its own.
+//
+// CONTRACT: only a provider-side failure falls back, and only while the chain
+// has an untried entry left. Budget, permission and output-schema failures
+// never wrap llm.ErrProvider, so a second endpoint can never be asked to
+// repeat a run that the operator's own limits - or a refused tool call -
+// stopped on purpose.
+func (l *Loop) switchBackend(cause error, res *Result, turn int, messages []llm.Message) ([]llm.Message, bool) {
+	if !errors.Is(cause, llm.ErrProvider) || l.active >= len(l.Fallbacks) {
+		return messages, false
+	}
+
+	from := l.backend()
+	l.active++
+	to := l.backend()
+	res.Fallbacks++
+
+	// The log records the move before the retry is attempted: a run that dies
+	// on the next backend must still show where it went and why.
+	l.Session.ProviderFallback(session.ProviderFallback{
+		Turn: l.TurnBase + turn, From: l.active - 1, To: l.active,
+		FromModel: from.Model, ToModel: to.Model,
+		FromProvider: from.Identity, ToProvider: to.Identity,
+		Error: cause.Error(),
+	})
+	if to.Identity != from.Identity {
+		messages = stripCarriers(messages)
+	}
+	l.progressf("turn %d: provider error on %s (%s); falling back to %s (%s)",
+		l.TurnBase+turn, from.Model, from.Identity, to.Model, to.Identity)
+	return messages, true
+}
+
+// stripCarriers returns a COPY of the history with every assistant message's
+// reasoning carrier removed.
+//
+// CONTRACT: reasoning carriers are provider-scoped. Anthropic signs its
+// thinking blocks, DeepSeek hash-checks its reasoning_content and Gemini
+// carries thought signatures; each is either rejected or meaningless at any
+// other family's endpoint. So a switch that CROSSES families drops them, and a
+// switch inside one family keeps them - that family may require them back
+// byte-for-byte.
+//
+// The copy is not an optimization: the stripped slice must not reach back into
+// the array the previous backend was already sent, which is history the
+// session log has recorded.
+//
+// Caveat, honestly stated: dropping the carrier does not make every history
+// portable. A thinking-enabled Anthropic model can still refuse a last
+// assistant turn that requests tools without its signed block. That ends the
+// run with the provider's own error, which is the truthful outcome - better
+// than echoing a signature the new endpoint cannot verify.
+func stripCarriers(msgs []llm.Message) []llm.Message {
+	out := slices.Clone(msgs)
+	for i := range out {
+		if out[i].Role != llm.RoleAssistant {
+			continue
+		}
+		out[i].Reasoning = nil
+		out[i].ReasoningField = ""
+	}
+	return out
 }
 
 // wrapContextErr maps a context error onto the exit-code contract: only a
