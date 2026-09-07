@@ -11,7 +11,7 @@ The four contract artifacts:
 | Artifact | Surface |
 |----------|---------|
 | [exit-codes.md](exit-codes.md) | The 0..8 process exit code table (v1.2). |
-| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.7). |
+| [jsonl-events.md](jsonl-events.md) | The session log event schema (`v: 1`, doc revision v1.8). |
 | [cli.md](cli.md) | Commands, flags, stdin/stdout/stderr behavior. |
 | [config.schema.json](config.schema.json) | The YAML config schema (JSON Schema, also printed by `amele schema`). |
 
@@ -207,6 +207,19 @@ Within a frozen version, changes must be additive and backwards-compatible:
   premium with no read to recoup it - set `provider.prompt_cache: false`
   there. Not on the `--set` allowlist: it reshapes every request rather than
   retuning one.
+- **2026-09-07 - JSONL v1.8, provider fallback.** `run_start` gains
+  `provider` (the primary backend's identity string: `openai`,
+  `openai/<dialect>`, `anthropic`, `gemini` or `gemini/vertex`; always
+  written from v1.8); `llm_response` gains `model` and `provider`, written
+  ONLY when the turn was served by a different backend than `run_start`
+  names; a new event `provider_fallback` (`turn`, `from`, `to`, `from_model`,
+  `to_model`, `from_provider`, `to_provider`, `error`) records each switch,
+  between the failed turn's position and the next `llm_response`; and
+  `run_end` gains `fallbacks` (switches over the run; absent means 0).
+  Additive: the wire `v` stays `1`, nothing was removed, renamed or
+  re-typed, and a run with no fallback list writes exactly the bytes v1.7
+  wrote plus the one new `run_start.provider` key. Migration: none
+  required; a consumer that ignores unknown events keeps working.
 - **2026-09-07 - config schema: `provider.fallback`.** `provider` gains one
   optional list, `fallback`: up to four complete provider targets, each
   written like the primary block plus its own required `model`, tried in

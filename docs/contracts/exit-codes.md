@@ -18,7 +18,7 @@ via `// CONTRACT:` markers.
 | 2 | config error | The command never got as far as a run: bad usage or a bad config. |
 | 3 | budget exceeded | A configured limit (`limits.max_turns`, `limits.max_tokens`, `limits.timeout`) killed the run. |
 | 4 | permission denied | A tool call was denied **and the run aborted** because of it. |
-| 5 | provider error | The LLM provider or the network failed after the client's retries were exhausted. |
+| 5 | provider error | The LLM provider or the network failed after the client's retries were exhausted - and, when `provider.fallback` is configured, after the fallback list, if any, is exhausted too. |
 | 6 | output schema unmet | `output.schema` is set, the model produced answers, but none validated within the retry budget. |
 | 7 | lock held | `lock: true` is set and another run of this config is in progress; this run did nothing. |
 | 8 | MCP unavailable | a required MCP server failed to start, connect or authenticate (including a missing or refused OAuth credential) |
@@ -108,9 +108,20 @@ run" whenever they see it.
 ### 5 - provider error
 
 Any `llm.ErrProvider`: transport failures, non-2xx API responses, undecodable
-replies - after the HTTP client's own retries are exhausted. Applies to all
+replies - after the HTTP client's own retries are exhausted, and after the
+`provider.fallback` list, if any, is exhausted. Applies to all
 three clients: the OpenAI-compatible one, the native Anthropic one and the
 native Gemini one.
+
+With a fallback chain configured, this code means **every** target failed: the
+error reported is the LAST one's, because that is the endpoint that finally
+refused - the earlier failures are in the session log, each on its own
+`provider_fallback` event (jsonl-events.md). A chain does not change which
+failures fall back either: the whole exit-5 class does, including a 400 or a
+401, so a wrong key or a malformed parameter on the primary moves the run onto
+the backup rather than stopping it. Only the exit-5 class falls back - a budget
+kill (3), a permission abort (4) or an unmet output schema (6) never asks a
+second endpoint to repeat what the operator's own limits stopped on purpose.
 
 ### 6 - output schema unmet
 

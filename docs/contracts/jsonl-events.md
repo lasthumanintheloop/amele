@@ -1,10 +1,11 @@
 # JSONL event schema
 
-**v1.7 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.8 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
 `mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4), the
-opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6) and the
-prompt-cache counts on `llm_response` and `run_end` (v1.7) added
+opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6), the
+prompt-cache counts on `llm_response` and `run_end` (v1.7) and the provider
+identities plus the `provider_fallback` event (v1.8) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
@@ -32,8 +33,8 @@ Every line is one JSON object with three always-present fields:
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `v` | int | Wire schema version. Always `1` for this document - the `v1.7` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
-| `type` | string | Event type: `run_start`, `llm_response`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
+| `v` | int | Wire schema version. Always `1` for this document - the `v1.8` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
+| `type` | string | Event type: `run_start`, `llm_response`, `provider_fallback`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
 All other fields are declared with `omitempty`: **a zero value is omitted**.
@@ -47,6 +48,7 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | Field | Type | Meaning |
 |-------|------|---------|
 | `model` | string | Model identifier the run was started with (after any `--model` override). |
+| `provider` | string | Identity of the backend the run started on: the wire family, narrowed by the variation that changes the request shape - `openai`, `openai/<dialect>` (e.g. `openai/deepseek`), `anthropic`, `gemini` or `gemini/vertex`. Deliberately **not** the `base_url`: a log is pasted into issues and shipped to collectors, and a URL can carry a credential in its query string or name an internal host. The consequence is that two targets on the same family read alike here - the `provider_fallback` event's `from`/`to` index pair is what tells them apart. Every `run`, `chat` and pack invocation of the binary writes it from v1.8 on, so absent means the log predates v1.8 (or was written by an embedder of `internal/session` that named no backend). Since v1.8. |
 | `task` | string | The rendered user task (clipped + redacted, see below). For a chat session this is the fixed label `interactive chat`. |
 
 ### `llm_response` - one per provider round-trip
@@ -63,6 +65,24 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `cache_write_tokens` | int | Input tokens written into the cache on this round-trip (Anthropic `cache_creation_input_tokens`, OpenAI `cache_write_tokens`). A subset of `input_tokens`; absent means 0. Since v1.7. |
 | `reasoning_bytes` | int | Byte length of the provider's reasoning payload for this turn (a DeepSeek `reasoning_content`, Anthropic thinking blocks, an OpenRouter `reasoning_details` array), as amele stored it. Absent means the turn carried no reasoning - or the log predates v1.4. **The reasoning CONTENT is not logged by default**: it is the model's unfiltered scratchpad, it can restate a secret in words the value redactor never sees, and replay does not need it. `log_reasoning: true` opts it in (v1.5, the `reasoning` field below) through the same redact+clip path as every other free-text field; the rationale above is why that is a deliberate data-governance decision rather than a default. This number is what answers "why did that turn cost so much?" - echoed reasoning is billed as input on every later turn, and it answers it whether or not the content is logged. Since v1.4. |
 | `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Written **only** when the config sets `log_reasoning: true` **and** the turn carried a payload, so absence has three readings - the run did not opt in, the turn did no thinking, or the log predates v1.5 - and `reasoning_bytes` is what separates them: a positive `reasoning_bytes` with no `reasoning` means the content was not written (opted out, or a pre-v1.5 log), both absent means the turn carried no reasoning at all. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text - but a **clipped** value is a byte prefix plus the marker and will not parse at all (most visibly for the two array-shaped wires), so a consumer that needs to parse every turn sets `limits.max_logged_field: 0` and keeps the payload whole. Since v1.5. |
+| `model` | string | The model that served **this** turn, written **only** when it differs from `run_start.model` - i.e. after the run moved along `provider.fallback`. Absent means the turn was served by the model `run_start` named (or the log predates v1.8); it never means "unknown". Since v1.8. |
+| `provider` | string | The backend identity that served **this** turn (same vocabulary as `run_start.provider`), written under the same difference rule: present only when it differs from `run_start.provider`. The two keys are independent - a switch to another target on the same wire family writes `model` alone, and a switch to a different family that happens to serve the same model name writes `provider` alone. Since v1.8. |
+
+### `provider_fallback` - the run moved to the next fallback target
+
+Written when a provider-class failure ended a turn and `provider.fallback` had
+an untried entry left (see [docs/providers.md](../providers.md)). One event per
+switch; a run with no chain, or one whose backend never fails that way, never
+writes it.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `turn` | int | The turn whose attempt failed - the same numbering as `llm_response` (see [Turn numbering](#turn-numbering)). That attempt produced no `llm_response`, so this number is a gap in the file's `llm_response` sequence; the retry on the next backend is the turn after it. |
+| `error` | string | The provider failure that caused the switch (clipped + redacted, like every other free-text field - a 4xx body is remote text and has been seen to echo a request header back). |
+| `from` | int | 0-based position of the backend being left: `0` is the primary, `n` is `provider.fallback[n-1]`. **Present including `0`** - it is the common case, and the event is meaningless without it. |
+| `to` | int | 0-based position of the backend being moved to, always `from + 1`: the walk is sequential and never returns. |
+| `from_model` / `to_model` | string | The two ends' model identifiers, spelled out so the line is readable without the config that produced it. |
+| `from_provider` / `to_provider` | string | The two ends' backend identities, same vocabulary as `run_start.provider`. When the two differ, amele also strips the reasoning carriers from the history it re-sends (providers.md). |
 
 ### `tool_call` - the model requested a tool
 
@@ -199,6 +219,7 @@ because the SDK models two of them as plain booleans:
 | `total_tokens` | int | Cumulative input + output tokens. |
 | `cache_read_tokens` | int | Cumulative cache-read input tokens over the run. Absent means 0. Since v1.7. |
 | `mcp_errors` | int | MCP-attributable failures over the whole run (failed connects, lost responses, tool-listing failures). Absent means **0**. Since v1.2. |
+| `fallbacks` | int | Provider switches the run made - the number of `provider_fallback` events in the file. Absent means **0**: the backend `run_start` named served the whole run, the config declared no chain, or the log predates v1.8. In `chat` it is the session total across every exchange. Since v1.8. |
 | `duration_ms` | int | Loop time in milliseconds, **not** process wall clock: `run` measures the agent loop only (config loading and the stdin read are excluded), and `chat` sums the per-exchange loop durations - time idle at the prompt is excluded. |
 
 `run_end` is written for failed runs too - especially for failed runs - with
@@ -217,6 +238,14 @@ truthful partial accounting.
   `ok` false when the reconnect itself failed. The
   orderly shutdown emits a `mcp_disconnect` (reason `run_end`) for every
   still-connected server before `run_end`.
+- A `provider_fallback` sits where the failed attempt's `llm_response` would
+  have been: after the previous turn's events, and before the next
+  `llm_response`, which is the **retry on the new backend and carries the next
+  turn number**. The retry is an ordinary turn - it is counted and re-checked
+  against `max_turns`, so a chain never overspends the operator's budget - and
+  the failed attempt keeps its own number, which no `llm_response` ever uses.
+  With a chain of more than one entry, several `provider_fallback` events can
+  follow one another, each on its own turn number, before any answer arrives.
 - Within a turn: the `llm_response` comes first, then its tool calls. Both
   `tool_call` and `tool_result` events appear in the order the model requested
   the calls in that `llm_response` (the same order as its `tool_call_ids`),
@@ -256,6 +285,13 @@ The counter alone therefore cannot tell the two cases apart: within the file,
 an attempted-but-unanswered turn is distinguishable from an answered one only
 by the **absence of its `llm_response` event**. A consumer that needs answered
 round-trips must count `llm_response` events rather than read `run_end.turns`.
+
+A `provider.fallback` chain adds the same gap *mid-file*: the attempt that
+failed over is counted and numbered, has no `llm_response`, and carries a
+`provider_fallback` event instead - so `turn` values are strictly increasing
+but not contiguous across the `llm_response` events, and the highest `turn`
+can fall short of `run_end.turns` by one per switch plus one for a final
+failed attempt.
 
 ## Clipping and redaction
 
@@ -483,3 +519,61 @@ count the token figure gains a parenthetical, `41.0k tokens (28.0k cached)`
   `{"v":1,"type":"run_end","ts":"2026-09-07T12:00:08Z","cache_read_tokens":28000,"status":"success","exit_code":0,"turns":6,"tool_calls":4,"total_tokens":41000,"duration_ms":34200}`.
   A JSON object's key order carries no meaning and never did here; the position
   is noted only so a reader diffing recorded lines is not surprised by it.
+
+### v1.8 (amele v0.3.0) - provider fallback (additive, `v` stays `1`)
+
+Added one optional field to `run_start` (`provider`), two to `llm_response`
+(`model`, `provider`), one to `run_end` (`fallbacks`), and one new event type,
+`provider_fallback`. Nothing was removed, renamed or re-typed, and no existing
+field changed meaning. A config with no `provider.fallback` list writes exactly
+the bytes v1.7 wrote **plus the one new `run_start.provider` key**.
+
+- `run_start.provider` (string): the identity of the backend the run started
+  on - `openai`, `openai/<dialect>`, `anthropic`, `gemini` or `gemini/vertex`.
+  This is the one line every run's bytes change on. It is written
+  unconditionally because it is the baseline the other two identity keys are a
+  difference from: without it, `llm_response.provider` would be a value with
+  nothing to compare against;
+- `llm_response.model` / `provider` (string, omitted when unchanged): the
+  backend that served THAT turn, written only when it differs from what
+  `run_start` announced. Difference, not repetition - naming the backend on
+  every turn would grow every line of every existing log for no information;
+- `provider_fallback` (new event): one per switch, carrying `turn`, the
+  clipped+redacted `error` that caused it, the 0-based `from`/`to` chain
+  positions, and both ends' `from_model`/`to_model` and
+  `from_provider`/`to_provider`;
+- `run_end.fallbacks` (int, omitted when 0): how many switches the run made.
+
+A whole run, as amele writes it, when the primary is down and one fallback
+entry answers (both targets on the openai wire, so only `model` differs on the
+answering turn):
+
+```
+{"v":1,"type":"run_start","ts":"2026-09-07T03:27:21.387620403Z","model":"test-model","provider":"openai","task":"task"}
+{"v":1,"type":"provider_fallback","ts":"2026-09-07T03:27:21.388554472Z","turn":1,"error":"provider error: retries exhausted: provider error: status 500: upstream is down","from":0,"to":1,"from_model":"test-model","to_model":"backup-model","from_provider":"openai","to_provider":"openai"}
+{"v":1,"type":"llm_response","ts":"2026-09-07T03:27:21.389876916Z","model":"backup-model","turn":2,"content":"from the backup","input_tokens":10,"output_tokens":5,"finish_reason":"stop"}
+{"v":1,"type":"run_end","ts":"2026-09-07T03:27:21.389917017Z","status":"success","exit_code":0,"turns":2,"total_tokens":15,"fallbacks":1,"duration_ms":2}
+```
+
+**Migration:** none required. Concretely:
+
+- an absent `llm_response.model` / `provider` means "the same backend
+  `run_start` named", never "unknown". An absent `run_start.provider` means
+  the log predates v1.8 - the CLI always writes it;
+- `provider_fallback` is a new event type, and the change policy above already
+  requires consumers to ignore unknown types - one that does keeps working and
+  simply cannot see the switch;
+- `from` is present even when it is `0`, which is the common case (the
+  primary). It is a pointer in `session.Event` for exactly that reason: a
+  plain int with `omitempty` would delete the interesting half of most
+  switches;
+- the identities are wire families, not endpoints. Two fallback entries that
+  differ only in `base_url` produce the same `provider` string; `from`/`to`
+  are what distinguish them, and the `base_url` is deliberately absent from
+  the log because it can carry a credential;
+- turn numbers are still strictly increasing, but a failed-over attempt has no
+  `llm_response`, so they are no longer contiguous across `llm_response`
+  events (see [Turn numbering](#turn-numbering));
+- `fallbacks` is a count of switches, not of failures: a target that failed and
+  had no successor left never produces one (the run ends with that provider's
+  error, exit 5).

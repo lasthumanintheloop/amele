@@ -182,11 +182,18 @@ session log.
   amele: turn 3: shell timed out (30.0s)
   amele: turn 3: shell rejected (0.0s)
   amele: turn 3: fs_read error: <message>
+  amele: turn 1: provider error on gpt-4o (openai); falling back to claude-opus-5 (anthropic)
   amele: turn 4: final answer (312 tokens)
   ```
 
   The turn number is the one the session log records; the token count is what
-  the model produced in that turn. A tool call that ran but did not work is
+  the model produced in that turn. The `provider error ... falling back` line
+  (additive, 2026-09-07) is the only one that reports something the run
+  survived rather than something it did: it appears once per
+  `provider.fallback` switch, names both ends as `<model> (<identity>)`, and
+  is how an operator notices that a run answered from the backup - the same
+  switch the session log records as a `provider_fallback` event. The turn it
+  names is the attempt that failed; the retry is the next turn. A tool call that ran but did not work is
   named as such instead of `ok`: `exit N` (the command failed), `timed out`
   (the tool's own timeout fired), `aborted` (the run ended under the command)
   and `rejected` (the shell policy refused the command). A trailing
@@ -465,6 +472,21 @@ up yet.
   wire, where the endpoint decides on its own and the key is a config error:
   `prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)`.
   Existing reports gain exactly that one line.
+- **Fallback rows** (additive, 2026-09-07): when the config declares
+  `provider.fallback`, the `MODEL & PROVIDER` block closes with one row per
+  entry, in the order the run will walk it:
+  `fallback 1:      "claude-opus-5" via anthropic (default: api.anthropic.com)`,
+  `fallback 2:      "deepseek-v4" via openai/deepseek "https://api.deepseek.com/v1"`.
+  The number is 1-based (the YAML list's position; the session log's
+  `provider_fallback` event counts the same entries 0-based, where 0 is the
+  primary). The three pieces are the entry's own `model`, the backend identity
+  the session log names it by, and where its requests go - its `base_url`
+  quoted, or the note naming the host its wire defaults to
+  (`(unset)` on the openai wire, which has no default host). A config without
+  the key gains no row at all. Deliberately absent: a per-entry mapping block.
+  Each entry's `${VAR}`s appear in `REQUIREMENTS` like every other variable, so
+  a fallback whose credential is unset is visible **before** the primary goes
+  down, not during.
 - **Requirements section** (additive, 2026-08-12): the report carries a
   `REQUIREMENTS` block listing every `${VAR}` the config references (✓ set /
   ✗ MISSING), every executable the config needs on `PATH` (✓ found /
