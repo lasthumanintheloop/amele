@@ -267,3 +267,22 @@ All of the above is recorded when `session_dir` is set (one JSONL file per run
 or chat session). Note the redaction caveat before interpolating non-secret
 variables like `${HOME}`: see
 [docs/session-logging.md](session-logging.md).
+
+A `tool_result` whose text was cut before the model read it carries
+`truncated: true`, and the text itself ends in `[output truncated by amele]`.
+The cap is per tool family - `fs_read` 256 KiB, `fs_list`, subprocess and
+shell 64 KiB per stream, MCP 64 KiB - unless `limits.max_tool_result_bytes`
+sets one number for all of them and for the framed result the loop hands back:
+
+```yaml
+limits:
+  max_tool_result_bytes: 16384   # every tool family; minimum 1024
+```
+
+There is deliberately no unbounded setting - a tool result with no bound is
+the one thing that can spend a whole context window in a single call - so the
+minimum is 1024 and omitting the key keeps the built-in caps byte for byte.
+`amele explain` prints the effective value either way. Do not confuse this cut
+with the log's own per-field clip (`limits.max_logged_field`): that one
+shortens what the FILE stores, after the model has already read the text, and
+never sets `truncated`.

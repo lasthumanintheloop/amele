@@ -16,9 +16,11 @@ tools:
 ```
 
 Each call is a fresh shell: `cd`, variables and shell functions do not persist
-between calls. Stdout is returned to the model (capped at 64KB, marked when
-truncated); a non-zero exit is reported with its stderr as a tool result, not
-as a run failure. On timeout the whole process group is terminated.
+between calls. Stdout is returned to the model (capped at 64 KiB per stream,
+or at `limits.max_tool_result_bytes` when the config sets one; a cut result
+ends in `[output truncated by amele]` and is flagged `truncated` in the
+session log); a non-zero exit is reported with its stderr as a tool result,
+not as a run failure. On timeout the whole process group is terminated.
 
 ## Pattern matching
 

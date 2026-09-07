@@ -18,11 +18,25 @@ jq -r 'select(.type=="tool_result") | "\(.tool)\t\(.outcome)"' run-*.jsonl
 
 Note that a failing command is not an `error`: `grep` exiting 1 is
 `nonzero_exit`, and `is_error` is reserved for calls amele could not dispatch
-at all. `result_bytes` reports the full size of the tool's answer, which is how
-you see when the per-field log clip (`limits.max_logged_field`, 8 KB by
-default; `0` writes every field whole) dropped part of what the model read.
+at all. `result_bytes` reports the size of what the model actually read, which
+is how you see when the per-field log clip (`limits.max_logged_field`, 8 KB by
+default; `0` writes every field whole) dropped part of it from the file.
 The full field list is in
 [docs/contracts/jsonl-events.md](contracts/jsonl-events.md).
+
+There are two different cuts here, and only one of them reaches the model. A
+result that hit the tool-result byte cap is flagged `truncated` and ends in
+`[output truncated by amele]`:
+
+```sh
+jq -r 'select(.type=="tool_result" and .truncated) | .tool' run-*.jsonl
+```
+
+That names the tools whose answer the MODEL was handed short - the ones to
+give a narrower query, or a larger `limits.max_tool_result_bytes`. The log
+clip is the other cut: it happens after the model has read the text, it shows
+up as a `result` shorter than `result_bytes` (with a `...[clipped]` marker),
+and it never sets `truncated`.
 
 ## What gets redacted
 
