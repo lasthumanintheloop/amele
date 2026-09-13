@@ -332,21 +332,25 @@ func (e *Editor) paste(st *state) error {
 			return err
 		}
 		if r == keyEscape {
-			intro, err := e.in.ReadByte()
+			// The escape itself is dropped - inside a paste it is not a key -
+			// but the character after it is pasted content unless it opens
+			// a sequence; read as a rune so a non-ASCII one stays whole.
+			next, _, err := e.in.ReadRune()
 			if err != nil {
 				return err
 			}
-			if intro != '[' && intro != 'O' {
-				continue // an escape inside a paste is not a key
+			if next != '[' && next != 'O' {
+				r = next
+			} else {
+				seq, err := e.readSequence(byte(next))
+				if err != nil {
+					return err
+				}
+				if seq == pasteEnd {
+					break
+				}
+				continue
 			}
-			seq, err := e.readSequence(intro)
-			if err != nil {
-				return err
-			}
-			if seq == pasteEnd {
-				break
-			}
-			continue
 		}
 		// CRLF and a bare CR both become one LF; the LF of a CRLF pair is
 		// the one byte skipped.

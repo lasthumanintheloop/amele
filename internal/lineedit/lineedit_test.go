@@ -78,6 +78,7 @@ func TestReadLineKeys(t *testing.T) {
 		{"unknown escape is swallowed", "he\x1b[15~llo\r", "hello"},
 		{"a bare escape is dropped and the key after it kept", "he\x1bxllo\x1b\r", "hexllo"},
 		{"escape then a non-ascii key keeps the rune whole", "caf\x1bé\r", "café"},
+		{"escape inside a paste keeps the rune after it whole", "\x1b[200~caf\x1bé\x1b[201~\r", "café"},
 		{"a pasted block keeps its newlines", "\x1b[200~line one\r\nline two\x1b[201~\r", "line one\nline two"},
 		{"ctrl-c discards the line and re-prompts", "junk\x03hello\r", "hello"},
 		{"control bytes are ignored", "he\x1fllo\r", "hello"},
