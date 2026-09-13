@@ -40,10 +40,19 @@
 // passes the same gates (schema version, clip marker, malformed events) and
 // decides its own reasoning carriers (Options), so a link produced by another
 // model keeps its carriers to itself while the links that match still get
-// theirs back. A link that cannot be read - missing, moved, or named through a
-// path that redaction rewrote - refuses the whole read: continuing from the
-// first readable link would silently drop the conversation the missing one
-// held, which is exactly what following the chain exists to avoid.
+// theirs back.
+//
+// Three things refuse a chain rather than guess at it. A link that cannot be
+// read - missing, moved, or named through a path that redaction rewrote -
+// because continuing from the first readable link would silently drop the
+// conversation the missing one held, which is exactly what following the
+// chain exists to avoid. A link written before v1.11, which does not say
+// whether its resume was given an instruction (the key is absent, not empty),
+// because the rebuilt history would either invent a user turn or skip one.
+// And a parent that no longer ends where the link continued it - its turn
+// count or its pending calls differ from what the link's run_start recorded -
+// because the link's run saw the parent as it was then, and the file has
+// since grown or been cut.
 //
 // A file whose LAST line is torn - a prefix of an event with no newline after
 // it, which is what a SIGKILL mid-write leaves behind - ends there: the events
@@ -98,6 +107,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/lasthumanintheloop/amele/internal/ctxfile"
@@ -257,6 +267,12 @@ func readLink(ctx context.Context, path string, opts Options, depth int) (*Repla
 	if link.from == "" {
 		return &link.rep, nil
 	}
+	if link.instruction == nil {
+		// Absent, not empty: a v1.9/v1.10 writer, which sent the instruction
+		// but never recorded it. Whether one was given cannot be known here.
+		return nil, fmt.Errorf("%w: %s continues %s but was written before JSONL v1.11 and does not record whether its resume was given an instruction; resume %s instead",
+			ErrNotResumable, path, link.from, link.from)
+	}
 	// The path is followed exactly as the old run's operator typed it,
 	// resolved against the current working directory like every other
 	// operator path: it is a pointer the log recorded, not one this reader
@@ -265,6 +281,9 @@ func readLink(ctx context.Context, path string, opts Options, depth int) (*Repla
 	parent, err := readLink(ctx, link.from, opts, depth+1)
 	if err != nil {
 		return nil, fmt.Errorf("%s: following resumed_from: %w", path, err)
+	}
+	if err := link.continues(parent); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return chain(parent, link), nil
 }
@@ -288,11 +307,40 @@ type link struct {
 	// own task, which ends the chain.
 	from string
 	// instruction is run_start.resumed_instruction: the user message that
-	// sat between the parent's history and this log's first turn.
-	instruction string
+	// sat between the parent's history and this log's first turn. nil means
+	// the key was absent - a pre-v1.11 writer - which is not the same as an
+	// empty instruction (see session.Event.ResumedInstruction).
+	instruction *string
+	// turn and pending are run_start.resumed_turn and resumed_pending: what
+	// the parent looked like when this log's run continued it, checked
+	// against the parent as it reads now (continues).
+	turn    int
+	pending []string
 	// opened is whether the log holds at least one llm_response; it decides
 	// whose Completed verdict a chain takes (see chain).
 	opened bool
+}
+
+// continues checks that parent still ends where this link's run continued it.
+//
+// CONTRACT: the link's run sent the parent's history as the parent was THEN
+// - so many turns, these pending calls - and recorded both on its run_start.
+// A parent that has since grown (its run went on after the resume, or a
+// pending call was answered) or been cut (a torn tail, a cleanup) would put
+// turns into the rebuilt chain that the link's run never saw, or take away
+// ones it did. Two numbers and a list are not a byte digest, but they are the
+// facts the v1.9 run_start already records, and every way a log can change
+// moves at least one of them.
+func (l *link) continues(parent *Replay) error {
+	if parent.LastTurn != l.turn {
+		return fmt.Errorf("%w: %s no longer ends where this log continued it (turn %d then, turn %d now)",
+			ErrNotResumable, l.from, l.turn, parent.LastTurn)
+	}
+	if !slices.Equal(parent.Pending, l.pending) {
+		return fmt.Errorf("%w: %s no longer has the pending tool calls this log continued from (%v then, %v now)",
+			ErrNotResumable, l.from, l.pending, parent.Pending)
+	}
+	return nil
 }
 
 // readOne decodes and rebuilds a single log.
@@ -313,7 +361,11 @@ func readOne(r io.Reader, opts Options) (*link, error) {
 	}
 	b.closeTurn()
 	b.rep.Links = 1
-	return &link{rep: b.rep, from: events[0].ResumedFrom, instruction: events[0].ResumedInstruction, opened: b.opened}, nil
+	start := events[0]
+	return &link{
+		rep: b.rep, from: start.ResumedFrom, instruction: start.ResumedInstruction,
+		turn: start.ResumedTurn, pending: start.ResumedPending, opened: b.opened,
+	}, nil
 }
 
 // chain appends one link's conversation to the history of the log it
@@ -338,13 +390,15 @@ func chain(parent *Replay, l *link) *Replay {
 	rep.Carriers = rep.Carriers || parent.Carriers
 	msgs := make([]llm.Message, 0, len(parent.Messages)+1+len(l.rep.Messages))
 	msgs = append(msgs, parent.Messages...)
-	if l.instruction != "" {
-		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: l.instruction})
+	// readLink refused a nil instruction before getting here.
+	instruction := *l.instruction
+	if instruction != "" {
+		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: instruction})
 	}
 	msgs = append(msgs, l.rep.Messages[1:]...)
 	rep.Messages = msgs
 	if !l.opened {
-		rep.Completed = parent.Completed && l.instruction == ""
+		rep.Completed = parent.Completed && instruction == ""
 	}
 	return &rep
 }
@@ -469,8 +523,10 @@ func newBuilder(events []session.Event, opts Options) (*builder, error) {
 	if err := gateClip("task", 0, start.Task); err != nil {
 		return nil, err
 	}
-	if err := gateClip("instruction", 0, start.ResumedInstruction); err != nil {
-		return nil, err
+	if start.ResumedInstruction != nil {
+		if err := gateClip("instruction", 0, *start.ResumedInstruction); err != nil {
+			return nil, err
+		}
 	}
 	b := &builder{assistant: -1}
 	b.rep.Task, b.rep.Model, b.rep.Provider = start.Task, start.Model, start.Provider

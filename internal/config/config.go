@@ -1523,7 +1523,15 @@ func (p *ProviderConfig) ownedParamsKeys(dialect llm.Dialect, known bool) []stri
 	if !known {
 		return nil
 	}
-	return llm.OwnedWireFields(dialect)
+	owned := llm.OwnedWireFields(dialect)
+	if dialect == llm.DialectOpenRouter && p.PromptCache != nil {
+		// The gateway's top-level caching marker is owned only once
+		// provider.prompt_cache speaks for it: a config that placed the key
+		// through params before the option existed keeps sending its request
+		// unchanged, and only a config that sets both is asked to pick one.
+		owned = append(owned, "cache_control")
+	}
+	return owned
 }
 
 // validateReasoning checks the thinking knob against the effort vocabulary and

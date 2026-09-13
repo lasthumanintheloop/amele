@@ -789,18 +789,30 @@ func writeChainLog(t *testing.T, dir, name string, lines ...string) string {
 	return path
 }
 
-// resumedStart renders the run_start of a log that continued another one.
-func resumedStart(from, instruction string) string {
+// resumedStart renders the run_start of a log that continued another one, as
+// a v1.11 writer does: the instruction is always present (empty when none),
+// and turn/pending record what the parent looked like at the time.
+func resumedStart(from, instruction string, turn int, pending ...string) string {
 	ev := map[string]any{
 		"v": 1, "type": "run_start", "ts": "2026-09-13T03:00:00Z",
 		"model": "gpt-4o", "provider": "openai", "task": "scan the logs",
-		"resumed_from": from, "resumed_turn": 1,
+		"resumed_from": from, "resumed_instruction": instruction,
 	}
-	if instruction != "" {
-		ev["resumed_instruction"] = instruction
+	if turn > 0 {
+		ev["resumed_turn"] = turn
+	}
+	if len(pending) > 0 {
+		ev["resumed_pending"] = pending
 	}
 	b, _ := json.Marshal(ev)
 	return string(b)
+}
+
+// legacyResumedStart is resumedStart as a v1.9/v1.10 writer wrote it: no
+// resumed_instruction key at all.
+func legacyResumedStart(from string, turn int) string {
+	line := resumedStart(from, "", turn)
+	return strings.Replace(line, `"resumed_instruction":"",`, "", 1)
 }
 
 const (
@@ -819,10 +831,10 @@ func TestReadFollowsTheChain(t *testing.T) {
 	// Run 1 died with c1 dispatched and unanswered.
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, turn1Call, turn1Dispat)
 	// Run 2 resumed it with an instruction and finished.
-	retry := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "be brief"), finalTurn)
+	retry := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "be brief", 1, "c1"), finalTurn)
 	// Run 3 resumed the retry, added another instruction, and died before its
 	// first turn.
-	third := writeChainLog(t, dir, "run-3.jsonl", resumedStart(retry, "now count them"))
+	third := writeChainLog(t, dir, "run-3.jsonl", resumedStart(retry, "now count them", 2))
 
 	got, err := resume.Read(context.Background(), third, resume.Options{Provider: "openai", Model: "gpt-4o"})
 	if err != nil {
@@ -866,7 +878,7 @@ func TestReadFollowsTheChain(t *testing.T) {
 func TestChainCompletedFollowsTheParent(t *testing.T) {
 	dir := t.TempDir()
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
-	empty := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, ""))
+	empty := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "", 1))
 	got, err := resume.Read(context.Background(), empty, resume.Options{})
 	if err != nil {
 		t.Fatalf("Read = %v", err)
@@ -883,7 +895,7 @@ func TestChainCarriersPerLink(t *testing.T) {
 	dir := t.TempDir()
 	reasoning := `{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":1,"content":"done","finish_reason":"stop","reasoning_bytes":11,"reasoning":"[{\"a\":1}]"}`
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, reasoning)
-	otherModel := strings.Replace(resumedStart(root, "again"), `"model":"gpt-4o"`, `"model":"gpt-4o-mini"`, 1)
+	otherModel := strings.Replace(resumedStart(root, "again", 1), `"model":"gpt-4o"`, `"model":"gpt-4o-mini"`, 1)
 	retry := writeChainLog(t, dir, "run-2.jsonl", otherModel, reasoning)
 
 	got, err := resume.Read(context.Background(), retry, resume.Options{Provider: "openai", Model: "gpt-4o"})
@@ -911,7 +923,7 @@ func TestChainRefusals(t *testing.T) {
 	dir := t.TempDir()
 	t.Run("a missing link names both files", func(t *testing.T) {
 		missing := filepath.Join(dir, "gone.jsonl")
-		child := writeChainLog(t, dir, "run-2.jsonl", resumedStart(missing, ""), finalTurn)
+		child := writeChainLog(t, dir, "run-2.jsonl", resumedStart(missing, "", 1), finalTurn)
 		_, err := resume.Read(context.Background(), child, resume.Options{})
 		if err == nil || !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("err = %v, want a not-exist error", err)
@@ -924,7 +936,7 @@ func TestChainRefusals(t *testing.T) {
 	})
 	t.Run("a clipped instruction", func(t *testing.T) {
 		root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
-		child := writeChainLog(t, dir, "run-clip.jsonl", resumedStart(root, "be brief"+session.ClipMarker))
+		child := writeChainLog(t, dir, "run-clip.jsonl", resumedStart(root, "be brief"+session.ClipMarker, 1))
 		_, err := resume.Read(context.Background(), child, resume.Options{})
 		if !errors.Is(err, resume.ErrClipped) || !strings.Contains(err.Error(), "instruction") {
 			t.Fatalf("err = %v, want ErrClipped naming the instruction", err)
@@ -932,7 +944,7 @@ func TestChainRefusals(t *testing.T) {
 	})
 	t.Run("a cycle hits the link cap", func(t *testing.T) {
 		self := filepath.Join(dir, "loop.jsonl")
-		writeChainLog(t, dir, "loop.jsonl", resumedStart(self, ""), finalTurn)
+		writeChainLog(t, dir, "loop.jsonl", resumedStart(self, "", 1), finalTurn)
 		_, err := resume.Read(context.Background(), self, resume.Options{})
 		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "longer than") {
 			t.Fatalf("err = %v, want ErrNotResumable naming the chain cap", err)
@@ -945,6 +957,45 @@ func TestChainRefusals(t *testing.T) {
 		_, err := resume.Read(ctx, root, resume.Options{})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+}
+
+// TestChainRefusesAChangedOrLegacyParent: the two refusals that keep a chain
+// honest about its parent - a link that cannot say whether it had an
+// instruction, and a parent that no longer ends where the link continued it.
+func TestChainRefusesAChangedOrLegacyParent(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("a pre-v1.11 link does not say whether it had an instruction", func(t *testing.T) {
+		root := writeChainLog(t, dir, "run-legacy-1.jsonl", runStart, finalTurn)
+		child := writeChainLog(t, dir, "run-legacy-2.jsonl", legacyResumedStart(root, 1), finalTurn)
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if !errors.Is(err, resume.ErrNotResumable) {
+			t.Fatalf("err = %v, want ErrNotResumable", err)
+		}
+		for _, want := range []string{"before JSONL v1.11", "resume " + root + " instead"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err %q does not say %q", err, want)
+			}
+		}
+	})
+	t.Run("a parent that grew after the resume", func(t *testing.T) {
+		// The child recorded the parent at turn 1 with c1 pending; the parent
+		// then went on (its result arrived and a second turn was written).
+		root := writeChainLog(t, dir, "run-grew-1.jsonl", runStart, turn1Call, turn1Dispat, turn1Result,
+			`{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":2,"content":"done","finish_reason":"stop"}`)
+		child := writeChainLog(t, dir, "run-grew-2.jsonl", resumedStart(root, "", 1, "c1"), finalTurn)
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "turn 1 then, turn 2 now") {
+			t.Fatalf("err = %v, want ErrNotResumable naming both turn counts", err)
+		}
+	})
+	t.Run("a parent whose pending call was answered after the resume", func(t *testing.T) {
+		root := writeChainLog(t, dir, "run-ans-1.jsonl", runStart, turn1Call, turn1Dispat, turn1Result)
+		child := writeChainLog(t, dir, "run-ans-2.jsonl", resumedStart(root, "", 1, "c1"), finalTurn)
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "pending tool calls") {
+			t.Fatalf("err = %v, want ErrNotResumable naming the pending calls", err)
 		}
 	})
 }

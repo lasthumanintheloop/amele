@@ -424,10 +424,20 @@ resolved against the current working directory, so a chain resumed from
 another directory needs the same relative layout, and a `resumed_from` that
 redaction rewrote is a link that cannot be read. At most 32 links are
 followed; a longer chain - in practice a cycle in edited files - is refused as
-not resumable. Logs written before v1.11 recorded no instruction, so a chain
-through one of them rebuilds without that user message: the turns are all
-there, the follow-up that prompted them is not. Added 2026-09-13 (issue #31);
-before it, a resume rebuilt the named log's turns alone.
+not resumable. Two more refusals keep the chain honest. A link written
+**before v1.11** does not say whether its resume was given an instruction
+(the key is absent, where a v1.11 writer records an empty one), and a rebuilt
+history would either invent that user turn or skip it - so it is refused,
+naming the log to resume instead (`run-2.jsonl continues run-1.jsonl but was
+written before JSONL v1.11 and does not record whether its resume was given
+an instruction; resume run-1.jsonl instead`). And a parent that **no longer
+ends where the link continued it** - its turn count or its pending calls
+differ from the `resumed_turn`/`resumed_pending` the link recorded, because
+the parent's run went on after the resume or the file was cut - is refused
+too (`run-1.jsonl no longer ends where this log continued it (turn 1 then,
+turn 2 now)`), since the link's run saw the parent as it was then. Added
+2026-09-13 (issue #31); before it, a resume rebuilt the named log's turns
+alone.
 
 **The other run-level guards come first.** `lock: true` keys on the config
 path, not on the log, so resuming a config whose original run is still alive
@@ -644,12 +654,18 @@ up yet.
   carries a `prompt cache:` row on **every** wire, unconditionally - unlike the
   mapping rows above, which appear only when a config sets something, because
   what a run pays for its unchanged prefix is a fact about the run rather than
-  the state of one key. There are exactly three texts. On the anthropic wire
+  the state of one key. There are exactly five texts. On the anthropic wire
   with the key unset or true (the default):
   `prompt cache:    anthropic cache_control on tools, system, the previous user turn and the last message (up to 4 breakpoints)`;
   on that wire with `provider.prompt_cache: false`:
-  `prompt cache:    disabled (provider.prompt_cache: false)`; on every other
-  wire, where the endpoint decides on its own and the key is a config error:
+  `prompt cache:    disabled (provider.prompt_cache: false)`; with
+  `dialect: openrouter` and `provider.prompt_cache: true` (added
+  2026-09-13, issue #25):
+  `prompt cache:    openrouter top-level cache_control (the gateway caches up to the last block and moves the mark every turn; live-unverified)`;
+  on that dialect with the key unset or false:
+  `prompt cache:    whatever OpenRouter does on its own (provider.prompt_cache: true asks it for Anthropic-style caching)`;
+  on every other wire, where the endpoint decides on its own and the key is a
+  config error:
   `prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)`.
   Existing reports gain exactly that one line.
 - **Fallback rows** (additive, 2026-09-07): when the config declares

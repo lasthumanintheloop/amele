@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/ctxfile"
 	"github.com/lasthumanintheloop/amele/internal/explain"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/loop"
@@ -1096,7 +1097,7 @@ func cmdHelp(args []string, stdout, stderr io.Writer) int {
 // them, so the command answers "will THIS invocation work?" rather than a
 // question about a file nobody runs bare.
 func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseInspectArgs("validate", usageValidate, args, stderr)
+	parsed, ok := parseInspectArgs(context.Background(), "validate", usageValidate, args, stderr)
 	if !ok {
 		return ExitConfigError
 	}
@@ -1156,7 +1157,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) 
 // refuses to touch such a config (exit 2), which is where that judgement
 // belongs.
 func cmdExplain(ctx context.Context, args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseInspectArgs("explain", usageExplain, args, stderr)
+	parsed, ok := parseInspectArgs(context.Background(), "explain", usageExplain, args, stderr)
 	if !ok {
 		return ExitConfigError
 	}
@@ -1600,9 +1601,11 @@ func (f *setFlag) Set(v string) error {
 	return nil
 }
 
-// parseAgentArgs parses that shared shape for the named command. On a usage
-// error it writes the reason to stderr and reports ok=false; the caller turns
-// that into ExitConfigError.
+// parseAgentArgs parses that shared shape for the named command. It returns
+// the exit code the caller should end with when parsing did not succeed: on a
+// usage error it writes the reason to stderr and returns ExitConfigError; a
+// config-path lookup ended by the run's context is reported as an interrupted
+// run instead (reportLoadError). ExitOK means the arguments are usable.
 //
 // The config path comes first, then flags, then the free-form remainder.
 // Parsed in this order because the flag package stops at the first non-flag
@@ -1617,17 +1620,17 @@ func (f *setFlag) Set(v string) error {
 // was never a usable config path, so reading it as a help request is additive.
 // The same slot rejects any other flag-shaped argument outright
 // (rejectFlagInConfigPathSlot): no flag is a config path either.
-func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentArgs, bool) {
+func parseAgentArgs(ctx context.Context, name, usage string, args []string, stderr io.Writer) (agentArgs, int) {
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(stderr, usage)
-		return agentArgs{}, false
+		return agentArgs{}, ExitConfigError
 	}
 	if args[0] == "-h" || args[0] == "--help" {
-		return agentArgs{help: true}, true
+		return agentArgs{help: true}, ExitOK
 	}
 	if strings.HasPrefix(args[0], "-") {
 		rejectFlagInConfigPathSlot(name, usage, args[0], stderr)
-		return agentArgs{}, false
+		return agentArgs{}, ExitConfigError
 	}
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	// The flag package's own error output dumps the defaults block, whose
@@ -1657,7 +1660,7 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 	fs.Var(&resumeFlag, "resume", "continue the run recorded in this session log")
 	if err := fs.Parse(args[1:]); err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n%s\n", name, err, usage)
-		return agentArgs{}, false
+		return agentArgs{}, ExitConfigError
 	}
 	parsed := agentArgs{
 		configPath: args[0],
@@ -1672,18 +1675,23 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 	// Help wins over the conflicts below: someone who asked for the manual
 	// gets the manual, and the page is where the flags are explained.
 	if parsed.help {
-		return agentArgs{help: true}, true
+		return agentArgs{help: true}, ExitOK
 	}
 	if !parsed.flagsAgree(name, usage, stderr) {
-		return agentArgs{}, false
+		return agentArgs{}, ExitConfigError
 	}
-	resolved, err := resolveConfigArg(parsed.configPath)
+	resolved, err := resolveConfigArg(ctx, parsed.configPath)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Not a usage error: a signal arrived while the path was being
+			// stat'ed (issue #29), so the run is reported as interrupted.
+			return agentArgs{}, reportLoadError(err, stderr)
+		}
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n", name, err)
-		return agentArgs{}, false
+		return agentArgs{}, ExitConfigError
 	}
 	parsed.configPath = resolved
-	return parsed, true
+	return parsed, ExitOK
 }
 
 // resolveConfigArg maps a directory argument to its canonical entry point
@@ -1691,13 +1699,28 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 // Load keeps reporting them with its own errors. CONTRACT: resolution
 // happens at parse time, BEFORE the run lock is derived, so `run pack/`
 // and `run pack/agent.yaml` contend on the same lock file.
-func resolveConfigArg(path string) (string, error) {
-	info, err := os.Stat(path) //nolint:gosec // G703: the path is the operator's own config argument; statting it is this command's purpose
-	if err != nil || !info.IsDir() {
+//
+// Both lookups go through the context (issue #29): a stat on a hung mount
+// blocks like a read, and this is the first thing the binary does with the
+// path. A context error is returned as-is so the caller can report an
+// interrupted run rather than a usage error.
+func resolveConfigArg(ctx context.Context, path string) (string, error) {
+	info, err := ctxfile.Stat(ctx, path)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+		// A missing path passes through untouched so Load reports it.
+		return path, nil
+	}
+	if !info.IsDir() {
 		return path, nil
 	}
 	candidate := filepath.Join(path, "agent.yaml")
-	if _, err := os.Stat(candidate); err != nil { //nolint:gosec // G703: same operator-supplied path, joined with a fixed name
+	if _, err := ctxfile.Stat(ctx, candidate); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
 		return "", fmt.Errorf("no agent.yaml in %s", path)
 	}
 	return candidate, nil
@@ -1798,7 +1821,7 @@ type inspectArgs struct {
 // only as the SOLE argument (docs/contracts/cli.md): alongside anything else
 // the invocation remains a usage error, so a wrong argument count is never
 // answered with a help page and an exit 0.
-func parseInspectArgs(name, usage string, args []string, stderr io.Writer) (inspectArgs, bool) {
+func parseInspectArgs(ctx context.Context, name, usage string, args []string, stderr io.Writer) (inspectArgs, bool) {
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(stderr, usage)
 		return inspectArgs{}, false
@@ -1842,7 +1865,7 @@ func parseInspectArgs(name, usage string, args []string, stderr io.Writer) (insp
 		_, _ = fmt.Fprintln(stderr, usage)
 		return inspectArgs{}, false
 	}
-	resolved, err := resolveConfigArg(args[0])
+	resolved, err := resolveConfigArg(ctx, args[0])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n", name, err)
 		return inspectArgs{}, false
@@ -1853,9 +1876,9 @@ func parseInspectArgs(name, usage string, args []string, stderr io.Writer) (insp
 // cmdRun executes a one-shot agent run and maps every failure to the exit
 // code contract.
 func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseAgentArgs("run", usageRun, args, stderr)
-	if !ok {
-		return ExitConfigError
+	parsed, parseCode := parseAgentArgs(ctx, "run", usageRun, args, stderr)
+	if parseCode != ExitOK {
+		return parseCode
 	}
 	if parsed.help {
 		return printHelp("run", stdout, stderr)
@@ -2438,9 +2461,9 @@ const chatTaskLabel = "interactive chat"
 // (Ctrl-D). Config loading and validation are identical to `run` - the same
 // YAML describes both modes - and so is the exit code contract.
 func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseAgentArgs("chat", usageChat, args, stderr)
-	if !ok {
-		return ExitConfigError
+	parsed, parseCode := parseAgentArgs(ctx, "chat", usageChat, args, stderr)
+	if parseCode != ExitOK {
+		return parseCode
 	}
 	if parsed.help {
 		return printHelp("chat", stdout, stderr)

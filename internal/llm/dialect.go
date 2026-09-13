@@ -272,12 +272,6 @@ func reasoningWireFields(d Dialect) []string {
 // amele's transport and loop, and config names them separately.
 func OwnedWireFields(d Dialect) []string {
 	owned := []string{"model", "messages", "tools", "response_format", "temperature", "top_p", CapField(d)}
-	if d == DialectOpenRouter {
-		// The gateway's top-level caching marker has a config key of its own
-		// (provider.prompt_cache), so it is owned whether or not that key is
-		// set: a params copy would otherwise silently win or lose against it.
-		owned = append(owned, "cache_control")
-	}
 	return append(owned, reasoningWireFields(d)...)
 }
 

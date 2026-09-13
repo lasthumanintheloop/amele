@@ -71,10 +71,16 @@ type Event struct {
 	// conversation that no other event records - the task belongs to the
 	// original run - and without it a chain of resumes could not be rebuilt
 	// as one conversation (issue #31). Clipped + redacted like task.
+	//
+	// A pointer, and ALWAYS written by a resumed run from v1.11 on - as "" when
+	// no instruction was given - so that a reader can tell "there was none"
+	// (present, empty) from "this log predates v1.11 and did not record
+	// whether there was one" (absent). The chain reader refuses to follow the
+	// second kind rather than guess.
 	ResumedFrom        string   `json:"resumed_from,omitempty"`
 	ResumedTurn        int      `json:"resumed_turn,omitempty"`
 	ResumedPending     []string `json:"resumed_pending,omitempty"`
-	ResumedInstruction string   `json:"resumed_instruction,omitempty"`
+	ResumedInstruction *string  `json:"resumed_instruction,omitempty"`
 
 	// llm_response. Content is the assistant's text (clipped); ToolCallIDs
 	// are the IDs of the tool calls requested in the same message. Together
@@ -646,10 +652,13 @@ type Resumed struct {
 // project rule "secrets are never logged" (docs/engineering.md §5.5) outranks
 // path fidelity.
 func (w *Writer) RunStartResumed(model, provider, task string, r Resumed) {
+	// The instruction is written even when empty: its presence is what tells
+	// a later chain read that this writer records instructions at all.
+	instruction := w.clip(r.Instruction)
 	w.runStart(Event{
 		Type: "run_start", Model: model, Provider: provider, Task: w.clip(task),
 		ResumedFrom: w.redactOnly(r.From), ResumedTurn: r.Turn, ResumedPending: r.Pending,
-		ResumedInstruction: w.clip(r.Instruction),
+		ResumedInstruction: &instruction,
 	})
 }
 

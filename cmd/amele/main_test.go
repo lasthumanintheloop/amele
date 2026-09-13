@@ -906,12 +906,12 @@ func TestDirectoryArgSharesLockWithFileArg(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte("model: m\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pd, ok := parseAgentArgs("run", usageRun, []string{dir}, io.Discard)
-	if !ok {
+	pd, code := parseAgentArgs(context.Background(), "run", usageRun, []string{dir}, io.Discard)
+	if code != ExitOK {
 		t.Fatal("parseAgentArgs(dir) failed")
 	}
-	pf, ok := parseAgentArgs("run", usageRun, []string{filepath.Join(dir, "agent.yaml")}, io.Discard)
-	if !ok {
+	pf, code := parseAgentArgs(context.Background(), "run", usageRun, []string{filepath.Join(dir, "agent.yaml")}, io.Discard)
+	if code != ExitOK {
 		t.Fatal("parseAgentArgs(file) failed")
 	}
 	ld, err := lockFilePath(pd.configPath)

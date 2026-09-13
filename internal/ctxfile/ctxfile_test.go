@@ -39,3 +39,22 @@ func TestReadFileRefusesADoneContext(t *testing.T) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
 }
+
+func TestStat(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f.txt")
+	if err := os.WriteFile(path, []byte("hello"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := Stat(context.Background(), path)
+	if err != nil || info.Size() != 5 {
+		t.Fatalf("Stat = %v, %v", info, err)
+	}
+	if _, err := Stat(context.Background(), filepath.Join(t.TempDir(), "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v, want a not-exist error", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Stat(ctx, path); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}

@@ -2349,18 +2349,29 @@ func TestValidateProviderTuning(t *testing.T) {
 			"",
 		},
 		{
-			// The gateway's marker is owned on openrouter whether or not the
-			// key is set: a params copy would silently win or lose against
-			// provider.prompt_cache.
-			"params cache_control collides on openrouter",
+			// The gateway's marker is owned on openrouter once
+			// provider.prompt_cache is set: a params copy would silently win
+			// or lose against it.
+			"params cache_control collides with prompt_cache on openrouter",
 			func(c *Config) {
 				c.Provider.Dialect = "openrouter"
+				c.Provider.PromptCache = ptrBool(true)
 				c.Provider.Params = map[string]any{"cache_control": map[string]any{"type": "ephemeral"}}
 			},
 			`provider.params key "cache_control" is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)`,
 		},
 		{
-			// ...and only there: the plain openai dialect never writes it.
+			// ...but a config that placed the key through params before the
+			// option existed keeps validating and keeps its request bytes.
+			"params cache_control is free on openrouter without the key",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.Params = map[string]any{"cache_control": map[string]any{"type": "ephemeral"}}
+			},
+			"",
+		},
+		{
+			// ...and always free where amele never writes it.
 			"params cache_control is free on openai",
 			func(c *Config) {
 				c.Provider.Params = map[string]any{"cache_control": map[string]any{"type": "ephemeral"}}

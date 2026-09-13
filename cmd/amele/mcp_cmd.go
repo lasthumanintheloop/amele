@@ -123,7 +123,7 @@ func parseMCPArgs(args []string, stderr io.Writer) (string, mcpArgs, bool) {
 	if len(rest) > maxArgs {
 		return fail()
 	}
-	resolved, err := resolveConfigArg(rest[0])
+	resolved, err := resolveConfigArg(context.Background(), rest[0])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele mcp %s: %v\n", sub, err)
 		return "", mcpArgs{}, false

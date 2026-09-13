@@ -836,8 +836,10 @@ request. What the gateway then caches, and what it charges, follows
 Anthropic's rules (a minimum prefix size, the write premium, the five-minute
 entry) and is reported in the session log's `cache_read_tokens` when the
 gateway reports it; `amele explain` prints which of the two requests a config
-will send. A `params: {cache_control: ...}` of your own is refused on this
-dialect, because the key now has a config field. Per-block breakpoints inside
+will send. A `params: {cache_control: ...}` of your own keeps working as long
+as `provider.prompt_cache` stays unset; once the key is set, the params copy
+is refused (exit 2), because two settings for one request field would silently
+win or lose against each other. Per-block breakpoints inside
 the message content - OpenRouter's other, explicit form - are not placed;
 they are for caching one large block by hand, which a config has no way to
 point at.

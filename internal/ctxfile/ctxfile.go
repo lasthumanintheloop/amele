@@ -17,31 +17,56 @@ import (
 // the context ends - whichever comes first. A context that is already done
 // reads nothing. The file error, when there is one, is os.ReadFile's own,
 // unwrapped, so callers keep their existing phrasing around it.
-//
-// The read runs in a goroutine that is abandoned when the context wins. That
-// goroutine holds no lock and blocks nobody: its result channel is buffered,
-// so it exits the moment the operating system lets the read return - when a
-// writer finally opens the FIFO, when the mount answers, or when the process
-// ends, which for every caller in this binary is what a cancelled context
-// leads to anyway. That is the deliberate trade: a blocked read cannot be
-// interrupted portably, and a goroutine waiting on it costs a run nothing.
 func ReadFile(ctx context.Context, path string) ([]byte, error) {
+	return await(ctx, func() ([]byte, error) {
+		return os.ReadFile(path) //nolint:gosec // G304: reading the operator-named file is this package's purpose.
+	})
+}
+
+// Stat is os.Stat under the same rule as ReadFile: the context's error as
+// soon as the context ends. A metadata lookup on a hung network mount blocks
+// exactly like a read does, and the CLI stats every config argument before it
+// reads one (the directory shortcut).
+func Stat(ctx context.Context, path string) (os.FileInfo, error) {
+	return await(ctx, func() (os.FileInfo, error) {
+		return os.Stat(path)
+	})
+}
+
+// await runs one blocking file operation and returns its result, or the
+// context's error if the context ends first.
+//
+// The operation runs in a goroutine that is ABANDONED when the context wins,
+// which is the one place this binary departs from "every goroutine has a
+// closing path": a blocked open(2), read(2) or stat(2) cannot be interrupted
+// portably (no descriptor exists yet to close, and Windows has no signal to
+// send), so the choice is between abandoning the goroutine and abandoning the
+// deadline. The goroutine holds no lock and blocks nobody - its result channel
+// is buffered - and it exits the moment the operating system lets the call
+// return: when a writer opens the FIFO, when the mount answers, or when the
+// process ends. Every caller in this binary is on its way to exit once its
+// context is cancelled, and a run touches a handful of operator files, so the
+// leak is bounded by that handful and lives at most as long as the process.
+// The tests release their FIFOs in cleanup so the test binary, which does not
+// exit per test, sees the same bound.
+func await[T any](ctx context.Context, op func() (T, error)) (T, error) {
+	var zero T
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return zero, err
 	}
 	type result struct {
-		data []byte
-		err  error
+		value T
+		err   error
 	}
 	done := make(chan result, 1)
 	go func() {
-		data, err := os.ReadFile(path) //nolint:gosec // G304: reading the operator-named file is this package's purpose.
-		done <- result{data, err}
+		v, err := op()
+		done <- result{v, err}
 	}()
 	select {
 	case r := <-done:
-		return r.data, r.err
+		return r.value, r.err
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return zero, ctx.Err()
 	}
 }

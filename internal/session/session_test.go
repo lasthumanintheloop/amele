@@ -1444,9 +1444,11 @@ func TestRunStartResumed(t *testing.T) {
 			},
 		},
 		{
-			name:    "no pending calls writes no key",
+			// No pending calls writes no key; no instruction writes an EMPTY
+			// one, because absence of that key means "pre-v1.11 writer".
+			name:    "no pending calls writes no key, no instruction writes an empty one",
 			resumed: &Resumed{From: "run-1.jsonl", Turn: 3},
-			want:    []string{`"resumed_from":"run-1.jsonl"`, `"resumed_turn":3`},
+			want:    []string{`"resumed_from":"run-1.jsonl"`, `"resumed_turn":3`, `"resumed_instruction":""`},
 			absent:  []string{`"resumed_pending"`},
 		},
 		{
