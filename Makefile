@@ -24,8 +24,12 @@ race:
 # -coverpkg pins the denominator to internal/ (the docs/engineering.md §6 scope): a
 # plain ./... total would let well-covered cmd/ wiring mask a coverage drop
 # inside the packages that matter.
+# The test output is kept out of the log while the suite passes and printed
+# whole when it does not: a failing test under coverage instrumentation must
+# name itself in CI rather than surface as a bare "make: Error 1".
 cover:
-	go test -coverprofile=coverage.out -coverpkg=./internal/... ./... > /dev/null
+	@go test -coverprofile=coverage.out -coverpkg=./internal/... ./... > cover.log || { cat cover.log; rm -f cover.log; exit 1; }
+	@rm -f cover.log
 	@go tool cover -func=coverage.out | tail -1
 	@total=$$(go tool cover -func=coverage.out | tail -1 | grep -oE '[0-9]+\.[0-9]+' | head -1); \
 	ok=$$(echo "$$total >= $(COVER_BUDGET)" | bc); \
@@ -88,4 +92,4 @@ dist:
 	cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS && cat SHA256SUMS
 
 clean:
-	rm -rf amele coverage.out dist
+	rm -rf amele coverage.out cover.log dist

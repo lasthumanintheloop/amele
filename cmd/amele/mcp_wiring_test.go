@@ -83,6 +83,30 @@ func stdioServerYAML(name, command, extra string) string {
 %s`, name, command, extra)
 }
 
+// cancelWhenSessionStarts cancels the run the moment its session log carries
+// run_start, which the run writes immediately before connecting its MCP
+// servers: the cancellation then lands inside the connect window, whatever
+// the machine's speed. It gives up after ten seconds so a run that never
+// starts fails the test rather than hanging it.
+func cancelWhenSessionStarts(t *testing.T, dir string, cancel context.CancelFunc) {
+	t.Helper()
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl"))
+			for _, f := range files {
+				if data, err := os.ReadFile(f); err == nil && strings.Contains(string(data), `"type":"run_start"`) { //nolint:gosec // G304: test-owned path.
+					cancel()
+					return
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Error("the run never wrote run_start")
+		cancel()
+	}()
+}
+
 // hangingServerYAML is stdioServerYAML for a server that never answers the
 // handshake (mcptestserver -hang-on-start), so a connect can only end by
 // cancellation.
@@ -419,12 +443,14 @@ func TestRunMCPInterruptedDuringConnect(t *testing.T) {
 
 	// The server never answers the handshake, so the connect can only end
 	// with the cancellation below: the same observable state as a SIGTERM
-	// landing mid-handshake, with no race on when the signal lands. (The
-	// context is not cancelled up front because, since issue #29, a context
-	// that is already done stops the config read itself.)
+	// landing mid-handshake. The cancel is tied to the session log's
+	// run_start - written just before the connect - rather than to a timer:
+	// a context that is already done stops the config read itself (issue
+	// #29), and a timer can fire before a slow (coverage-instrumented, loaded
+	// CI) run gets that far.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	time.AfterFunc(150*time.Millisecond, cancel)
+	cancelWhenSessionStarts(t, dir, cancel)
 
 	var stdout, stderr bytes.Buffer
 	code := run(ctx, []string{"run", cfgPath, "task"}, strings.NewReader(""), &stdout, &stderr, env(t))
@@ -529,10 +555,11 @@ func TestRunMCPInterruptedOptionalNotCounted(t *testing.T) {
 	cfgPath, dir := writeTestConfig(t, srv.URL,
 		"session_dir: sessions\n"+hangingServerYAML("files", bin, "      required: false\n"))
 
-	// See TestRunMCPInterruptedDuringConnect for why the cancel is deferred.
+	// See TestRunMCPInterruptedDuringConnect for why the cancel waits for
+	// run_start.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	time.AfterFunc(150*time.Millisecond, cancel)
+	cancelWhenSessionStarts(t, dir, cancel)
 
 	var stdout, stderr bytes.Buffer
 	code := run(ctx, []string{"run", cfgPath, "task"}, strings.NewReader(""), &stdout, &stderr, env(t))
