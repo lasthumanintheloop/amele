@@ -646,7 +646,7 @@ up yet.
   what a run pays for its unchanged prefix is a fact about the run rather than
   the state of one key. There are exactly three texts. On the anthropic wire
   with the key unset or true (the default):
-  `prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)`;
+  `prompt cache:    anthropic cache_control on tools, system, the previous user turn and the last message (up to 4 breakpoints)`;
   on that wire with `provider.prompt_cache: false`:
   `prompt cache:    disabled (provider.prompt_cache: false)`; on every other
   wire, where the endpoint decides on its own and the key is a config error:

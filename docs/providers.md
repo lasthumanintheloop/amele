@@ -266,7 +266,7 @@ behavior: nothing in the code special-cases them.
 
 This is the one wire where the request has to *ask* for caching, and amele asks
 by default: unless `provider.prompt_cache: false` says otherwise, every request
-carries up to three `cache_control: {"type": "ephemeral"}` breakpoints, in the
+carries up to four `cache_control: {"type": "ephemeral"}` breakpoints, in the
 order the API renders the prompt:
 
 1. the **last tool definition**, which caches the whole tool list at once;
@@ -274,31 +274,31 @@ order the API renders the prompt:
    A cached system prompt is sent as a one-element array of text blocks rather
    than a bare string - that is the only shape a breakpoint fits in, and it is
    the same prompt either way;
-3. the **last content block of the last message**, which caches the
+3. the **last content block of the previous user-role message** - on a tool
+   loop that is the previous turn's tool results - which is where the previous
+   request's moving mark sat, so the entry it wrote is found by an exact mark;
+4. the **last content block of the last message**, which caches the
    conversation so far. This one moves forward every turn: each turn marks its
    own tail, so the next turn reads back everything before it and writes only
    the delta.
 
-A breakpoint is also a *probe*: from where it sits the API looks back over
-roughly the last 20 content-block positions for an entry it already holds, and
-a run of consecutive `tool_use` blocks counts as one position there, as does a
-run of consecutive `tool_result` blocks. That is why the moving mark is enough
-on its own, and why a parallel tool fan-out - a dozen calls and a dozen results
-in two turns - never costs you the previous turn's entry. The limit that
-follows: a turn that appends more than that lookback of other, non-tool content
-can reach back past the previous entry, and that turn writes the whole prefix
-again instead of reading it. The API allows a fourth breakpoint, which
-Anthropic's own multi-turn recipe spends on the previous turn's last block to
-cover exactly that case; amele does not place it yet, which is a follow-up and
-not a claim that the case cannot happen, so that turn still rewrites the
-prefix instead of reading it until it lands. Live-unverified (#17): the
-lookback and its tool-run collapsing come from Anthropic's documentation, not
-from a response amele has recorded.
+The third mark is Anthropic's own multi-turn recipe. A breakpoint is also a
+*probe*: from where it sits the API looks back over roughly the last 20
+content-block positions for an entry it already holds, and a run of consecutive
+`tool_use` blocks counts as one position there, as does a run of consecutive
+`tool_result` blocks - so on most turns the moving mark finds the previous
+entry on its own, and a parallel tool fan-out never costs you it. The case the
+pin covers is the turn that appends more than that lookback of other, non-tool
+content: without the pin it would reach back past the previous entry and write
+the whole prefix again instead of reading it. Live-unverified (#17): the
+lookback, its tool-run collapsing and the pin's effect come from Anthropic's
+documentation, not from a response amele has recorded.
 
-The API allows 4 breakpoints; amele places at most 3 and leaves the fourth
-alone. An empty system prompt gets none (a blank text block is a 400), and
-neither does an assistant turn amele is echoing back verbatim - the loop never
-ends its history on one, so in practice that costs nothing.
+The API allows 4 breakpoints and amele never places a fifth. An empty system
+prompt gets none (a blank text block is a 400), and neither does an assistant
+turn amele is echoing back verbatim - the loop never ends its history on one,
+so in practice that costs nothing; a one-message history has no previous turn
+to pin and sends three.
 
 **A short prompt silently does not cache.** The minimum cacheable prefix is
 model-dependent (roughly 512 to 4096 tokens depending on the model, and it is

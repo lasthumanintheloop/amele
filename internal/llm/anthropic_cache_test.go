@@ -63,9 +63,10 @@ func anCacheWireCases() []anWireCase {
 			},
 		},
 		{
-			// A tool turn: the echoed assistant array stays untouched and the
+			// A tool turn: the echoed assistant array stays untouched, the
 			// moving breakpoint sits on the LAST of the two tool_result blocks
-			// that Anthropic requires to share one user message.
+			// that Anthropic requires to share one user message, and the
+			// fourth breakpoint pins the previous user message (the task).
 			name:   "tool turn",
 			golden: "anthropic-cache-tool-turn.json",
 			client: AnthropicClient{PromptCache: true},
@@ -159,11 +160,25 @@ func TestAnthropicCacheSystemKeyOmitted(t *testing.T) {
 
 // TestAnthropicCacheBreakpointBudget: the API allows at most 4 cache_control
 // breakpoints per request and answers a fifth with a 400. amele places at most
-// three (tools, system, last message), so no reachable request can overrun the
-// budget - this pins that the placement stays a fixed set and never a per-item
-// loop.
+// four (tools, system, previous user message, last message), so no reachable
+// request can overrun the budget - this pins that the placement stays a fixed
+// set and never a per-item loop, on a history long enough that a loop would
+// overrun it.
 func TestAnthropicCacheBreakpointBudget(t *testing.T) {
-	for _, tc := range anCacheWireCases() {
+	long := Request{
+		Model: "claude-opus-5",
+		Messages: []Message{
+			{Role: RoleSystem, Content: "you are a log sentry"},
+			{Role: RoleUser, Content: "scan today's log"},
+			{Role: RoleAssistant, Content: "which one?"},
+			{Role: RoleUser, Content: "app.log"},
+			{Role: RoleAssistant, Content: "and yesterday's?"},
+			{Role: RoleUser, Content: "that too"},
+		},
+		Tools: anCacheTools(),
+	}
+	cases := append(anCacheWireCases(), anWireCase{name: "long history", client: AnthropicClient{PromptCache: true}, req: long})
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			client := tc.client
 			wire, fields := client.toWire(tc.req)
@@ -171,10 +186,39 @@ func TestAnthropicCacheBreakpointBudget(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encodeBody: %v", err)
 			}
-			if n := strings.Count(string(got), `"cache_control"`); n > 3 {
-				t.Errorf("placed %d breakpoints, want at most 3: %s", n, got)
+			if n := strings.Count(string(got), `"cache_control"`); n > 4 {
+				t.Errorf("placed %d breakpoints, want at most 4: %s", n, got)
 			}
 		})
+	}
+}
+
+// TestAnthropicCachePinsThePreviousUserTurn (issue #26): the fourth breakpoint
+// sits on the previous user-role message - the one the previous request's
+// moving mark was on - and never on an assistant turn, so a turn that appends
+// more than the lookback of non-tool content still finds the previous entry.
+func TestAnthropicCachePinsThePreviousUserTurn(t *testing.T) {
+	client := AnthropicClient{PromptCache: true}
+	wire, _ := client.toWire(Request{
+		Model: "claude-opus-5",
+		Messages: []Message{
+			{Role: RoleUser, Content: "first"},
+			{Role: RoleAssistant, Content: "reply one"},
+			{Role: RoleUser, Content: "second"},
+			{Role: RoleAssistant, Content: "reply two"},
+			{Role: RoleUser, Content: "third"},
+		},
+	})
+	var marked []string
+	for _, m := range wire.Messages {
+		for _, b := range m.Content {
+			if b.CacheControl != nil {
+				marked = append(marked, m.Role+":"+b.Text)
+			}
+		}
+	}
+	if want := []string{"user:second", "user:third"}; strings.Join(marked, ",") != strings.Join(want, ",") {
+		t.Errorf("marked blocks = %v, want %v", marked, want)
 	}
 }
 

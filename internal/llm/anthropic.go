@@ -78,8 +78,9 @@ type AnthropicClient struct {
 	// DefaultAnthropicMaxOutput.
 	MaxOutputTokens int
 	// PromptCache asks for explicit prompt caching: the request grows up to
-	// three ephemeral cache_control breakpoints (last tool, system prompt,
-	// last message block - see placeCacheBreakpoints). The zero value false
+	// four ephemeral cache_control breakpoints (last tool, system prompt,
+	// previous user-role message, last message block - see
+	// placeCacheBreakpoints). The zero value false
 	// sends the request byte for byte as it was sent before caching existed,
 	// which is what keeps every pre-caching wire golden valid. Wired from the
 	// config's provider.prompt_cache, where an unset value means true.
@@ -875,28 +876,31 @@ func (out *anRequest) appendSystem(text string) {
 //
 // CONTRACT: at most 4 breakpoints per request (a fifth is a 400), and the API
 // renders the prompt as tools -> system -> messages. amele places at most
-// three, in that render order:
+// four, in that render order:
 //
 //   - the LAST tool definition, which caches every tool at once;
 //   - the system prompt, extending that prefix over the instructions;
+//   - the last content block of the PREVIOUS user-role message - the turn
+//     before this one - which is where the previous request's moving mark
+//     sat, so the entry written then is found by an exact mark rather than by
+//     the lookback below;
 //   - the last content block of the last message, which caches the
 //     conversation so far. This one MOVES forward every turn: each new turn
 //     marks its own tail, so the previous turn's prefix is a cache hit and only
 //     the delta is written.
 //
-// The third mark can move because a breakpoint is not only a write mark: the
-// API also looks BACK from it for an existing entry, over roughly the last 20
-// content-block positions, where a run of consecutive tool_use blocks counts
-// as one position and so does a run of consecutive tool_result blocks. That
-// lookback is the whole reason one moving mark suffices instead of also
-// pinning the previous turn, and it is why a parallel tool fan-out - many
-// tool_use and tool_result blocks in two turns - cannot push the previous
-// entry out of the window. The corollary is the limit: a turn that appends
-// more than that lookback of NON-tool positions can miss the previous entry,
-// and the prefix is then rewritten rather than read. Anthropic's own
-// multi-turn recipe spends the fourth breakpoint on the previous message to
-// cover exactly that; leaving it unspent is a follow-up, not a claim that the
-// case cannot happen.
+// The third mark is Anthropic's own multi-turn recipe (issue #26). A
+// breakpoint is not only a write mark: the API also looks BACK from it for an
+// existing entry, over roughly the last 20 content-block positions, where a
+// run of consecutive tool_use blocks counts as one position and so does a run
+// of consecutive tool_result blocks - so the moving mark alone finds the
+// previous entry on most turns. The corollary is the limit: a turn that
+// appends more than that lookback of NON-tool positions can miss the previous
+// entry, and the prefix is then rewritten rather than read. Pinning the
+// previous user-role message closes exactly that gap, at the cost of the
+// otherwise-unused fourth breakpoint. "User-role" here includes the tool
+// results a tool turn merges into one user message: on a tool loop the
+// previous user-role message IS the previous turn's results.
 //
 // Live-unverified (#17): the lookback and its tool-run collapsing come from
 // the platform documentation, not from a response amele has recorded.
@@ -909,17 +913,36 @@ func (out *anRequest) placeCacheBreakpoints() {
 	if out.System != nil && out.System.Text != "" {
 		out.System.Cache = true
 	}
-	if n := len(out.Messages); n > 0 {
-		last := &out.Messages[n-1]
-		// An echoed raw content array is signed by the provider and must go
-		// back byte for byte (anMessage.MarshalJSON), so it never receives a
-		// breakpoint. The loop never sends a history ending in an assistant
-		// turn - the last message is the user task or the tool results - so
-		// this only gives up a breakpoint on a path that does not occur.
-		if last.ContentRaw == nil && len(last.Content) > 0 {
-			last.Content[len(last.Content)-1].CacheControl = ephemeralCacheControl()
+	// The last message first. An echoed raw content array is signed by the
+	// provider and must go back byte for byte (anMessage.MarshalJSON), so it
+	// never receives a breakpoint; the loop never sends a history ending in
+	// an assistant turn, so a last message that cannot be marked is a path
+	// that does not occur, and the messages then get no mark at all rather
+	// than a previous-turn pin with nothing moving ahead of it.
+	n := len(out.Messages)
+	if n == 0 || !markLastBlock(&out.Messages[n-1]) {
+		return
+	}
+	// Then the previous user-role message: the tool results of the previous
+	// turn, or the user text before them. Assistant turns are skipped, not
+	// marked - a rebuilt (carrier-less) one has nothing a previous request
+	// marked, and an echoed one is signed.
+	for i := n - 2; i >= 0; i-- {
+		if out.Messages[i].Role == "user" && markLastBlock(&out.Messages[i]) {
+			return
 		}
 	}
+}
+
+// markLastBlock puts the breakpoint on a message's last content block and
+// reports whether it could: a message rendered from an echoed raw array, or
+// with no blocks at all, takes none.
+func markLastBlock(m *anMessage) bool {
+	if m.ContentRaw != nil || len(m.Content) == 0 {
+		return false
+	}
+	m.Content[len(m.Content)-1].CacheControl = ephemeralCacheControl()
+	return true
 }
 
 // assistantBlocks rebuilds an assistant turn from the neutral fields: an

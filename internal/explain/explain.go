@@ -1127,7 +1127,7 @@ func promptCacheRow(b *strings.Builder, cfg *config.Config) {
 		fmt.Fprint(b, "  prompt cache:    disabled (provider.prompt_cache: false)\n")
 		return
 	}
-	fmt.Fprint(b, "  prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)\n")
+	fmt.Fprint(b, "  prompt cache:    anthropic cache_control on tools, system, the previous user turn and the last message (up to 4 breakpoints)\n")
 }
 
 // baseURLDialectHint returns the "your base_url looks like X" line, or "" when
