@@ -73,6 +73,31 @@ func TestWriterGolden(t *testing.T) {
 	}
 }
 
+// TestValidatorFeedbackEvent pins the v1.10 event byte for byte: the rejected
+// turn's number and the feedback text, redacted and clipped like every other
+// free-text field (the feedback quotes validation errors, which can echo model
+// output - and so a secret).
+func TestValidatorFeedbackEvent(t *testing.T) {
+	w, err := New(t.TempDir(), Options{Clock: fixedClock(), Secrets: []string{"sk-supersecret"}, MaxLoggedField: 40})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.ValidatorFeedback(2, "your answer did not match the schema: score must be an integer, got sk-supersecret")
+	w.RunEnd(RunEnd{Status: "error", ExitCode: 6})
+	got, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(got)), "\n")
+	want := `{"v":1,"type":"validator_feedback","ts":"2026-08-10T12:00:02Z","turn":2,"content":"your answer did not match the schema: sc...[clipped]"}`
+	if lines[0] != want {
+		t.Errorf("validator_feedback line:\n got %s\nwant %s", lines[0], want)
+	}
+	if strings.Contains(string(got), "sk-supersecret") {
+		t.Errorf("the secret survived into the log:\n%s", got)
+	}
+}
+
 // TestWriterAppendsUnconditionally pins the append-only property as a SYSCALL
 // guarantee rather than a single-writer convention (live-test finding B-A04):
 // the writer must never seek back over bytes it did not write. The scenario is

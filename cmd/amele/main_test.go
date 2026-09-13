@@ -5396,6 +5396,57 @@ func TestE2EResumeCompletedRun(t *testing.T) {
 	})
 }
 
+// TestE2EResumeSchemaRetryRun (issue #28): a run that took an output.schema
+// retry is resumable, because the validator's feedback is now a logged user
+// turn. The resumed provider request must carry the conversation as it
+// happened - rejected answer, feedback, accepted answer - and then the new
+// instruction.
+func TestE2EResumeSchemaRetryRun(t *testing.T) {
+	srvA := scriptedServer(t, textBody(`{"score": "high"}`), textBody(`{"score": 9}`))
+	cfgA, dirA := writeResumeConfig(t, srvA.URL, schemaBlock+"limits:\n  max_logged_field: 0\n")
+	code, _, stderr := execCLI(t, []string{"run", cfgA, "score", "it"}, "")
+	if code != ExitOK {
+		t.Fatalf("run A: exit %d, stderr: %s", code, stderr)
+	}
+	var feedback string
+	for _, ev := range readSessionEvents(t, dirA) {
+		if ev.Type == "validator_feedback" {
+			feedback = ev.Content
+		}
+	}
+	if feedback == "" {
+		t.Fatalf("run A logged no validator_feedback event:\n%s", readSessionRaw(t, dirA))
+	}
+
+	srvB, reqs := capturingServer(t, textBody(`{"score": 8}`))
+	cfgB, _ := writeResumeConfig(t, srvB.URL, schemaBlock)
+	code, stdout, stderr := execCLI(t, []string{"run", cfgB, "--resume", sessionLogPath(t, dirA), "score it again"}, "")
+	if code != ExitOK {
+		t.Fatalf("run B: exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "{\"score\": 8}\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("provider calls = %d, want 1", len(*reqs))
+	}
+	var got []string
+	for _, m := range (*reqs)[0].Messages {
+		got = append(got, m.Role+": "+m.Content)
+	}
+	want := []string{
+		"system: You are a test agent.",
+		"user: score it",
+		`assistant: {"score": "high"}`,
+		"user: " + feedback,
+		`assistant: {"score": 9}`,
+		"user: score it again",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("resumed conversation:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
 // TestE2EResumeEmptyPathIsRefused (issue #30): `--resume ""` is a usage error,
 // not a fresh run. The flag package cannot tell an explicitly empty value from
 // an absent flag, and in a pipeline an empty value is far more likely a broken

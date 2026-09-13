@@ -61,9 +61,8 @@ Everything that must be reported **before a single token is spent**:
 - the tool registry could not be built (e.g. the fs workspace does not exist)
   or the session file could not be created;
 - `--resume`: the named session log cannot be read or cannot be continued
-  (missing, malformed, clipped, empty, a chat log, an unlogged
-  `output.schema` feedback turn, or an already-answered run with no
-  instruction) - see [cli.md](cli.md#resuming-a-run---resume-path);
+  (missing, malformed, clipped, empty, a chat log, a pre-v1.10 log of an
+  `output.schema` retry, or an already-answered run with no instruction) - see [cli.md](cli.md#resuming-a-run---resume-path);
 - `amele init`: the target file already exists (never overwritten) or could not
   be written.
 

@@ -1,0 +1,5 @@
+{"v":1,"type":"run_start","ts":"2026-09-13T11:00:00Z","model":"gpt-4o","provider":"openai","task":"score the incident report from 1 to 5"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T11:00:02Z","turn":1,"content":"{\"score\": \"four\"}","input_tokens":420,"output_tokens":12,"finish_reason":"stop"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T11:00:02Z","turn":1,"content":"your answer did not match the schema: score must be an integer"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T11:00:04Z","turn":2,"content":"{\"score\": 4}","input_tokens":510,"output_tokens":9,"finish_reason":"stop"}
+{"v":1,"type":"run_end","ts":"2026-09-13T11:00:04Z","status":"success","exit_code":0,"turns":2,"total_tokens":951,"duration_ms":4300}

@@ -498,6 +498,11 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 				// max_tokens still bound a model that never converges.
 				rejections++
 				messages = append(messages, llm.Message{Role: llm.RoleUser, Content: feedback})
+				// The feedback is a user turn of the conversation the model
+				// is having, so the log records it (JSONL v1.10) - without
+				// it the file would show two adjacent final answers and the
+				// run could not be resumed (issue #28).
+				l.Session.ValidatorFeedback(l.TurnBase+turn, feedback)
 				continue
 			}
 			// The answer is final and accepted: the run is over. The token

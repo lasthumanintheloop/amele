@@ -45,6 +45,42 @@ func TestReadFixtures(t *testing.T) {
 		messages  []llm.Message
 	}{
 		{
+			// A v1.10 log of a schema retry: the feedback is a user turn of
+			// the rebuilt conversation, between the rejected answer and the
+			// retry. The run finished, so it needs an instruction to go on.
+			name:      "a logged schema retry is rebuilt with its feedback turn",
+			fixture:   "schema-retry-logged.jsonl",
+			opts:      resume.Options{Provider: "openai"},
+			task:      "score the incident report from 1 to 5",
+			model:     "gpt-4o",
+			provider:  "openai",
+			lastTurn:  2,
+			completed: true,
+			messages: []llm.Message{
+				user("score the incident report from 1 to 5"),
+				assistant(`{"score": "four"}`),
+				user("your answer did not match the schema: score must be an integer"),
+				assistant(`{"score": 4}`),
+			},
+		},
+		{
+			// The run died after writing the feedback and before the retry:
+			// the history ends on the feedback, which the model has not
+			// answered - so the run is NOT complete and resumes on its own.
+			name:     "a run interrupted after the feedback continues from it",
+			fixture:  "schema-retry-interrupted.jsonl",
+			opts:     resume.Options{Provider: "openai"},
+			task:     "score the incident report from 1 to 5",
+			model:    "gpt-4o",
+			provider: "openai",
+			lastTurn: 1,
+			messages: []llm.Message{
+				user("score the incident report from 1 to 5"),
+				assistant(`{"score": "four"}`),
+				user("your answer did not match the schema: score must be an integer"),
+			},
+		},
+		{
 			name:     "complete tool turn resumes after the results",
 			fixture:  "complete-tool-turn.jsonl",
 			opts:     resume.Options{Provider: "openai"},
@@ -431,10 +467,51 @@ func TestReadRejects(t *testing.T) {
 			contains: []string{"line 2"},
 		},
 		{
-			name:     "a log that skips the validator's feedback turn",
+			name:     "a pre-v1.10 log that skips the validator's feedback turn",
 			log:      readFixture(t, "schema-retry.jsonl"),
 			want:     resume.ErrNotResumable,
-			contains: []string{"skips a user turn", "output.schema"},
+			contains: []string{"skips a user turn", "output.schema", "v1.10"},
+		},
+		{
+			name: "validator_feedback after a turn that requested tools",
+			log: `{"v":1,"type":"run_start","ts":"2026-09-13T03:00:00Z","model":"gpt-4o","task":"scan the logs"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:01Z","turn":1,"tool_call_ids":["c1"],"finish_reason":"tool_calls"}
+{"v":1,"type":"tool_call","ts":"2026-09-13T03:00:01Z","tool_call_id":"c1","tool":"fs_read","args":"{}"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":1,"content":"fix it"}`,
+			want:     resume.ErrMalformed,
+			contains: []string{"validator_feedback", "not a final answer"},
+		},
+		{
+			name: "validator_feedback before any turn",
+			log: `{"v":1,"type":"run_start","ts":"2026-09-13T03:00:00Z","model":"gpt-4o","task":"scan the logs"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":1,"content":"fix it"}`,
+			want:     resume.ErrMalformed,
+			contains: []string{"validator_feedback", "not a final answer"},
+		},
+		{
+			name: "validator_feedback on the wrong turn number",
+			log: `{"v":1,"type":"run_start","ts":"2026-09-13T03:00:00Z","model":"gpt-4o","task":"scan the logs"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:01Z","turn":1,"content":"{}","finish_reason":"stop"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":2,"content":"fix it"}`,
+			want:     resume.ErrMalformed,
+			contains: []string{"turn 2", "turn 1 is open"},
+		},
+		{
+			name: "two validator_feedback events for one turn",
+			log: `{"v":1,"type":"run_start","ts":"2026-09-13T03:00:00Z","model":"gpt-4o","task":"scan the logs"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:01Z","turn":1,"content":"{}","finish_reason":"stop"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":1,"content":"fix it"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":1,"content":"fix it again"}`,
+			want:     resume.ErrMalformed,
+			contains: []string{"second validator_feedback"},
+		},
+		{
+			name: "a clipped validator_feedback",
+			log: `{"v":1,"type":"run_start","ts":"2026-09-13T03:00:00Z","model":"gpt-4o","task":"scan the logs"}
+{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:01Z","turn":1,"content":"{}","finish_reason":"stop"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T03:00:02Z","turn":1,"content":"fix it...[clipped]"}`,
+			want:     resume.ErrClipped,
+			contains: []string{"feedback", "turn 1", "limits.max_logged_field: 0"},
 		},
 		{
 			name:     "a future schema version",

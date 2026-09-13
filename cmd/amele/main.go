@@ -252,9 +252,10 @@ FLAGS
                   The log must be a complete record of what the model saw:
                   write it with limits.max_logged_field: 0, or the resume is
                   refused (exit 2) rather than continued from text the log
-                  shortened. A log of an interactive chat, of a run whose
-                  output.schema validator feedback was not logged, or of a
-                  different schema version is refused the same way.
+                  shortened. A log of an interactive chat, a pre-v1.10 log
+                  of an output.schema retry (its feedback turn was not
+                  logged), or a log of a different schema version is refused
+                  the same way.
                   No tool call is ever re-executed. A call the interrupted run
                   dispatched but never logged a result for gets a message in
                   its place telling the model the result is unknown, and the

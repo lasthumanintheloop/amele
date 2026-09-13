@@ -328,12 +328,15 @@ and before any session log is opened - a refused resume leaves no file behind:
   `run_start` carries no task, or one written to a schema version this build
   does not read - each the same `not resumable` sentence with its own reason
   (`the log is empty`, `the log does not begin with a run_start event`, ...);
-- a log whose run took an `output.schema` retry: the validator's feedback is a
-  user turn the log does not record, so rebuilding it would hand the model a
-  conversation that never happened (`the log skips a user turn (an
-  output.schema retry's feedback is not logged); the run is not resumable`).
-  In the file it looks like two adjacent `llm_response` events where the first
-  requested no tool calls;
+- a log written **before JSONL v1.10** of a run that took an `output.schema`
+  retry: the validator's feedback was a user turn such logs do not record, so
+  rebuilding one would hand the model a conversation that never happened
+  (`the log skips a user turn (an output.schema retry's feedback is not
+  logged before JSONL v1.10); the run is not resumable`). In the file it looks
+  like two adjacent `llm_response` events where the first requested no tool
+  calls and no `validator_feedback` sits between them. A v1.10 log records
+  the feedback and resumes normally, with the feedback back in its place as a
+  user message (added 2026-09-13, issue #28);
 - a missing or unreadable file (`opening session log: ...`);
 - an **empty path** - `--resume ""` or `--resume=` - is a usage error
   (`amele run: --resume needs a path`), not a run started from scratch: in a

@@ -1,12 +1,12 @@
 # JSONL event schema
 
-**v1.9 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.10 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
 `mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4), the
 opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6), the
 prompt-cache counts on `llm_response` and `run_end` (v1.7), the provider
-identities plus the `provider_fallback` event (v1.8) and the resumed-run keys
-on `run_start` (v1.9) added
+identities plus the `provider_fallback` event (v1.8), the resumed-run keys
+on `run_start` (v1.9) and the `validator_feedback` event (v1.10) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
@@ -36,7 +36,7 @@ Every line is one JSON object with three always-present fields:
 | Field | Type | Meaning |
 |-------|------|---------|
 | `v` | int | Wire schema version. Always `1` for this document - the `v1.8` above is this document's revision, and additive changes deliberately leave `v` alone (a bump means a consumer must be rewritten). |
-| `type` | string | Event type: `run_start`, `llm_response`, `provider_fallback`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
+| `type` | string | Event type: `run_start`, `llm_response`, `validator_feedback`, `provider_fallback`, `tool_call`, `tool_result`, `mcp_connect`, `mcp_tools_listed`, `mcp_disconnect`, `run_end`. |
 | `ts` | string | Event time, RFC 3339 UTC (Go `time.Time` JSON encoding). |
 
 All other fields are declared with `omitempty`: **a zero value is omitted**.
@@ -72,6 +72,20 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `reasoning` | string | The turn's reasoning payload, as the provider sent it, rendered as text (clipped + redacted like every other free-text field). Written **only** when the config sets `log_reasoning: true` **and** the turn carried a payload, so absence has three readings - the run did not opt in, the turn did no thinking, or the log predates v1.5 - and `reasoning_bytes` is what separates them: a positive `reasoning_bytes` with no `reasoning` means the content was not written (opted out, or a pre-v1.5 log), both absent means the turn carried no reasoning at all. The value is the provider's RAW payload, not prose: on a wire whose payload is a JSON string (a DeepSeek/GLM/Kimi `reasoning_content`) the logged text INCLUDES that JSON's own quoting and escapes - a `reasoning_content` of `first I considered...` is logged as the text `"first I considered..."`, quotes and all - while the anthropic wire logs the raw content-blocks JSON array and the gemini wire the raw parts JSON array. A consumer must parse it as the provider's payload for that wire and never read it as plain text - but a **clipped** value is a byte prefix plus the marker and will not parse at all (most visibly for the two array-shaped wires), so a consumer that needs to parse every turn sets `limits.max_logged_field: 0` and keeps the payload whole. Since v1.5. |
 | `model` | string | The model that served **this** turn, written **only** when it differs from `run_start.model` - i.e. after the run moved along `provider.fallback`. Absent means the turn was served by the model `run_start` named (or the log predates v1.8); it never means "unknown". Since v1.8. |
 | `provider` | string | The backend identity that served **this** turn (same vocabulary as `run_start.provider`), written under the same difference rule: present only when it differs from `run_start.provider`. The two keys are independent - a switch to another target on the same wire family writes `model` alone, and a switch to a different family that happens to serve the same model name writes `provider` alone. Since v1.8. |
+
+### `validator_feedback` - the output.schema validator rejected a final answer
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `turn` | int | The turn whose final answer was rejected - the same number as the `llm_response` just before it. |
+| `content` | string | The feedback sent back to the model as a **user** message (clipped + redacted): the validation errors, quoting the rejected answer where they must. |
+
+Written only by a run with `output.schema` set, once per rejection that
+bought a retry; the rejection that exhausts `max_schema_retries` ends the run
+(exit 6) and sends nothing back, so it writes none. The event is a turn of the
+conversation the model had - the one user message the log did not record
+before v1.10 - which is what makes such a run resumable: `--resume` puts the
+feedback back where it was. Since v1.10.
 
 ### `provider_fallback` - the run moved to the next fallback target
 
@@ -251,6 +265,11 @@ truthful partial accounting.
   the failed attempt keeps its own number, which no `llm_response` ever uses.
   With a chain of more than one entry, several `provider_fallback` events can
   follow one another, each on its own turn number, before any answer arrives.
+- A `validator_feedback` follows an `llm_response` that requested no tool
+  calls, carries that turn's number, and is followed by the retry's
+  `llm_response` with the next number - or by nothing but `run_end` (or by
+  nothing at all) when the run ended before the retry arrived. There is at
+  most one per turn.
 - Within a turn: the `llm_response` comes first, then its tool calls. Both
   `tool_call` and `tool_result` events appear in the order the model requested
   the calls in that `llm_response` (the same order as its `tool_call_ids`),
@@ -600,6 +619,33 @@ answering turn):
 - `fallbacks` is a count of switches, not of failures: a target that failed and
   had no successor left never produces one (the run ends with that provider's
   error, exit 5).
+
+### v1.10 (amele v0.3.1) - the schema validator's feedback turn (additive, `v` stays `1`)
+
+Added one event type, `validator_feedback`, written when `output.schema`
+rejects a final answer and the loop sends the model repair feedback. It reuses
+two existing field names - `turn` (the rejected turn's number) and `content`
+(the feedback text, clipped + redacted) - and nothing else changed a byte. A
+run whose answers all validate on the first try, or that sets no schema,
+writes exactly the bytes v1.9 wrote.
+
+```
+{"v":1,"type":"llm_response","ts":"2026-09-13T09:14:02.1Z","turn":1,"content":"{\"score\": \"high\"}","input_tokens":420,"output_tokens":12,"finish_reason":"stop"}
+{"v":1,"type":"validator_feedback","ts":"2026-09-13T09:14:02.2Z","turn":1,"content":"your previous answer did not satisfy the required JSON schema: ..."}
+{"v":1,"type":"llm_response","ts":"2026-09-13T09:14:04.7Z","turn":2,"content":"{\"score\": 9}","input_tokens":510,"output_tokens":9,"finish_reason":"stop"}
+```
+
+**Why:** the feedback is a user turn of the conversation the model had, and
+it was the one turn the log did not record - so a log of a schema retry showed
+two adjacent final answers, and `--resume` refused it as a conversation that
+never happened (issue #28). With the event in place such a run resumes; a
+pre-v1.10 log of a schema retry is still refused, with the same sentence, now
+naming the revision that fixes it.
+
+**Migration:** none required. A consumer that ignores unknown event types (the
+change policy above) sees no difference; one that counts `llm_response`
+events per turn number will find the `turn` of a `validator_feedback` shared
+with the `llm_response` before it, which is the rejected answer it belongs to.
 
 ### v1.9 (amele v0.3.0) - resumed runs (additive, `v` stays `1`)
 

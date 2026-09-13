@@ -16,6 +16,10 @@
 //   - tool_call fills one of those expected calls in - name and raw argument
 //     string - onto the open assistant message.
 //   - tool_result appends the tool message that answers one call.
+//   - validator_feedback (JSONL v1.10) is the user turn the output.schema
+//     validator sent back after rejecting a final answer: it closes that turn
+//     and appends a user message carrying the feedback, so the retry that
+//     follows is rebuilt in the conversation it actually happened in.
 //   - closing a turn (the next llm_response, or the end of the file) gives
 //     every requested-and-dispatched call that never got a result a synthetic
 //     tool message (PendingResultMessage) and lists it in Replay.Pending, so
@@ -32,10 +36,11 @@
 // tail ends a history, so with no complete event before it there is no history
 // to end.
 //
-// Two llm_response events in a row where the first requested no tool calls mean
-// a user turn happened that the log does not record (today: the output.schema
-// validator's feedback). Such a log is refused with ErrNotResumable rather than
-// rebuilt into a conversation that never happened.
+// Two llm_response events in a row where the first requested no tool calls and
+// no validator_feedback sits between them mean a user turn happened that the
+// log does not record - the shape every pre-v1.10 log of a schema retry has.
+// Such a log is refused with ErrNotResumable rather than rebuilt into a
+// conversation that never happened.
 //
 // A call the turn requested but never dispatched - no tool_call event, because
 // the run died between the two writes - is DROPPED from the assistant message
@@ -186,11 +191,12 @@ const redactedMarker = "[REDACTED]"
 // The event types this package understands. The rest are ignored by name, not
 // by omission, so an added event type cannot silently change a replay.
 const (
-	eventRunStart         = "run_start"
-	eventLLMResponse      = "llm_response"
-	eventToolCall         = "tool_call"
-	eventToolResult       = "tool_result"
-	eventProviderFallback = "provider_fallback"
+	eventRunStart          = "run_start"
+	eventLLMResponse       = "llm_response"
+	eventToolCall          = "tool_call"
+	eventToolResult        = "tool_result"
+	eventProviderFallback  = "provider_fallback"
+	eventValidatorFeedback = "validator_feedback"
 )
 
 // Read parses the log at path and rebuilds the history. Failures are one of
@@ -312,6 +318,10 @@ type builder struct {
 	// skipped-user-turn rule in llmResponse reads the sequence of turns in the
 	// log, so a turn closeTurn dropped still counts as one that happened.
 	opened bool
+	// answered records that the open turn's final answer was followed by a
+	// validator_feedback event, which is the one thing that makes a second
+	// final-shaped llm_response legitimate (see llmResponse).
+	answered bool
 	// expected is the open turn's tool_call_ids in the model's call order,
 	// and calls is their state by id. Both are replaced on every llm_response.
 	expected []string
@@ -382,6 +392,8 @@ func (b *builder) event(ev session.Event) error {
 		return b.toolCall(ev)
 	case eventToolResult:
 		return b.toolResult(ev)
+	case eventValidatorFeedback:
+		return b.validatorFeedback(ev)
 	default:
 		// Everything else is ignored, by design and without inspection: the
 		// event types this reader knows to skip (mcp_connect,
@@ -399,17 +411,17 @@ func (b *builder) event(ev session.Event) error {
 func (b *builder) llmResponse(ev session.Event) error {
 	// CONTRACT: a turn with no tool calls is a final answer, so a second
 	// llm_response after one means SOMETHING was said to the model in
-	// between - today that is the output.schema validator's feedback, which
-	// the log does not record. Rebuilding without it would hand the model a
-	// conversation it never had (and, for a signed-reasoning provider, one
-	// that no longer matches its own carrier), so the log is refused rather
-	// than guessed at. Logging that feedback is a JSONL contract change and
-	// belongs to its own slice.
-	if b.opened && len(b.expected) == 0 {
-		return fmt.Errorf("%w: the log skips a user turn (an output.schema retry's feedback is not logged); the run is not resumable",
+	// between - the output.schema validator's feedback, which a v1.10 log
+	// records as a validator_feedback event and an older log does not.
+	// Rebuilding without it would hand the model a conversation it never had
+	// (and, for a signed-reasoning provider, one that no longer matches its
+	// own carrier), so the older log is refused rather than guessed at.
+	if b.opened && len(b.expected) == 0 && !b.answered {
+		return fmt.Errorf("%w: the log skips a user turn (an output.schema retry's feedback is not logged before JSONL v1.10); the run is not resumable",
 			ErrNotResumable)
 	}
 	b.closeTurn()
+	b.answered = false
 	if err := gateClip("content", ev.Turn, ev.Content); err != nil {
 		return err
 	}
@@ -473,6 +485,37 @@ func (b *builder) restoreCarrier(msg *llm.Message, ev session.Event) error {
 	}
 	msg.Reasoning = json.RawMessage(ev.Reasoning)
 	b.rep.Carriers = true
+	return nil
+}
+
+// validatorFeedback closes the rejected final answer's turn and appends the
+// feedback as the user message it was.
+//
+// CONTRACT: the event belongs to a final-shaped turn (no tool calls) and comes
+// once per turn, on that turn's number - anything else is a file the writer
+// never produces, and rebuilding it would put a user message where no provider
+// accepts one. The turn is closed BEFORE the message is appended so the
+// empty-assistant drop (closeTurn) cannot truncate the feedback away with the
+// answer it follows. Completed is cleared: the answer this feedback rejects is
+// not one the run finished on, so a log that ends here continues without a new
+// instruction - the model's next move is to answer the feedback.
+func (b *builder) validatorFeedback(ev session.Event) error {
+	if !b.opened || len(b.expected) != 0 {
+		return fmt.Errorf("%w: validator_feedback for turn %d, which is not a final answer", ErrMalformed, ev.Turn)
+	}
+	if ev.Turn != b.turn {
+		return fmt.Errorf("%w: validator_feedback for turn %d while turn %d is open", ErrMalformed, ev.Turn, b.turn)
+	}
+	if b.answered {
+		return fmt.Errorf("%w: a second validator_feedback for turn %d", ErrMalformed, ev.Turn)
+	}
+	if err := gateClip("feedback", ev.Turn, ev.Content); err != nil {
+		return err
+	}
+	b.closeTurn()
+	b.rep.Messages = append(b.rep.Messages, llm.Message{Role: llm.RoleUser, Content: ev.Content})
+	b.answered = true
+	b.rep.Completed = false
 	return nil
 }
 
@@ -541,8 +584,10 @@ func (b *builder) expect(id, kind string) (*callState, error) {
 // they are dropped rather than invented - and a turn left with nothing at all
 // by that drop is itself dropped.
 //
-// It runs before each new llm_response and once at the end of the file, which
-// is what makes an interrupted run (no run_end at all) resumable.
+// It runs before each new llm_response, on a validator_feedback, and once at
+// the end of the file, which is what makes an interrupted run (no run_end at
+// all) resumable. It is idempotent: a turn closed by the feedback event is not
+// patched again when the retry opens the next one.
 func (b *builder) closeTurn() {
 	if b.assistant >= 0 {
 		// CONTRACT: tool_call_ids IS the model's call order, so rebuilding
@@ -571,6 +616,7 @@ func (b *builder) closeTurn() {
 			b.rep.Messages[b.assistant].Reasoning = nil
 		}
 		b.dropEmptyAssistant()
+		b.assistant = -1
 	}
 	for _, id := range b.expected {
 		st := b.calls[id]

@@ -810,6 +810,48 @@ func TestFinalValidatorRetry(t *testing.T) {
 	}
 }
 
+// TestFinalValidatorFeedbackIsLogged (issue #28): the validator's feedback is
+// a user turn of the conversation, so the session log records it between the
+// rejected answer and the retry - on the rejected turn's number - instead of
+// showing two adjacent final answers with the user turn missing.
+func TestFinalValidatorFeedbackIsLogged(t *testing.T) {
+	w, err := session.New(t.TempDir(), session.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &llm.Fake{Responses: []llm.Response{
+		llm.TextResponse("bad", usage(1, 1)),
+		llm.TextResponse("good", usage(1, 1)),
+	}}
+	l := newLoop(t, fake, Limits{})
+	l.Session = w
+	l.FinalValidator = func(text string) (string, bool) { return "fix it", text == "good" }
+
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(w.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []string
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var ev session.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatal(err)
+		}
+		types = append(types, ev.Type)
+		if ev.Type == "validator_feedback" && (ev.Turn != 1 || ev.Content != "fix it") {
+			t.Errorf("validator_feedback = turn %d %q, want turn 1 \"fix it\"", ev.Turn, ev.Content)
+		}
+	}
+	// No run_end: the loop's caller writes that one (cmd), not Run.
+	want := []string{"run_start", "llm_response", "validator_feedback", "llm_response"}
+	if strings.Join(types, " ") != strings.Join(want, " ") {
+		t.Errorf("event order = %v, want %v", types, want)
+	}
+}
+
 // TestFinalValidatorEmptyFeedback: a refusal carrying no feedback must still
 // produce a non-empty user message - some OpenAI-compatible endpoints reject
 // a request containing an empty-content message outright.

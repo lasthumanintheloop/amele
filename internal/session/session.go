@@ -72,6 +72,8 @@ type Event struct {
 	// are the IDs of the tool calls requested in the same message. Together
 	// with the tool_call/tool_result events these make the log a complete
 	// conversation record - the replay/resume source the package promises.
+	// validator_feedback (v1.10) reuses Turn and Content: the turn whose final
+	// answer was rejected, and the user-role feedback text sent back.
 	Turn         int      `json:"turn,omitempty"`
 	Content      string   `json:"content,omitempty"`
 	ToolCallIDs  []string `json:"tool_call_ids,omitempty"`
@@ -772,6 +774,20 @@ func (w *Writer) ProviderFallback(f ProviderFallback) {
 		FromProvider: f.FromProvider,
 		ToProvider:   f.ToProvider,
 	})
+}
+
+// ValidatorFeedback records the user-role message the output.schema validator
+// sent back after rejecting the final answer of turn (JSONL v1.10). The text
+// goes through the same redact+clip path as every other free-text field: it
+// quotes the rejected answer's validation errors, which can echo model output.
+//
+// CONTRACT: it is logged because it is a turn of the conversation the model
+// had - the one user message the log never recorded - and without it a run
+// that took a schema retry could not be resumed (issue #28). It sits between
+// the rejected llm_response and the retry's llm_response, on the rejected
+// turn's number.
+func (w *Writer) ValidatorFeedback(turn int, feedback string) {
+	w.emit(Event{Type: "validator_feedback", Turn: turn, Content: w.clip(feedback)})
 }
 
 // ToolCall records a tool invocation request from the model. callID links the
