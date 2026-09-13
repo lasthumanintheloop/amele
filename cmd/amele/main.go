@@ -262,7 +262,10 @@ FLAGS
                   new run's run_start records the origin (resumed_from,
                   resumed_turn, resumed_pending) so an operator can see which
                   side effects are unaccounted for. Turn numbering starts at 1
-                  again; the log named by PATH is never appended to.
+                  again; the log named by PATH is never appended to. A log
+                  that was itself written by a resumed run names the log it
+                  continued, and that chain is followed: naming the NEWEST
+                  log rebuilds every earlier run's turns and instructions.
                   A log whose run already produced a final answer has nothing
                   to continue on its own: resuming it without an instruction
                   is exit 2. Default: off - the run starts from the task text.
@@ -1934,7 +1937,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	// hands that choice to callers driving their own history - `chat` has
 	// always done it - so the run below goes through RunMessages.
 	logResumeNote(stderr, parsed, replay, secrets)
-	logRunStart(agent, cfg, task, parsed.resume, replay)
+	logRunStart(agent, cfg, task, parsed.resume, resumeInstruction(taskArgs), replay)
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
@@ -2083,14 +2086,7 @@ func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskA
 	if err != nil {
 		return "", nil, nil, err
 	}
-	// Whitespace-only arguments are no instruction at all - the same rule
-	// buildTask applies to a one-shot task, so `--resume log " "` cannot buy a
-	// round trip that asks the model nothing. Anything that survives it is
-	// sent exactly as typed (resumeHistory).
-	var instruction string
-	if strings.TrimSpace(taskArgs) != "" {
-		instruction = taskArgs
-	}
+	instruction := resumeInstruction(taskArgs)
 	if replay.Completed && instruction == "" {
 		return "", nil, nil, errResumeCompleted
 	}
@@ -2098,6 +2094,19 @@ func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskA
 	// and repeating it in the new log is what lets the two be read as one
 	// story. The origin fields say the rest.
 	return replay.Task, resumeHistory(cfg, replay, instruction), replay, nil
+}
+
+// resumeInstruction is the follow-up a --resume run sends as its last user
+// message: the task text as typed, or nothing. Whitespace-only arguments are
+// no instruction at all - the same rule buildTask applies to a one-shot task,
+// so `--resume log " "` cannot buy a round trip that asks the model nothing.
+// Anything that survives is sent exactly as typed (resumeHistory) and recorded
+// exactly as typed (run_start.resumed_instruction), so the two cannot differ.
+func resumeInstruction(taskArgs string) string {
+	if strings.TrimSpace(taskArgs) == "" {
+		return ""
+	}
+	return taskArgs
 }
 
 // errResumeCompleted is the refusal for a log whose run already answered.
@@ -2138,17 +2147,20 @@ func resumeHistory(cfg *config.Config, replay *resume.Replay, instruction string
 // there was one.
 //
 // CONTRACT (docs/contracts/jsonl-events.md): a resumed run writes run_start
-// with the three v1.9 origin fields and a normal run writes none of them, so
-// absence keeps meaning "this run started from nothing" - including in every
-// log written before the fields existed. The path is recorded exactly as the
-// operator typed it, because that is the string that names the file again.
-func logRunStart(agent *loop.Loop, cfg *config.Config, task, from string, replay *resume.Replay) {
+// with the three v1.9 origin fields plus the v1.11 instruction, and a normal
+// run writes none of them, so absence keeps meaning "this run started from
+// nothing" - including in every log written before the fields existed. The
+// path is recorded exactly as the operator typed it, because that is the
+// string that names the file again; resumed_turn counts the turns of the
+// whole chain the path leads to, since that is how much conversation precedes
+// this run's turn 1.
+func logRunStart(agent *loop.Loop, cfg *config.Config, task, from, instruction string, replay *resume.Replay) {
 	if replay == nil {
 		agent.Session.RunStart(cfg.Model, cfg.Provider.Identity(), task)
 		return
 	}
 	agent.Session.RunStartResumed(cfg.Model, cfg.Provider.Identity(), task, session.Resumed{
-		From: from, Turn: replay.LastTurn, Pending: replay.Pending,
+		From: from, Turn: replay.LastTurn, Pending: replay.Pending, Instruction: instruction,
 	})
 }
 
@@ -2179,6 +2191,11 @@ func logResumeNote(stderr io.Writer, parsed agentArgs, replay *resume.Replay, se
 	note := fmt.Sprintf("resuming %s: %d %s of %s on %s; %d pending %s; reasoning carriers %s",
 		parsed.resume, replay.LastTurn, pluralNoun(replay.LastTurn, "turn"), replay.Model, replay.Provider,
 		len(replay.Pending), pluralNoun(len(replay.Pending), "tool call"), carriers)
+	if replay.Links > 1 {
+		// The turns above span every log the named one continues; say so, or
+		// "5 turns" of a 1-turn file reads like a lie.
+		note += fmt.Sprintf("; a chain of %d logs", replay.Links)
+	}
 	_, _ = fmt.Fprintf(stderr, "amele: %s\n", safeForTerminal(secrets.Redact(note), maxProgressLine))
 }
 

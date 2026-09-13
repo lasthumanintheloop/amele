@@ -5396,6 +5396,65 @@ func TestE2EResumeCompletedRun(t *testing.T) {
 	})
 }
 
+// TestE2EResumeFollowsTheChain (issue #31): resuming a log that was itself
+// written by a resume rebuilds the whole chain - the original run's turns, the
+// first resume's instruction and turns, then the new instruction - and the new
+// run_start counts the chain's turns and records this run's instruction.
+func TestE2EResumeFollowsTheChain(t *testing.T) {
+	first := interruptedRunLog(t) // turn 1: fs_read note.txt, answered; then the provider died
+
+	srvB := scriptedServer(t, textBody("the note says to remember the milk"))
+	cfgB, dirB := writeResumeConfig(t, srvB.URL, "limits:\n  max_logged_field: 0\n")
+	code, _, stderr := execCLI(t, []string{"run", cfgB, "--resume", first, "be brief"}, "")
+	if code != ExitOK {
+		t.Fatalf("run B: exit %d, stderr: %s", code, stderr)
+	}
+	second := sessionLogPath(t, dirB)
+	if raw := readSessionRaw(t, dirB); !strings.Contains(raw, `"resumed_instruction":"be brief"`) {
+		t.Fatalf("run B's run_start does not record its instruction:\n%s", raw)
+	}
+
+	srvC, reqs := capturingServer(t, textBody("one item: milk"))
+	cfgC, dirC := writeResumeConfig(t, srvC.URL, "")
+	code, stdout, stderr := execCLI(t, []string{"run", cfgC, "-v", "--resume", second, "now count the items"}, "")
+	if code != ExitOK {
+		t.Fatalf("run C: exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "one item: milk\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if len(*reqs) != 1 {
+		t.Fatalf("provider calls = %d, want 1", len(*reqs))
+	}
+	var got []string
+	for _, m := range (*reqs)[0].Messages {
+		got = append(got, m.Role+": "+m.Content)
+	}
+	want := []string{
+		"system: You are a test agent.",
+		"user: read the note",
+		"assistant: ",
+		"tool: remember the milk",
+		"user: be brief",
+		"assistant: the note says to remember the milk",
+		"user: now count the items",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("chained conversation:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	raw := readSessionRaw(t, dirC)
+	// resumed_from stays the pointer the operator typed; resumed_turn counts
+	// the chain (1 turn in the first log + 1 in the second).
+	for _, want := range []string{`"resumed_from":` + strconv.Quote(second), `"resumed_turn":2`, `"resumed_instruction":"now count the items"`} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("run C's run_start lacks %s:\n%s", want, raw)
+		}
+	}
+	if !strings.Contains(stderr, "2 turns of test-model on openai; 0 pending tool calls; reasoning carriers not restored; a chain of 2 logs") {
+		t.Errorf("-v note does not describe the chain: %q", stderr)
+	}
+}
+
 // TestE2EResumeSchemaRetryRun (issue #28): a run that took an output.schema
 // retry is resumable, because the validator's feedback is now a logged user
 // turn. The resumed provider request must carry the conversation as it

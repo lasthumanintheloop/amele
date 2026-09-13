@@ -28,6 +28,23 @@
 //     what the model saw and is ignored here; provider_fallback is read in a
 //     pre-scan, for carriers only.
 //
+// # Chains
+//
+// A log written by a resumed run names the log it continued in
+// run_start.resumed_from, and records the follow-up instruction that run was
+// given in run_start.resumed_instruction (JSONL v1.11). Read follows that
+// pointer: the named log's history is rebuilt first (recursively, up to
+// MaxChainLinks), the instruction is appended as the user message it was, and
+// this log's own turns follow - so a chain of resumes is one growing
+// conversation rather than a chain of shortening ones (issue #31). Every link
+// passes the same gates (schema version, clip marker, malformed events) and
+// decides its own reasoning carriers (Options), so a link produced by another
+// model keeps its carriers to itself while the links that match still get
+// theirs back. A link that cannot be read - missing, moved, or named through a
+// path that redaction rewrote - refuses the whole read: continuing from the
+// first readable link would silently drop the conversation the missing one
+// held, which is exactly what following the chain exists to avoid.
+//
 // A file whose LAST line is torn - a prefix of an event with no newline after
 // it, which is what a SIGKILL mid-write leaves behind - ends there: the events
 // before it are complete, and that is the position the resumed run continues
@@ -120,7 +137,18 @@ type Replay struct {
 	// Carriers reports that at least one assistant message got its provider
 	// reasoning payload back (see Options.Provider).
 	Carriers bool
+	// Links is how many session logs the history was rebuilt from: 1 for a
+	// log that started from its own task, more for a log that continued an
+	// earlier one (see Chains in the package comment). LastTurn counts the
+	// turns of every link.
+	Links int
 }
+
+// MaxChainLinks bounds how many logs a resume follows through resumed_from.
+// It is a guard against a cycle in operator-edited files (a log copied over
+// the one it points at), not a working limit: a chain that long has been
+// resumed more times than any run should be.
+const MaxChainLinks = 32
 
 // Options tunes carrier restoration.
 //
@@ -200,27 +228,75 @@ const (
 	eventValidatorFeedback = "validator_feedback"
 )
 
-// Read parses the log at path and rebuilds the history. Failures are one of
-// ErrClipped, ErrNotResumable or ErrMalformed (match with errors.Is), each
-// wrapped with the path so a message can be printed as-is - or the context's
-// own error when ctx ends before the file is read: the log is operator-named,
-// and a path that blocks (a FIFO with no writer, a hung mount) must not hold
-// the run past limits.timeout or a SIGTERM (issue #29).
+// Read parses the log at path and rebuilds the history, following the chain
+// of logs it continues (see Chains in the package comment). Failures are one
+// of ErrClipped, ErrNotResumable or ErrMalformed (match with errors.Is), each
+// wrapped with the path of the link that failed so a message can be printed
+// as-is - or the context's own error when ctx ends before a file is read: the
+// logs are operator-named, and a path that blocks (a FIFO with no writer, a
+// hung mount) must not hold the run past limits.timeout or a SIGTERM (issue
+// #29).
 func Read(ctx context.Context, path string, opts Options) (*Replay, error) {
+	return readLink(ctx, path, opts, 1)
+}
+
+// readLink reads one log of the chain. depth is this link's 1-based position
+// counted from the log the operator named; it is what MaxChainLinks bounds.
+func readLink(ctx context.Context, path string, opts Options, depth int) (*Replay, error) {
+	if depth > MaxChainLinks {
+		return nil, fmt.Errorf("%w: the resume chain is longer than %d logs (a resumed_from cycle?)", ErrNotResumable, MaxChainLinks)
+	}
 	data, err := ctxfile.ReadFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("opening session log: %w", err)
 	}
-	rep, err := ReadFrom(bytes.NewReader(data), opts)
+	link, err := readOne(bytes.NewReader(data), opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return rep, nil
+	if link.from == "" {
+		return &link.rep, nil
+	}
+	// The path is followed exactly as the old run's operator typed it,
+	// resolved against the current working directory like every other
+	// operator path: it is a pointer the log recorded, not one this reader
+	// invents. A parent that fails to read fails the whole resume - see the
+	// package comment for why the first readable link is not a fallback.
+	parent, err := readLink(ctx, link.from, opts, depth+1)
+	if err != nil {
+		return nil, fmt.Errorf("%s: following resumed_from: %w", path, err)
+	}
+	return chain(parent, link), nil
 }
 
-// ReadFrom rebuilds the history from an already-open log. It is the tested
-// core of Read; callers with a file path want Read.
+// ReadFrom rebuilds the history from an already-open log. It reads that log
+// alone - with no path there is no chain to follow - and is the tested core
+// of Read; callers with a file path want Read.
 func ReadFrom(r io.Reader, opts Options) (*Replay, error) {
+	link, err := readOne(r, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &link.rep, nil
+}
+
+// link is one log of a chain as readOne yields it: its own replay, plus the
+// two run_start facts that tie it to the log it continued.
+type link struct {
+	rep Replay
+	// from is run_start.resumed_from - empty for a log that started from its
+	// own task, which ends the chain.
+	from string
+	// instruction is run_start.resumed_instruction: the user message that
+	// sat between the parent's history and this log's first turn.
+	instruction string
+	// opened is whether the log holds at least one llm_response; it decides
+	// whose Completed verdict a chain takes (see chain).
+	opened bool
+}
+
+// readOne decodes and rebuilds a single log.
+func readOne(r io.Reader, opts Options) (*link, error) {
 	events, err := decode(r)
 	if err != nil {
 		return nil, err
@@ -236,7 +312,41 @@ func ReadFrom(r io.Reader, opts Options) (*Replay, error) {
 		}
 	}
 	b.closeTurn()
-	return &b.rep, nil
+	b.rep.Links = 1
+	return &link{rep: b.rep, from: events[0].ResumedFrom, instruction: events[0].ResumedInstruction, opened: b.opened}, nil
+}
+
+// chain appends one link's conversation to the history of the log it
+// continued, reproducing what that link's run actually sent: the parent's
+// rebuilt history (including the synthetic results of its pending calls -
+// the same ones the link's run stood in), then the instruction as the last
+// user message when there was one, then the link's own turns. The link's own
+// task message is dropped: it is the parent's task, copied.
+//
+// The facts of the newest link win where only one log can answer: Model and
+// Provider are the link's (the last backend the conversation ran on), Pending
+// is the link's alone (the parent's pending calls were answered - with the
+// stand-in - in the link's run, and the link's run_start already lists them),
+// and Completed is the link's verdict when it produced a turn at all; a link
+// that died before its first turn hands the question back to the parent,
+// unless it added an instruction nobody has answered yet.
+func chain(parent *Replay, l *link) *Replay {
+	rep := l.rep
+	rep.Task = parent.Task
+	rep.Links = parent.Links + 1
+	rep.LastTurn += parent.LastTurn
+	rep.Carriers = rep.Carriers || parent.Carriers
+	msgs := make([]llm.Message, 0, len(parent.Messages)+1+len(l.rep.Messages))
+	msgs = append(msgs, parent.Messages...)
+	if l.instruction != "" {
+		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: l.instruction})
+	}
+	msgs = append(msgs, l.rep.Messages[1:]...)
+	rep.Messages = msgs
+	if !l.opened {
+		rep.Completed = parent.Completed && l.instruction == ""
+	}
+	return &rep
 }
 
 // decode reads the whole log into memory, one JSONL line at a time.
@@ -357,6 +467,9 @@ func newBuilder(events []session.Event, opts Options) (*builder, error) {
 		return nil, fmt.Errorf("%w: it records an interactive chat, which has no task to continue", ErrNotResumable)
 	}
 	if err := gateClip("task", 0, start.Task); err != nil {
+		return nil, err
+	}
+	if err := gateClip("instruction", 0, start.ResumedInstruction); err != nil {
 		return nil, err
 	}
 	b := &builder{assistant: -1}

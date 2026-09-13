@@ -1461,9 +1461,16 @@ func TestRunStartResumed(t *testing.T) {
 			absent:  []string{`"resumed_turn"`, `"resumed_pending"`},
 		},
 		{
+			// v1.11: the follow-up instruction is a user turn of the
+			// conversation, logged so a chain of resumes can be rebuilt.
+			name:    "an instruction is recorded",
+			resumed: &Resumed{From: "run-1.jsonl", Turn: 3, Instruction: "now open a ticket"},
+			want:    []string{`"resumed_from":"run-1.jsonl"`, `"resumed_instruction":"now open a ticket"`},
+		},
+		{
 			name:   "a fresh run carries no origin at all",
 			want:   []string{`"type":"run_start"`, `"task":"scan the logs"`},
-			absent: []string{`"resumed_from"`, `"resumed_turn"`, `"resumed_pending"`},
+			absent: []string{`"resumed_from"`, `"resumed_turn"`, `"resumed_pending"`, `"resumed_instruction"`},
 		},
 	}
 	for _, tt := range tests {

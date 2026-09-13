@@ -64,9 +64,17 @@ type Event struct {
 	// call ids the interrupted run dispatched but never logged a result for -
 	// the resumed run stands a message in for each and RE-EXECUTES NONE, so a
 	// reader can see exactly which side effects are unaccounted for.
-	ResumedFrom    string   `json:"resumed_from,omitempty"`
-	ResumedTurn    int      `json:"resumed_turn,omitempty"`
-	ResumedPending []string `json:"resumed_pending,omitempty"`
+	//
+	// ResumedInstruction (v1.11, additive) is the follow-up instruction the
+	// operator gave beside --resume, sent verbatim as the last user message
+	// of the rebuilt history. It is logged because it is a user turn of the
+	// conversation that no other event records - the task belongs to the
+	// original run - and without it a chain of resumes could not be rebuilt
+	// as one conversation (issue #31). Clipped + redacted like task.
+	ResumedFrom        string   `json:"resumed_from,omitempty"`
+	ResumedTurn        int      `json:"resumed_turn,omitempty"`
+	ResumedPending     []string `json:"resumed_pending,omitempty"`
+	ResumedInstruction string   `json:"resumed_instruction,omitempty"`
 
 	// llm_response. Content is the assistant's text (clipped); ToolCallIDs
 	// are the IDs of the tool calls requested in the same message. Together
@@ -619,6 +627,9 @@ type Resumed struct {
 	// logged a result for, in call order. The resumed run re-executes none of
 	// them; each got a synthetic tool message instead.
 	Pending []string
+	// Instruction is the follow-up the operator typed beside --resume, empty
+	// when there was none (Event.ResumedInstruction, v1.11).
+	Instruction string
 }
 
 // RunStartResumed records the beginning of a run that CONTINUES an earlier
@@ -638,6 +649,7 @@ func (w *Writer) RunStartResumed(model, provider, task string, r Resumed) {
 	w.runStart(Event{
 		Type: "run_start", Model: model, Provider: provider, Task: w.clip(task),
 		ResumedFrom: w.redactOnly(r.From), ResumedTurn: r.Turn, ResumedPending: r.Pending,
+		ResumedInstruction: w.clip(r.Instruction),
 	})
 }
 

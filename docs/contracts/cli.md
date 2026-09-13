@@ -388,26 +388,46 @@ saying what came back:
 amele: resuming out/item/run-1.jsonl: 3 turns of claude-sonnet-4 on anthropic; 1 pending tool call; reasoning carriers restored
 ```
 
-The verdict is `restored` or `not restored`; the line is redacted and clipped
-like every other `-v` line, and its wording is human-facing, not a parsing
-contract.
+The verdict is `restored` or `not restored`; when the named log continues
+earlier ones the line ends with `; a chain of N logs`, and the turn count is
+the chain's. The line is redacted and clipped like every other `-v` line, and
+its wording is human-facing, not a parsing contract.
 
 **The resumed run writes a NEW session log.** The file named by `--resume` is
 opened read-only and never appended to, and the new file numbers its turns
 from 1 again. Its `run_start` records the origin in the three fields added by
-[JSONL v1.9](jsonl-events.md): `resumed_from` (the path exactly as typed, the
-one logged field that is redacted but never clipped), `resumed_turn` (the
-highest turn the old log carried) and `resumed_pending` (the interrupted call
-ids above, absent when there are none). The task it records is the OLD run's
-task, so the two files read as one story.
+[JSONL v1.9](jsonl-events.md) - `resumed_from` (the path exactly as typed, the
+one logged field that is redacted but never clipped), `resumed_turn` (how many
+turns precede this run's turn 1, over the whole chain below) and
+`resumed_pending` (the interrupted call ids above, absent when there are
+none) - plus, since v1.11, `resumed_instruction`: the follow-up given on the
+command line, verbatim, when there was one. The task it records is the OLD
+run's task, so the files read as one story.
 
-**`resumed_from` is a pointer, not an inclusion.** The history a resume
-rebuilds is the turns of the log named on the command line, and only those. A
-log that was itself produced by a resume records its own run's turns; the
-conversation it continued lives in the file it points at, and is not pulled
-back in. So a chain of resumes is a chain of *shortening* conversations, and
-the log to name for a second retry is usually the original one - see
-[docs/deployment.md](../deployment.md) §4.
+**A chain of resumes is followed.** A log written by a resumed run names the
+log it continued, and `--resume` follows that pointer: the named log's history
+is rebuilt first (recursively, through every earlier link), the instruction
+that run was given comes back as the user message it was, and the named log's
+own turns follow - so resuming a retry keeps everything the original attempt
+did, and the log to name for the next retry is the **newest** one (see
+[docs/deployment.md](../deployment.md) §4). Every link passes the same gates
+as the named log (schema version, clip marker, malformed events), and each
+link decides its own reasoning carriers by the rule above - a link produced by
+another model keeps its payloads out of the replay while the links that match
+still get theirs back. A link that cannot be read refuses the whole resume
+(exit 2, naming both the file that pointed and the file that is missing:
+`run-3.jsonl: following resumed_from: opening session log: open run-2.jsonl:
+no such file or directory`) - continuing from the first readable link would
+silently drop the conversation the missing one held, which is what following
+the chain exists to avoid. The pointer is followed exactly as it was typed,
+resolved against the current working directory, so a chain resumed from
+another directory needs the same relative layout, and a `resumed_from` that
+redaction rewrote is a link that cannot be read. At most 32 links are
+followed; a longer chain - in practice a cycle in edited files - is refused as
+not resumable. Logs written before v1.11 recorded no instruction, so a chain
+through one of them rebuilds without that user message: the turns are all
+there, the follow-up that prompted them is not. Added 2026-09-13 (issue #31);
+before it, a resume rebuilt the named log's turns alone.
 
 **The other run-level guards come first.** `lock: true` keys on the config
 path, not on the log, so resuming a config whose original run is still alive

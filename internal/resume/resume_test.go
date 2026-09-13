@@ -777,3 +777,174 @@ func TestUndispatchedCallDropsTheCarrier(t *testing.T) {
 		t.Errorf("Pending = %v, want none (the call was never dispatched)", got.Pending)
 	}
 }
+
+// writeChainLog writes one log of a chain into dir and returns its path. The
+// lines are given whole so a test reads like the files an operator has.
+func writeChainLog(t *testing.T, dir, name string, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// resumedStart renders the run_start of a log that continued another one.
+func resumedStart(from, instruction string) string {
+	ev := map[string]any{
+		"v": 1, "type": "run_start", "ts": "2026-09-13T03:00:00Z",
+		"model": "gpt-4o", "provider": "openai", "task": "scan the logs",
+		"resumed_from": from, "resumed_turn": 1,
+	}
+	if instruction != "" {
+		ev["resumed_instruction"] = instruction
+	}
+	b, _ := json.Marshal(ev)
+	return string(b)
+}
+
+const (
+	turn1Call   = `{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:01Z","turn":1,"content":"reading","tool_call_ids":["c1"],"finish_reason":"tool_calls"}`
+	turn1Dispat = `{"v":1,"type":"tool_call","ts":"2026-09-13T03:00:02Z","tool_call_id":"c1","tool":"fs_read","args":"{}"}`
+	turn1Result = `{"v":1,"type":"tool_result","ts":"2026-09-13T03:00:03Z","tool_call_id":"c1","tool":"fs_read","result":"ERROR at 03:00"}`
+	finalTurn   = `{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":1,"content":"one error at 03:00","finish_reason":"stop"}`
+)
+
+// TestReadFollowsTheChain (issue #31): a log produced by a resume names the log
+// it continued, and reading it rebuilds BOTH - the original run's turns, the
+// instruction the resume was given, then the retry's turns - as one
+// conversation, with the turn count and the link count of the whole chain.
+func TestReadFollowsTheChain(t *testing.T) {
+	dir := t.TempDir()
+	// Run 1 died with c1 dispatched and unanswered.
+	root := writeChainLog(t, dir, "run-1.jsonl", runStart, turn1Call, turn1Dispat)
+	// Run 2 resumed it with an instruction and finished.
+	retry := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "be brief"), finalTurn)
+	// Run 3 resumed the retry, added another instruction, and died before its
+	// first turn.
+	third := writeChainLog(t, dir, "run-3.jsonl", resumedStart(retry, "now count them"))
+
+	got, err := resume.Read(context.Background(), third, resume.Options{Provider: "openai", Model: "gpt-4o"})
+	if err != nil {
+		t.Fatalf("Read = %v", err)
+	}
+	if got.Links != 3 || got.LastTurn != 2 {
+		t.Errorf("Links = %d, LastTurn = %d; want 3 and 2 (one turn per run that made one)", got.Links, got.LastTurn)
+	}
+	if got.Task != "scan the logs" || got.Completed {
+		t.Errorf("Task = %q, Completed = %v; want the root task and an unanswered instruction", got.Task, got.Completed)
+	}
+	if len(got.Pending) != 0 {
+		t.Errorf("Pending = %v; the root's pending call was answered (stood in) by run 2", got.Pending)
+	}
+	assertMessages(t, got.Messages, []llm.Message{
+		user("scan the logs"),
+		assistant("reading", llm.ToolCall{ID: "c1", Name: "fs_read", Arguments: "{}"}),
+		toolMsg("c1", resume.PendingResultMessage),
+		user("be brief"),
+		assistant("one error at 03:00"),
+		user("now count them"),
+	})
+
+	t.Run("the middle link alone", func(t *testing.T) {
+		got, err := resume.Read(context.Background(), retry, resume.Options{})
+		if err != nil {
+			t.Fatalf("Read = %v", err)
+		}
+		if got.Links != 2 || got.LastTurn != 2 || !got.Completed {
+			t.Errorf("Links = %d, LastTurn = %d, Completed = %v; want 2, 2, true", got.Links, got.LastTurn, got.Completed)
+		}
+		if n := len(got.Messages); n != 5 || got.Messages[n-1].Content != "one error at 03:00" {
+			t.Errorf("Messages = %+v", got.Messages)
+		}
+	})
+}
+
+// TestChainCompletedFollowsTheParent: a link that died before its first turn
+// and added no instruction leaves the question "is there anything left to
+// answer?" to the log it continued.
+func TestChainCompletedFollowsTheParent(t *testing.T) {
+	dir := t.TempDir()
+	root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
+	empty := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, ""))
+	got, err := resume.Read(context.Background(), empty, resume.Options{})
+	if err != nil {
+		t.Fatalf("Read = %v", err)
+	}
+	if !got.Completed || got.LastTurn != 1 || got.Links != 2 {
+		t.Errorf("Completed = %v, LastTurn = %d, Links = %d; want true, 1, 2", got.Completed, got.LastTurn, got.Links)
+	}
+}
+
+// TestChainCarriersPerLink: each link decides its own carriers. A link run by
+// another model keeps its payloads out of the replay while the links that
+// match the current model still get theirs back.
+func TestChainCarriersPerLink(t *testing.T) {
+	dir := t.TempDir()
+	reasoning := `{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":1,"content":"done","finish_reason":"stop","reasoning_bytes":11,"reasoning":"[{\"a\":1}]"}`
+	root := writeChainLog(t, dir, "run-1.jsonl", runStart, reasoning)
+	otherModel := strings.Replace(resumedStart(root, "again"), `"model":"gpt-4o"`, `"model":"gpt-4o-mini"`, 1)
+	retry := writeChainLog(t, dir, "run-2.jsonl", otherModel, reasoning)
+
+	got, err := resume.Read(context.Background(), retry, resume.Options{Provider: "openai", Model: "gpt-4o"})
+	if err != nil {
+		t.Fatalf("Read = %v", err)
+	}
+	if !got.Carriers {
+		t.Fatal("the root link matches the current model, so its carrier must come back")
+	}
+	// Messages: task, root assistant (carrier), instruction, retry assistant (no carrier).
+	if len(got.Messages) != 4 {
+		t.Fatalf("Messages = %+v", got.Messages)
+	}
+	if len(got.Messages[1].Reasoning) == 0 {
+		t.Errorf("root turn lost its carrier: %+v", got.Messages[1])
+	}
+	if len(got.Messages[3].Reasoning) != 0 {
+		t.Errorf("a turn produced by another model must not carry its payload: %+v", got.Messages[3])
+	}
+}
+
+// TestChainRefusals: a chain is refused whole when a link cannot be read, is
+// clipped where the history needs it, or never ends.
+func TestChainRefusals(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("a missing link names both files", func(t *testing.T) {
+		missing := filepath.Join(dir, "gone.jsonl")
+		child := writeChainLog(t, dir, "run-2.jsonl", resumedStart(missing, ""), finalTurn)
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if err == nil || !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("err = %v, want a not-exist error", err)
+		}
+		for _, want := range []string{child, "following resumed_from", missing} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err %q does not name %q", err, want)
+			}
+		}
+	})
+	t.Run("a clipped instruction", func(t *testing.T) {
+		root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
+		child := writeChainLog(t, dir, "run-clip.jsonl", resumedStart(root, "be brief"+session.ClipMarker))
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if !errors.Is(err, resume.ErrClipped) || !strings.Contains(err.Error(), "instruction") {
+			t.Fatalf("err = %v, want ErrClipped naming the instruction", err)
+		}
+	})
+	t.Run("a cycle hits the link cap", func(t *testing.T) {
+		self := filepath.Join(dir, "loop.jsonl")
+		writeChainLog(t, dir, "loop.jsonl", resumedStart(self, ""), finalTurn)
+		_, err := resume.Read(context.Background(), self, resume.Options{})
+		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "longer than") {
+			t.Fatalf("err = %v, want ErrNotResumable naming the chain cap", err)
+		}
+	})
+	t.Run("a cancelled context stops at the first link", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		root := writeChainLog(t, dir, "run-ctx.jsonl", runStart, finalTurn)
+		_, err := resume.Read(ctx, root, resume.Options{})
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	})
+}

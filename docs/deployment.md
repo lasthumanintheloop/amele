@@ -311,7 +311,7 @@ instead of buying it again.
 
 ```sh
 amele run agent.yaml -q --set "session_dir=out/$item" \
-  --resume "$(ls -1 "out/$item"/run-*.jsonl | head -n 1)" \
+  --resume "$(ls -1 "out/$item"/run-*.jsonl | tail -n 1)" \
   > "out/$item.json"
 ```
 
@@ -326,14 +326,15 @@ And the retry writes a **new** file into the same directory rather than
 appending to the old one, so an item that was resumed twice has three logs in
 timestamp order, each naming its predecessor in `resumed_from`.
 
-**Which log to name on the second retry: the first one.** `resumed_from` is a
-pointer, not an inclusion - a resume rebuilds the turns of the log it is given
-and nothing the file points at. The second log therefore records only the
-turns the *retry* ran, so resuming it continues a conversation that has lost
-everything the original attempt did; a chain of resumes is a chain of
-shortening conversations. Naming the item's **original** log keeps the run
-that did the real work, which is why the `ls | head -n 1` above picks the
-oldest file rather than the newest. Full rules:
+**Which log to name on the second retry: the newest one.** A log written by a
+resumed run names the log it continued in `resumed_from`, and `--resume`
+follows that chain: naming the newest file rebuilds the original attempt's
+turns, each retry's instruction and turns, in order, as one conversation -
+which is why the `ls | tail -n 1` above picks the newest file. The chain is
+read whole or not at all: if an earlier log has been cleaned up (§3) the
+resume is refused naming the missing file, since continuing from the first
+readable link would silently lose the work the missing one held. Keep an
+item's logs together for as long as the item may be retried. Full rules:
 [CLI contract](contracts/cli.md#resuming-a-run---resume-path).
 
 **The full-record combination.** When a batch exists to be audited afterwards -

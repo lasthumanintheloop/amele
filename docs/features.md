@@ -331,8 +331,11 @@ whether the side effect landed. The model is handed a result saying the call
 was interrupted and decides whether to ask again, and the new run's
 `run_start.resumed_pending` lists those ids so an operator can see which side
 effects are unaccounted for. The resumed run always writes a **new** session
-file (`resumed_from`, `resumed_turn`, `resumed_pending`), never appends to the
-old one, and numbers its turns from 1 again.
+file (`resumed_from`, `resumed_turn`, `resumed_pending`, and the follow-up
+instruction as `resumed_instruction`), never appends to the old one, and
+numbers its turns from 1 again. Resuming that new file follows the chain back:
+the original run's turns, each resume's instruction and turns, rebuilt as one
+conversation - so the log to name for the next retry is always the newest.
 
 `amele chat` has no `--resume`. The refusals, the exact messages and the rules
 for reasoning payloads are in the
@@ -400,6 +403,7 @@ positions in the chain, and both ends' models and identities), and
 
 A run started with `--resume` says so on its `run_start`: `resumed_from` names
 the log it continued (redacted like every other field, but never clipped),
-`resumed_turn` the highest turn that log carried, and `resumed_pending` the
-tool calls it left unanswered. All three are absent from an ordinary run's
-log.
+`resumed_turn` how many turns precede this run's turn 1 across the whole
+chain, `resumed_pending` the tool calls the continued log left unanswered, and
+`resumed_instruction` the follow-up given on the command line, when there was
+one. All four are absent from an ordinary run's log.

@@ -1,12 +1,13 @@
 # JSONL event schema
 
-**v1.10 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
+**v1.11 - FROZEN as of v0.1; `tool_result`'s `outcome`, `exit_code` and
 `result_bytes` (v1.1), the MCP events plus `run_end.mcp_errors` (v1.2),
 `mcp_connect.auth` (v1.3), `llm_response.reasoning_bytes` (v1.4), the
 opt-in `llm_response.reasoning` (v1.5), `tool_result.truncated` (v1.6), the
 prompt-cache counts on `llm_response` and `run_end` (v1.7), the provider
 identities plus the `provider_fallback` event (v1.8), the resumed-run keys
-on `run_start` (v1.9) and the `validator_feedback` event (v1.10) added
+on `run_start` (v1.9), the `validator_feedback` event (v1.10) and
+`run_start.resumed_instruction` (v1.11) added
 additively (every v1 field unchanged, and the
 on-the-wire `v` stays `1`).** This is the format of the session log: one append-only JSONL
 file per run or chat session, written when `session_dir` is set. Log, session
@@ -53,8 +54,9 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `provider` | string | Identity of the backend the run started on: the wire family, narrowed by the variation that changes the request shape - `openai`, `openai/<dialect>` (e.g. `openai/deepseek`), `anthropic`, `gemini` or `gemini/vertex`. Deliberately **not** the `base_url`: a log is pasted into issues and shipped to collectors, and a URL can carry a credential in its query string or name an internal host. The consequence is that two targets on the same family read alike here - the `provider_fallback` event's `from`/`to` index pair is what tells them apart. Every `run`, `chat` and pack invocation of the binary writes it from v1.8 on, so absent means the log predates v1.8 (or was written by an embedder of `internal/session` that named no backend). Since v1.8. |
 | `task` | string | The rendered user task (clipped + redacted, see below). For a chat session this is the fixed label `interactive chat`. On a resumed run it is the task of the run being continued, copied from its log, so the two files read as one story. |
 | `resumed_from` | string | The session log this run's conversation was rebuilt from, exactly as it was typed after `--resume` (cli.md). Written only by a resumed run, so absence means "this run started from its own task" - in every log, including every one written before v1.9. It is the **one** free-text field that is redacted but never clipped ([Clipping and redaction](#clipping-and-redaction)). Since v1.9. |
-| `resumed_turn` | int | The highest `turn` the resumed log carried: how much conversation precedes turn 1 of this file, whose own numbering starts at 1 again. Absent means 0, which is a real case rather than a gap - a log whose run died before its first `llm_response` still resumes, it simply starts the task over. Since v1.9. |
+| `resumed_turn` | int | How many turns precede turn 1 of this file, whose own numbering starts at 1 again: the highest `turn` the resumed log carried, plus - since v1.11, when that log itself continued earlier ones - the turns of every log in that chain. Absent means 0, which is a real case rather than a gap - a log whose run died before its first `llm_response` still resumes, it simply starts the task over. Since v1.9. |
 | `resumed_pending` | string[] | The tool call ids the interrupted run dispatched but never logged a `tool_result` for. Each was answered with a synthetic result telling the model the outcome is unknown, and **nothing was re-executed**, so this list is exactly the set of side effects that are unaccounted for. The ids belong to the OLD log, not to this run. Absent means none. Since v1.9. |
+| `resumed_instruction` | string | The follow-up instruction given beside `--resume`, sent verbatim as the last user message of the rebuilt history (clipped + redacted like `task`). Absent when the resume gave none, and in every log written before v1.11. It is the one user turn of a resumed run that no other event records, which is what lets a later `--resume` rebuild the chain as one conversation. Since v1.11. |
 
 ### `llm_response` - one per provider round-trip
 
@@ -620,6 +622,33 @@ answering turn):
   had no successor left never produces one (the run ends with that provider's
   error, exit 5).
 
+### v1.11 (amele v0.3.1) - the resume instruction (additive, `v` stays `1`)
+
+Added one optional field to `run_start`, `resumed_instruction`, written by a
+run started with `--resume` that was given a follow-up instruction on the
+command line. Nothing else changed a byte; a resume with no instruction, and
+every run that was not resumed, writes exactly the bytes v1.10 wrote.
+
+```
+{"v":1,"type":"run_start","ts":"2026-09-13T09:14:02.1Z","model":"gpt-5.6","provider":"openai","task":"scan the logs","resumed_from":"out/run-2.jsonl","resumed_turn":3,"resumed_instruction":"now open a ticket"}
+```
+
+**Why:** the instruction is a user turn of the conversation, and it was the
+one turn of a resumed run no event recorded - so a log produced by a resume
+could not be rebuilt faithfully by a later resume. With it recorded,
+`--resume` follows `resumed_from` through every earlier log and rebuilds the
+chain as one conversation (issue #31, [cli.md](cli.md)). Alongside it the
+meaning of `resumed_turn` widened, additively: it still counts how many turns
+precede this file's turn 1, and now those are the turns of the whole chain
+rather than of the named log alone - for a log that continued a fresh run the
+two numbers are the same.
+
+**Migration:** none required. A consumer stitching logs together can now do it
+for a chain: read `resumed_from` back to the first log, and put each link's
+`resumed_instruction` (when present) between that link's predecessor and its
+own turn 1. Logs written before v1.11 carry no instruction, so a chain through
+one of them rebuilds without that user message.
+
 ### v1.10 (amele v0.3.1) - the schema validator's feedback turn (additive, `v` stays `1`)
 
 Added one event type, `validator_feedback`, written when `output.schema`
@@ -688,7 +717,9 @@ The opening line of a resumed run, as amele writes it:
   one's turns;
 - `resumed_from` is a path as it was typed, resolved against whatever
   directory the shell was in, and it has been through secret redaction. Treat
-  it as a human-readable origin note, not as a path a script may open blindly;
+  it as a human-readable origin note, not as a path a script may open blindly
+  (amele itself follows it on a later `--resume`, from v1.11 on, and refuses
+  the resume when the link cannot be read);
 - the resumed run always writes a NEW file. The log named by `resumed_from` is
   opened read-only and never appended to, so a resumed chain is N files, not
   one growing one.

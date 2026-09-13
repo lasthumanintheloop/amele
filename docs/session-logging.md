@@ -132,9 +132,14 @@ dropped instead of echoed back.
 
 **The resumed run writes its own file.** The log named by `--resume` is opened
 read-only and never appended to, turn numbering starts at 1 again, and the new
-file's `run_start` carries `resumed_from`, `resumed_turn` and (when the old
-run was killed mid-tool-call) `resumed_pending` - the call ids whose results
-never reached the log, which nothing re-executed. `resumed_from` is the one
-logged field that is redacted but never clipped, so a secret value inside the
-path is replaced there too and the logged string is then no longer the path to
-feed back to `--resume`.
+file's `run_start` carries `resumed_from`, `resumed_turn`, (when the old run
+was killed mid-tool-call) `resumed_pending` - the call ids whose results never
+reached the log, which nothing re-executed - and, when a follow-up was given,
+`resumed_instruction`. That last field is what lets a later `--resume` follow
+`resumed_from` back through every earlier log and rebuild the chain as one
+conversation, so the log to name is always the newest; a link that has been
+cleaned up refuses the resume rather than silently shortening it.
+`resumed_from` is the one logged field that is redacted but never clipped, so
+a secret value inside the path is replaced there too and the logged string is
+then no longer the path to feed back to `--resume` - nor a link amele can
+follow.
