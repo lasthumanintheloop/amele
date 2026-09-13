@@ -293,6 +293,23 @@ carriers dropped when a switch crosses wire families, and why a fallback that
 succeeds can mask a broken primary - are in
 [docs/providers.md](providers.md#provider-fallback).
 
+## Pre-flight (`amele doctor`)
+
+Before the first cron firing, or after moving a config to a new host:
+
+```sh
+amele doctor agent.yaml
+```
+
+One line per check - the config, every `${VAR}`, each provider target's
+reachability and key (one GET to its models listing, no token spent), the
+workspace and session directory, every executable and MCP server the config
+names, the permission profile against the terminal state, the run lock - with
+a PASS, WARN or FAIL verdict and a closing count. Any FAIL is exit 1, so a
+deploy script can branch on it; `explain` describes, `doctor` gates. The full
+list of checks and what each verdict means is in the
+[CLI contract](contracts/cli.md#amele-doctor-configyamldir---set-keyvalue--w-dir).
+
 ## Resuming a run (`--resume`)
 
 A run that dies in its fourth tool call has already paid for three. `--resume`

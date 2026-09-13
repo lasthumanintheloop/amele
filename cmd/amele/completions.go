@@ -28,7 +28,7 @@ _amele_complete() {
 	cur="${COMP_WORDS[COMP_CWORD]}"
 	prev="${COMP_WORDS[COMP_CWORD-1]}"
 
-	local commands="run chat validate explain schema init version completion mcp help"
+	local commands="run chat validate explain doctor schema init version completion mcp help"
 	local shells="bash zsh fish"
 	local mcp_subcommands="login status logout"
 	local agent_flags="--model --set -w --workspace -q --quiet -v --verbose -h --help"
@@ -68,7 +68,7 @@ _amele_complete() {
 			[[ "$cmd" == run ]] && flags="$flags --resume"
 			COMPREPLY=( $(compgen -W "$flags" -- "$cur") )
 			;;
-		validate|explain)
+		validate|explain|doctor)
 			if [[ $COMP_CWORD -eq 2 ]]; then
 				COMPREPLY=( $(_amele_yaml_files "$cur") )
 				return 0
@@ -136,6 +136,7 @@ _amele() {
 		'chat:Talk to the same agent interactively'
 		'validate:Check a config and report every violation'
 		'explain:Dry-run report of tools, permissions and budgets'
+		'doctor:Pre-flight checks: config, env, endpoints, workspace, TTY'
 		'schema:Print the config JSON Schema'
 		'init:Write an annotated starter config'
 		'version:Print version, commit and build date'
@@ -179,7 +180,7 @@ _amele() {
 				_describe 'flag' flags
 			fi
 			;;
-		validate|explain)
+		validate|explain|doctor)
 			if (( CURRENT == 3 )); then
 				# One -g per extension: passing both globs inside a single
 				# quoted argument makes the space part of the pattern in older
@@ -223,7 +224,7 @@ _amele "$@"
 # Hand-written against fish's own complete builtin - no completion framework
 # required.
 
-set -l amele_commands run chat validate explain schema init version completion mcp help
+set -l amele_commands run chat validate explain doctor schema init version completion mcp help
 
 complete -c amele -f
 
@@ -239,6 +240,7 @@ complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a run -d
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a chat -d "Talk to the same agent interactively"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a validate -d "Check a config and report every violation"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a explain -d "Dry-run report of tools, permissions and budgets"
+complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a doctor -d "Pre-flight checks: config, env, endpoints, workspace, TTY"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a schema -d "Print the config JSON Schema"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a init -d "Write an annotated starter config"
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a version -d "Print version, commit and build date"
@@ -247,13 +249,13 @@ complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a mcp -d
 complete -c amele -n "not __fish_seen_subcommand_from $amele_commands" -a help -d "Print this text, or the detailed page for one command"
 
 # Config-path slot: YAML files and directories (pack shorthand).
-complete -c amele -n "__fish_seen_subcommand_from run chat validate explain; and __amele_config_slot" -k -a "(__fish_complete_directories)"
-complete -c amele -n "__fish_seen_subcommand_from run chat validate explain; and __amele_config_slot" -k -a "(__fish_complete_suffix .yaml)"
-complete -c amele -n "__fish_seen_subcommand_from run chat validate explain; and __amele_config_slot" -k -a "(__fish_complete_suffix .yml)"
+complete -c amele -n "__fish_seen_subcommand_from run chat validate explain doctor; and __amele_config_slot" -k -a "(__fish_complete_directories)"
+complete -c amele -n "__fish_seen_subcommand_from run chat validate explain doctor; and __amele_config_slot" -k -a "(__fish_complete_suffix .yaml)"
+complete -c amele -n "__fish_seen_subcommand_from run chat validate explain doctor; and __amele_config_slot" -k -a "(__fish_complete_suffix .yml)"
 
 complete -c amele -n "__fish_seen_subcommand_from run chat" -l model -d "Shortcut for --set model=MODEL"
-complete -c amele -n "__fish_seen_subcommand_from run chat validate explain" -l set -d "Override one config field: key=value"
-complete -c amele -n "__fish_seen_subcommand_from run chat validate explain" -s w -l workspace -d "Shortcut for --set workspace=DIR"
+complete -c amele -n "__fish_seen_subcommand_from run chat validate explain doctor" -l set -d "Override one config field: key=value"
+complete -c amele -n "__fish_seen_subcommand_from run chat validate explain doctor" -s w -l workspace -d "Shortcut for --set workspace=DIR"
 complete -c amele -n "__fish_seen_subcommand_from run chat" -s q -l quiet -d "Suppress the summary line and non-error notes"
 complete -c amele -n "__fish_seen_subcommand_from run chat" -s v -l verbose -d "Print a progress line per loop event to stderr"
 complete -c amele -n "__fish_seen_subcommand_from run" -l resume -r -d "Continue the run recorded in this session log"

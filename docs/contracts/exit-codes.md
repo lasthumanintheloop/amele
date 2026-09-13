@@ -13,8 +13,8 @@ via `// CONTRACT:` markers.
 
 | Code | Name | Meaning |
 |------|------|---------|
-| 0 | success | The command completed. For `run`: the agent finished and its final answer was printed to stdout. For `chat`: the session ended at EOF (Ctrl-D). For `validate` / `explain` / `schema` / `init` / `help`: the command did its job. |
-| 1 | task failed | The agent could not complete the task. |
+| 0 | success | The command completed. For `run`: the agent finished and its final answer was printed to stdout. For `chat`: the session ended at EOF (Ctrl-D). For `doctor`: no check failed. For `validate` / `explain` / `schema` / `init` / `help`: the command did its job. |
+| 1 | task failed | The agent could not complete the task. For `doctor`: at least one check failed. |
 | 2 | config error | The command never got as far as a run: bad usage or a bad config. |
 | 3 | budget exceeded | A configured limit (`limits.max_turns`, `limits.max_tokens`, `limits.timeout`) killed the run. |
 | 4 | permission denied | A tool call was denied **and the run aborted** because of it. |
@@ -45,6 +45,9 @@ The catch-all for "the agent ran but did not deliver":
   monitoring must not read a Ctrl-C as a budget overrun (see
   [Signals](#signals) below);
 - `chat` was interrupted at the prompt or its stdin broke;
+- `doctor` found at least one failing check (added 2026-09-13, issue #13):
+  the same code, because a host that cannot run the config is a run that
+  would not deliver, and a wrapper needs no second failure convention;
 - any run error that matches none of the typed cases below.
 
 ### 2 - config error

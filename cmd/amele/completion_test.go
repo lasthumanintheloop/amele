@@ -119,7 +119,7 @@ func TestCompletionZshFishStatic(t *testing.T) {
 			if strings.TrimSpace(stdout) == "" {
 				t.Fatalf("%s script is empty", shell)
 			}
-			for _, name := range []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "mcp", "help"} {
+			for _, name := range []string{"run", "chat", "validate", "explain", "doctor", "schema", "init", "version", "completion", "mcp", "help"} {
 				if !strings.Contains(stdout, name) {
 					t.Errorf("%s script never mentions command %q", shell, name)
 				}

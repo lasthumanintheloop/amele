@@ -36,6 +36,7 @@ import (
 
 	"github.com/lasthumanintheloop/amele/internal/config"
 	"github.com/lasthumanintheloop/amele/internal/ctxfile"
+	"github.com/lasthumanintheloop/amele/internal/doctor"
 	"github.com/lasthumanintheloop/amele/internal/explain"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/loop"
@@ -120,6 +121,7 @@ Commands:
   chat        Talk to the same agent interactively, one message per stdin line.
   validate    Check a config and report every violation at once.
   explain     Dry-run report: tools, permissions, budgets, output, warnings.
+  doctor      Pre-flight checks: config, env, endpoints, workspace, TTY (exit 1 on a failure).
   schema      Print the config JSON Schema for editors and tooling.
   init        Write an annotated starter config (an existing file is kept).
   mcp         Log in to, inspect or log out of an MCP server's OAuth credential.
@@ -132,6 +134,7 @@ Synopsis:
   amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]
   amele validate <config.yaml|dir> [--set key=value] [-w DIR]
   amele explain <config.yaml|dir> [--set key=value] [-w DIR]
+  amele doctor <config.yaml|dir> [--set key=value] [-w DIR]
   amele schema
   amele init [path]
   amele mcp login|status|logout <config.yaml|dir> [server]
@@ -161,6 +164,7 @@ const (
 	usageChat       = "usage: amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]"
 	usageValidate   = "usage: amele validate <config.yaml|dir> [--set key=value] [-w DIR]"
 	usageExplain    = "usage: amele explain <config.yaml|dir> [--set key=value] [-w DIR]"
+	usageDoctor     = "usage: amele doctor <config.yaml|dir> [--set key=value] [-w DIR]"
 	usageCompletion = "usage: amele completion bash|zsh|fish"
 	usageMCP        = "usage: amele mcp login|status|logout <config.yaml|dir> [server]"
 )
@@ -634,6 +638,82 @@ EXAMPLES
     amele explain agent.yaml -w /srv/logs --set limits.max_turns=5
 `
 
+const helpDoctor = `amele doctor - pre-flight checks: will this config run on this host?
+
+SYNOPSIS
+  amele doctor <config.yaml|dir> [--set key=value] [-w DIR]
+
+DESCRIPTION
+  Runs a fixed list of checks against a config and prints one line per
+  check with a PASS, WARN or FAIL verdict:
+
+    config       the file loads and validates (every violation is a FAIL)
+    env          every ${VAR} the config references is set
+    provider     the primary endpoint answers and accepts the key - and the
+                 same for every provider.fallback entry (one line each)
+    workspace    the directory exists and takes a write
+    session_dir  the directory can be created and written (when set)
+    tool <name>  a subprocess tool's command[0] is on PATH (one line each)
+    mcp <name>   a stdio server's command is on PATH; an http server's URL
+                 names a host (it is not dialled - amele explain connects)
+    tty          whether a terminal is attached, related to the permission
+                 profile: an ask policy auto-denies without one
+    lock         the lock file's directory takes a write (lock: true)
+
+  The provider check sends one GET to the wire's models listing with the
+  configured credential: 2xx is a PASS, 401/403 is a FAIL (the key was
+  refused), 404/405 is a WARN (the endpoint exposes no listing, so the key
+  could not be checked - gateways and self-hosted servers), anything else or
+  no answer is a FAIL. Vertex AI targets are not probed (their credential
+  flow is the run's own) and print a WARN saying so. No token is spent.
+
+  Unlike explain, doctor GATES: any FAIL exits 1, so a cron line can run it
+  before the real run and a deploy script can branch on it. WARN never
+  changes the exit code.
+
+  A directory argument is shorthand for <dir>/agent.yaml inside it, and a
+  bare name that names nothing on disk is looked up as a saved agent under
+  $XDG_CONFIG_HOME/amele (~/.config/amele when unset).
+
+FLAGS
+  --set KEY=VALUE Apply a config override before checking, exactly as run
+                  would apply it. Repeatable. Run "amele help run" for the
+                  key list.
+  -w, --workspace DIR
+                  Shortcut for --set workspace=DIR.
+  -h, --help      Print this page to stdout and exit 0. It is honored only as
+                  the SOLE argument.
+
+  doctor takes exactly one positional argument (the config path); flags
+  follow it. --model is not accepted here: use --set model=MODEL.
+
+STDIN
+  Not read; only its terminal state is inspected (the tty check).
+
+STDOUT
+  The report: one line per check, then a closing count.
+
+STDERR
+  Errors only - empty whenever the report was printed.
+
+EXIT CODES
+  0  every check passed (warnings allowed)
+  1  at least one check failed
+  2  usage error (including a malformed --set), or the loader rejected the
+     file: unreadable, unparseable YAML, an unknown key or a wrong type, a
+     literal provider.api_key, or an unusable system_prompt_file
+
+EXAMPLES
+  Check a config before its first run:
+    amele doctor agent.yaml
+
+  Guard a cron line with it:
+    amele doctor agent.yaml >/dev/null && amele run agent.yaml -q "scan the logs"
+
+  Pre-flight a saved agent under a different workspace:
+    amele doctor sentry -w /srv/logs
+`
+
 const helpSchema = `amele schema - print the config JSON Schema
 
 SYNOPSIS
@@ -918,16 +998,16 @@ DESCRIPTION
   name, prints that command's detailed page - the same page
   amele <command> --help prints.
 
-  Commands with a page: run, chat, validate, explain, schema, init, version,
-  completion, help. The alternate spellings resolve too, so
+  Commands with a page: run, chat, validate, explain, doctor, schema, init,
+  version, completion, mcp, help. The alternate spellings resolve too, so
   amele help --version reaches the version page.
 
   For run and chat the help flag is recognized only where a flag is
   recognized. Flag parsing stops at the first non-flag argument, so a -h that
   appears after the task text is part of the task, not a help request.
 
-  For the commands with a fixed argument count - validate, explain, schema,
-  init, version, completion - the flag is recognized only as the sole
+  For the commands with a fixed argument count - validate, explain, doctor,
+  schema, init, version, completion - the flag is recognized only as the sole
   argument. A -h next to other arguments leaves the invocation a usage error
   (exit 2), so a wrong argument count is never answered with a page and an
   exit 0.
@@ -971,6 +1051,7 @@ var helpPages = map[string]string{
 	"chat":       helpChat,
 	"validate":   helpValidate,
 	"explain":    helpExplain,
+	"doctor":     helpDoctor,
 	"schema":     helpSchema,
 	"init":       helpInit,
 	"mcp":        helpMCP,
@@ -1060,6 +1141,8 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return cmdValidate(args[1:], stdout, stderr, env)
 	case "explain":
 		return cmdExplain(ctx, args[1:], stdout, stderr, env)
+	case "doctor":
+		return cmdDoctor(ctx, args[1:], stdin, stdout, stderr, env)
 	case "schema":
 		return cmdSchema(args[1:], stdout, stderr)
 	case "init":
@@ -1230,6 +1313,57 @@ func explainProblems(cfg *config.Config) (problems []string, registry *tools.Reg
 		registry = nil
 	}
 	return problems, registry
+}
+
+// cmdDoctor runs the pre-flight checks (internal/doctor) and gates on them.
+//
+// CONTRACT (docs/contracts/cli.md): exit 0 when every check passed, 1 when
+// any failed, 2 when there was no config to check at all - unreadable file,
+// malformed --set. A config that loads but does not validate is checked
+// anyway, with its violations as the config check's FAIL: the operator asked
+// what is wrong with this host and this file, and the answer is the whole
+// list, not the first item.
+func cmdDoctor(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, env config.LookupEnv) int {
+	parsed, ok := parseInspectArgs(context.Background(), env, "doctor", usageDoctor, args, stderr)
+	if !ok {
+		return ExitConfigError
+	}
+	if parsed.help {
+		return printHelp("doctor", stdout, stderr)
+	}
+	// Tolerant, like explain: an unset ${VAR} is a finding for the env check,
+	// not a reason to print nothing.
+	cfg, err := config.LoadTolerant(parsed.configPath, env)
+	if err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return ExitConfigError
+	}
+	if err := applyCLIOverrides(ctx, cfg, parsed.overrides); err != nil {
+		_, _ = fmt.Fprintln(stderr, err)
+		return ExitConfigError
+	}
+	problems := cfg.Violations()
+	if _, err := compileOutputSchema(cfg); err != nil {
+		problems = append(problems, err.Error())
+	}
+	opts := doctor.Options{
+		Problems: problems,
+		IsTTY:    func() bool { return stdinIsTerminal(stdin) },
+	}
+	if cfg.Lock {
+		if lock, err := lockFilePath(parsed.configPath); err == nil {
+			opts.LockPath = lock
+		}
+	}
+	report := doctor.Run(ctx, cfg, opts)
+	// SECURITY: a base_url can carry a credential and a workspace path can
+	// carry an interpolated secret; the report is redacted as a whole, the
+	// way explain's is.
+	_, _ = fmt.Fprint(stdout, session.Redactor(agentSecrets(cfg))(report.Render()))
+	if report.Failed() {
+		return ExitTaskFailed
+	}
+	return ExitOK
 }
 
 // cmdSchema prints the embedded config JSON Schema (docs/contracts/

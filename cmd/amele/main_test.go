@@ -998,6 +998,79 @@ func TestNamedAgentDiscovery(t *testing.T) {
 	}
 }
 
+// doctorServer answers the models listing with status, after checking the
+// credential header when a key is expected.
+func doctorServer(t *testing.T, status int) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer sk-test-secret-key" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestE2EDoctorPasses (issue #13): a healthy config passes with the report on
+// stdout, nothing on stderr and no credential in the output.
+func TestE2EDoctorPasses(t *testing.T) {
+	cfgPath, _ := writeTestConfig(t, doctorServer(t, http.StatusOK).URL, "session_dir: sessions\n")
+	code, stdout, stderr := execCLI(t, []string{"doctor", cfgPath}, "")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s\n%s", code, stderr, stdout)
+	}
+	for _, want := range []string{"[PASS] config: loads and validates", "[PASS] provider: openai:", "key accepted", "[PASS] workspace:", "[PASS] session_dir:", "0 failed\n"} {
+		if !strings.Contains(stdout, want) {
+			t.Errorf("report lacks %q:\n%s", want, stdout)
+		}
+	}
+	if stderr != "" || strings.Contains(stdout, "sk-test-secret-key") {
+		t.Errorf("stderr %q; stdout leaks the key: %v", stderr, strings.Contains(stdout, "sk-test-secret-key"))
+	}
+}
+
+// TestE2EDoctorGates: a failing check is exit 1 with the report still
+// printed, whether the failure is the endpoint or the config itself.
+func TestE2EDoctorGates(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		extra  string
+		want   []string
+	}{
+		{"a refused key", http.StatusForbidden, "", []string{"[FAIL] provider: openai:", "key rejected (HTTP 403)"}},
+		{"an invalid config is checked, not refused", http.StatusOK, "limits:\n  max_turns: -1\n", []string{"[FAIL] config:", "max_turns"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath, _ := writeTestConfig(t, doctorServer(t, tc.status).URL, tc.extra)
+			code, stdout, _ := execCLI(t, []string{"doctor", cfgPath}, "")
+			if code != ExitTaskFailed {
+				t.Fatalf("exit %d, want %d; stdout:\n%s", code, ExitTaskFailed, stdout)
+			}
+			for _, want := range tc.want {
+				if !strings.Contains(stdout, want) {
+					t.Errorf("report lacks %q:\n%s", want, stdout)
+				}
+			}
+		})
+	}
+}
+
+// TestE2EDoctorUsage: no config to check is exit 2, like every other command.
+func TestE2EDoctorUsage(t *testing.T) {
+	code, stdout, stderr := execCLI(t, []string{"doctor", filepath.Join(t.TempDir(), "missing.yaml")}, "")
+	if code != ExitConfigError || stdout != "" || stderr == "" {
+		t.Fatalf("missing file: exit %d, stdout %q, stderr %q", code, stdout, stderr)
+	}
+	code, _, stderr = execCLI(t, []string{"doctor"}, "")
+	if code != ExitConfigError || !strings.Contains(stderr, usageDoctor) {
+		t.Fatalf("no argument: exit %d, stderr %q", code, stderr)
+	}
+}
+
 // TestNamedAgentEndToEnd: `run <name>` runs the saved agent, and an unknown
 // name is a config error on every command that takes a config argument.
 func TestNamedAgentEndToEnd(t *testing.T) {
@@ -1170,7 +1243,7 @@ func TestVersionCommandExtraArgs(t *testing.T) {
 // helpCommands is every command name that must own a detailed help page. It
 // mirrors the dispatch switch in run(), so a command added without a page
 // fails here instead of shipping undocumented.
-var helpCommands = []string{"run", "chat", "validate", "explain", "schema", "init", "version", "completion", "mcp", "help"}
+var helpCommands = []string{"run", "chat", "validate", "explain", "doctor", "schema", "init", "version", "completion", "mcp", "help"}
 
 // helpSections is the man-page skeleton every detailed page promises. Tests
 // assert on the section headers rather than on whole-page golden text: the
@@ -1244,6 +1317,10 @@ func TestHelpPageContent(t *testing.T) {
 			"tool registry", "WARNINGS", "amele explain agent.yaml",
 			"--set KEY=VALUE", "(overridden via --set)",
 		}},
+		{cmd: "doctor", want: []string{
+			"PASS, WARN or FAIL", "amele doctor agent.yaml", "--set KEY=VALUE", "-w, --workspace DIR",
+			"1  at least one check failed", "models listing",
+		}, unwanted: []string{"--model MODEL"}},
 		{cmd: "schema", want: []string{
 			"config.schema.json", "amele schema > config.schema.json",
 		}},

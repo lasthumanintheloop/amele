@@ -11,6 +11,7 @@ amele run <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [--resume
 amele chat <config.yaml|dir> [--model MODEL] [--set key=value] [-w DIR] [-q|-v]
 amele validate <config.yaml|dir> [--set key=value] [-w DIR]
 amele explain <config.yaml|dir> [--set key=value] [-w DIR]
+amele doctor <config.yaml|dir> [--set key=value] [-w DIR]
 amele mcp login|status|logout <config.yaml|dir> [server]
 amele schema
 amele init [path]
@@ -727,6 +728,51 @@ up yet.
   (case-insensitive, anywhere in the name). This display rule is explain's
   alone - session-log redaction (`docs/contracts/jsonl-events.md`) stays
   unconditional by value.
+
+## `amele doctor <config.yaml|dir> [--set key=value] [-w DIR]`
+
+Added additively 2026-09-13 (issue #13). Pre-flight checks: will this config
+run on this host, right now? Takes the same argument shape as `validate` and
+`explain` (one config argument first, then `--set`/`-w`; no `--model`; `-h`
+only as the sole argument) and prints one line per check to **stdout**:
+
+```
+  [PASS] config: loads and validates
+  [PASS] env: 2 referenced variable(s) set
+  [PASS] provider: openai: api.openai.com reachable, key accepted
+  [WARN] provider.fallback[0]: openai/openrouter: openrouter.ai reachable; it exposes no models listing, so the key was not checked (HTTP 404)
+  [PASS] workspace: /srv/logs: exists and is writable
+  [PASS] session_dir: /var/log/amele: writable
+  [FAIL] tool grep_logs: rg: not found (exec: "rg": executable file not found in $PATH)
+  [WARN] tty: no terminal on stdin; every ask policy will auto-deny (run from cron, this is what happens)
+  [PASS] lock: /etc/amele/agent.yaml.lock: directory writable
+  9 checks: 6 passed, 2 warnings, 1 failed
+```
+
+The checks, in order: `config` (the file loads and validates; every violation
+and an uncompilable `output.schema` are FAILs on that line), `env` (every
+`${VAR}` referenced is set), `provider` and one `provider.fallback[N]` per
+chain entry (one GET to the wire's models listing with the credential: 2xx
+PASS, 401/403 FAIL, 404/405 WARN because the key could not be checked,
+anything else or no answer FAIL; a Vertex AI target is not probed and WARNs
+saying so; an empty `api_key` FAILs without a request), `workspace` (exists,
+is a directory, takes a write - not writable is a FAIL with `tools.fs` and a
+WARN without), `session_dir` (created if missing, then written; PASS `not
+set` when unset), `tool <name>` per subprocess tool and `mcp <name>` per MCP
+server (stdio: the command is on PATH; http: the URL names a host - the
+server is not dialled, `explain` does that), `tty` (PASS when no `ask` policy
+exists or a terminal is on stdin, WARN when an `ask` policy would auto-deny
+headless) and `lock` (with `lock: true`, the lock file's directory takes a
+write). No token is spent; the write probes create and remove an empty
+`.amele-doctor-<pid>` file. The report is redacted like every other output.
+
+**Exit codes**: **0** when no check failed (warnings allowed), **1** when at
+least one did - `doctor` gates, unlike `explain` - and **2** when there was
+no config to check: a usage error, a malformed `--set`, or a file the loader
+rejects. A config that loads but does not validate is checked anyway and
+exits 1 through its `config` FAIL, so the operator gets the whole list. The
+line wording is human-facing and not frozen; the verdict words `PASS`,
+`WARN`, `FAIL`, the `[VERDICT] name:` shape and the exit codes are.
 
 ## `amele mcp login|status|logout <config.yaml|dir> [server]`
 
