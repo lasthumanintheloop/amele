@@ -10,6 +10,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,6 +26,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/lasthumanintheloop/amele/internal/ctxfile"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 )
 
@@ -738,23 +740,41 @@ type LookupEnv func(key string) (string, bool)
 // Load reads, interpolates and parses the YAML file at path, then applies
 // defaults. It does NOT validate; call Validate after applying any CLI
 // overrides (e.g. --model) so overrides participate in validation.
-func Load(path string, env LookupEnv) (*Config, error) { return load(path, env, false) }
+//
+// It is LoadContext with a background context: the inspection commands
+// (validate, explain, mcp) have no deadline to honor. A run does, and uses
+// LoadContext.
+func Load(path string, env LookupEnv) (*Config, error) {
+	return load(context.Background(), path, env, false)
+}
+
+// LoadContext is Load for a run: the config file and its system_prompt_file
+// are read through the context, so a path that blocks - a FIFO with no
+// writer, a hung network mount - ends with the context's error when a signal
+// arrives instead of hanging the process past it (issue #29). The context
+// error is wrapped with %w alongside ErrInvalid, so a caller can tell an
+// interrupted read from an unreadable file.
+func LoadContext(ctx context.Context, path string, env LookupEnv) (*Config, error) {
+	return load(ctx, path, env, false)
+}
 
 // LoadTolerant is Load for inspection commands: an undefined ${VAR} does
 // not fail the load - it substitutes as an empty string and is recorded in
 // EnvMissing, so `explain` can tell a new user which variables to set
 // before the config can run. Run/validate keep using Load: headless runs
 // must fail loudly on missing env, not limp on with empty secrets.
-func LoadTolerant(path string, env LookupEnv) (*Config, error) { return load(path, env, true) }
+func LoadTolerant(path string, env LookupEnv) (*Config, error) {
+	return load(context.Background(), path, env, true)
+}
 
-// load is the shared implementation behind Load and LoadTolerant. tolerant
-// controls whether an undefined ${VAR} fails the load (false, Load's
-// contract) or substitutes as "" and is merely recorded (true, LoadTolerant's
-// contract).
-func load(path string, env LookupEnv, tolerant bool) (*Config, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // G304: loading the user-named config file is this function's purpose.
+// load is the shared implementation behind Load, LoadContext and
+// LoadTolerant. tolerant controls whether an undefined ${VAR} fails the load
+// (false, Load's contract) or substitutes as "" and is merely recorded (true,
+// LoadTolerant's contract).
+func load(ctx context.Context, path string, env LookupEnv, tolerant bool) (*Config, error) {
+	raw, err := ctxfile.ReadFile(ctx, path)
 	if err != nil {
-		return nil, fmt.Errorf("%w: reading %s: %v", ErrInvalid, path, err)
+		return nil, fmt.Errorf("%w: reading %s: %w", ErrInvalid, path, err)
 	}
 
 	// SECURITY: literal credentials in YAML are rejected before anything
@@ -832,7 +852,7 @@ func load(path string, env LookupEnv, tolerant bool) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: resolving config directory of %s: %v", ErrInvalid, path, err)
 	}
-	if err := cfg.applyDefaults(baseDir, tolerant); err != nil {
+	if err := cfg.applyDefaults(ctx, baseDir, tolerant); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -1071,7 +1091,7 @@ func interpolateString(text string, env LookupEnv, tolerant bool) (out string, r
 // is the one thing `amele explain` still refuses to report on (exit 2). The
 // skip therefore cannot be unconditional on tolerant alone, or the missing
 // prompt would go unmentioned by every command.
-func (c *Config) applyDefaults(baseDir string, tolerant bool) error {
+func (c *Config) applyDefaults(ctx context.Context, baseDir string, tolerant bool) error {
 	if c.Limits.MaxTurns == 0 {
 		c.Limits.MaxTurns = 20
 	}
@@ -1099,7 +1119,7 @@ func (c *Config) applyDefaults(baseDir string, tolerant bool) error {
 		resolveCommandBase(c.MCP.Servers[i].Transport.Command, baseDir)
 	}
 
-	return c.resolveSystemPrompt(baseDir, tolerant)
+	return c.resolveSystemPrompt(ctx, baseDir, tolerant)
 }
 
 // resolveCommandBase rewrites a path-like relative command[0] in place so it
@@ -1122,7 +1142,7 @@ func resolveCommandBase(cmd []string, baseDir string) {
 // either way, and a missing prompt file would abort the load and restore the
 // very short-circuit this removes. The inline prompt stays as written so the
 // report shows what the author wrote rather than a resolution amele invented.
-func (c *Config) resolveSystemPrompt(baseDir string, tolerant bool) error {
+func (c *Config) resolveSystemPrompt(ctx context.Context, baseDir string, tolerant bool) error {
 	if c.SystemPromptFile == "" {
 		return nil
 	}
@@ -1134,12 +1154,12 @@ func (c *Config) resolveSystemPrompt(baseDir string, tolerant bool) error {
 	// of the same field resolves against the caller's working directory
 	// instead (see ApplyOverrides) but shares this reader, so the two paths
 	// cannot drift in how they read a prompt file.
-	_, content, err := readPromptFile(c.SystemPromptFile, baseDir)
+	_, content, err := readPromptFile(ctx, c.SystemPromptFile, baseDir)
 	if err != nil {
 		if tolerant && len(c.EnvMissing()) > 0 {
 			return nil
 		}
-		return fmt.Errorf("%w: reading system_prompt_file: %v", ErrInvalid, err)
+		return fmt.Errorf("%w: reading system_prompt_file: %w", ErrInvalid, err)
 	}
 	c.SystemPrompt = content
 	return nil

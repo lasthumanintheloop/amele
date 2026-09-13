@@ -844,9 +844,12 @@ usage** on stdout, exit 0. Naming a command is the new part.
 
 `SIGINT` (Ctrl-C) and `SIGTERM` **cancel the run** rather than killing the
 process. The cancellation reaches everything the run is doing - the in-flight
-provider HTTP call, a running subprocess or shell tool, a blocked stdin read -
-so a run stops promptly instead of at the next convenient moment. Then the
-normal ending path runs:
+provider HTTP call, a running subprocess or shell tool, a blocked stdin read,
+and every read of an operator-named file: the config, a `system_prompt_file`,
+the `--resume` log (a FIFO with no writer or a hung network mount no longer
+holds the process past the signal or past `limits.timeout`; added 2026-09-13,
+issue #29) - so a run stops promptly instead of at the next convenient
+moment. Then the normal ending path runs:
 
 - the session log gets its `run_end` event (`status: error`, `exit_code: 1`),
   so an interrupted run is as auditable as a failed one;
@@ -864,6 +867,14 @@ exit 1 already means, and a cron wrapper needs no second failure convention.
 `SIGKILL` is not catchable - it leaves no `run_end` and the shell reports 137;
 it is the escape hatch, not the normal stop. amele stays in charge of both
 catchable signals for its whole life, so a second Ctrl-C does not escalate.
+
+A signal that arrives **before the config is loaded** - while the config file
+or a prompt file is still being read - ends that read at once and exits **1**
+with `run interrupted: context canceled` on stderr. No session log exists at
+that point, so there is no `run_end` to write; nothing was spent either. A
+signal during the `--resume` log's read comes after the session directory is
+known, and leaves the ordinary `run_start` + `run_end` pair behind (exit 1, or
+3 when it was `limits.timeout` that fired).
 
 `chat` follows the same contract from either position. Interrupted **at the
 `> ` prompt** (the common case - a blocked stdin read cannot see a signal on

@@ -83,6 +83,19 @@ func stdioServerYAML(name, command, extra string) string {
 %s`, name, command, extra)
 }
 
+// hangingServerYAML is stdioServerYAML for a server that never answers the
+// handshake (mcptestserver -hang-on-start), so a connect can only end by
+// cancellation.
+func hangingServerYAML(name, command, extra string) string {
+	return fmt.Sprintf(`mcp:
+  servers:
+    - name: %s
+      transport:
+        type: stdio
+        command: [%q, "-hang-on-start"]
+%s`, name, command, extra)
+}
+
 // assertListedTool fails unless the single mcp_tools_listed event advertises
 // the named model-facing tool.
 func assertListedTool(t *testing.T, events []session.Event, name string) {
@@ -402,13 +415,16 @@ func TestRunMCPInterruptedDuringConnect(t *testing.T) {
 	bin := buildMCPTestServer(t)
 	srv := scriptedServer(t)
 	cfgPath, dir := writeTestConfig(t, srv.URL,
-		"session_dir: sessions\n"+stdioServerYAML("files", bin, ""))
+		"session_dir: sessions\n"+hangingServerYAML("files", bin, ""))
 
-	// Cancelled up front: with a connect that can only fail, this is the same
-	// observable state as a SIGTERM landing mid-handshake, and it needs no
-	// polling to be deterministic.
+	// The server never answers the handshake, so the connect can only end
+	// with the cancellation below: the same observable state as a SIGTERM
+	// landing mid-handshake, with no race on when the signal lands. (The
+	// context is not cancelled up front because, since issue #29, a context
+	// that is already done stops the config read itself.)
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+	time.AfterFunc(150*time.Millisecond, cancel)
 
 	var stdout, stderr bytes.Buffer
 	code := run(ctx, []string{"run", cfgPath, "task"}, strings.NewReader(""), &stdout, &stderr, env(t))
@@ -511,10 +527,12 @@ func TestRunMCPInterruptedOptionalNotCounted(t *testing.T) {
 	bin := buildMCPTestServer(t)
 	srv := scriptedServer(t)
 	cfgPath, dir := writeTestConfig(t, srv.URL,
-		"session_dir: sessions\n"+stdioServerYAML("files", bin, "      required: false\n"))
+		"session_dir: sessions\n"+hangingServerYAML("files", bin, "      required: false\n"))
 
+	// See TestRunMCPInterruptedDuringConnect for why the cancel is deferred.
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
+	time.AfterFunc(150*time.Millisecond, cancel)
 
 	var stdout, stderr bytes.Buffer
 	code := run(ctx, []string{"run", cfgPath, "task"}, strings.NewReader(""), &stdout, &stderr, env(t))

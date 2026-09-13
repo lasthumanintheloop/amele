@@ -76,13 +76,14 @@ package resume
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
+	"github.com/lasthumanintheloop/amele/internal/ctxfile"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/session"
 )
@@ -201,14 +202,16 @@ const (
 
 // Read parses the log at path and rebuilds the history. Failures are one of
 // ErrClipped, ErrNotResumable or ErrMalformed (match with errors.Is), each
-// wrapped with the path so a message can be printed as-is.
-func Read(path string, opts Options) (*Replay, error) {
-	f, err := os.Open(path) //nolint:gosec // G304: the path is the operator's own --resume argument.
+// wrapped with the path so a message can be printed as-is - or the context's
+// own error when ctx ends before the file is read: the log is operator-named,
+// and a path that blocks (a FIFO with no writer, a hung mount) must not hold
+// the run past limits.timeout or a SIGTERM (issue #29).
+func Read(ctx context.Context, path string, opts Options) (*Replay, error) {
+	data, err := ctxfile.ReadFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("opening session log: %w", err)
 	}
-	defer func() { _ = f.Close() }()
-	rep, err := ReadFrom(f, opts)
+	rep, err := ReadFrom(bytes.NewReader(data), opts)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}

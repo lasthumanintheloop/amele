@@ -1,13 +1,15 @@
 package config
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lasthumanintheloop/amele/internal/ctxfile"
 )
 
 // settableKeys is the CLOSED allowlist of config fields the command line may
@@ -113,12 +115,20 @@ func SplitOverride(pair string) (key, value string, ok bool) {
 // error is returned: the caller must abandon it, which it does - a config
 // error aborts before anything is spent.
 func ApplyOverrides(cfg *Config, pairs []string, baseDir string) error {
+	return ApplyOverridesContext(context.Background(), cfg, pairs, baseDir)
+}
+
+// ApplyOverridesContext is ApplyOverrides for a run: the one override that
+// reads a file (system_prompt_file) reads it through ctx, so a blocked read
+// ends with the context instead of hanging the process (issue #29, see
+// LoadContext).
+func ApplyOverridesContext(ctx context.Context, cfg *Config, pairs []string, baseDir string) error {
 	for _, pair := range pairs {
 		key, value, ok := SplitOverride(pair)
 		if !ok {
 			return fmt.Errorf("%w: --set %q is not in key=value form", ErrInvalid, pair)
 		}
-		if err := cfg.applyOverride(key, value, baseDir); err != nil {
+		if err := cfg.applyOverride(ctx, key, value, baseDir); err != nil {
 			return err
 		}
 	}
@@ -129,8 +139,8 @@ func ApplyOverrides(cfg *Config, pairs []string, baseDir string) error {
 // value shape (text/path versus parsed scalar) rather than by config section:
 // it keeps each switch inside the complexity budget and puts the parsing rules
 // of a kind next to each other.
-func (c *Config) applyOverride(key, value, baseDir string) error {
-	if handled, err := c.applyTextOverride(key, value, baseDir); handled {
+func (c *Config) applyOverride(ctx context.Context, key, value, baseDir string) error {
+	if handled, err := c.applyTextOverride(ctx, key, value, baseDir); handled {
 		return err
 	}
 	if handled, err := c.applyScalarOverride(key, value); handled {
@@ -143,7 +153,7 @@ func (c *Config) applyOverride(key, value, baseDir string) error {
 // applyTextOverride handles the string-valued keys, including the three that
 // carry a path. handled=false means the key belongs to another group (or to
 // none at all).
-func (c *Config) applyTextOverride(key, value, baseDir string) (handled bool, err error) {
+func (c *Config) applyTextOverride(ctx context.Context, key, value, baseDir string) (handled bool, err error) {
 	switch key {
 	case "model":
 		c.Model = value
@@ -164,7 +174,7 @@ func (c *Config) applyTextOverride(key, value, baseDir string) (handled bool, er
 		}
 		c.SessionDir = resolveOverridePath(value, baseDir)
 	case "system_prompt_file":
-		return true, c.overrideSystemPromptFile(value, baseDir)
+		return true, c.overrideSystemPromptFile(ctx, value, baseDir)
 	case "provider.reasoning.effort":
 		c.overrideReasoningEffort(value)
 	default:
@@ -201,13 +211,13 @@ func (c *Config) overrideReasoningEffort(value string) {
 // here):
 // the override is a deliberate, explicit replacement of whatever the config
 // said.
-func (c *Config) overrideSystemPromptFile(value, baseDir string) error {
+func (c *Config) overrideSystemPromptFile(ctx context.Context, value, baseDir string) error {
 	if value == "" {
 		return fmt.Errorf("%w: --set system_prompt_file: the value must name a file", ErrInvalid)
 	}
-	path, content, err := readPromptFile(value, baseDir)
+	path, content, err := readPromptFile(ctx, value, baseDir)
 	if err != nil {
-		return fmt.Errorf("%w: --set system_prompt_file: %v", ErrInvalid, err)
+		return fmt.Errorf("%w: --set system_prompt_file: %w", ErrInvalid, err)
 	}
 	c.SystemPromptFile = path
 	c.SystemPrompt = content
@@ -221,10 +231,11 @@ func (c *Config) overrideSystemPromptFile(value, baseDir string) error {
 // readPromptFile resolves path against baseDir and reads it, returning the
 // resolved path and the content. Shared by applyDefaults (baseDir = the config
 // file's directory) and the system_prompt_file override (baseDir = the
-// caller's working directory), so both read a prompt file the same way.
-func readPromptFile(path, baseDir string) (resolved, content string, err error) {
+// caller's working directory), so both read a prompt file the same way - and
+// both stop when ctx does (issue #29).
+func readPromptFile(ctx context.Context, path, baseDir string) (resolved, content string, err error) {
 	resolved = resolveOverridePath(path, baseDir)
-	raw, err := os.ReadFile(resolved) //nolint:gosec // G304: the prompt file is named by the operator, in the config or on the command line - reading it is the point.
+	raw, err := ctxfile.ReadFile(ctx, resolved)
 	if err != nil {
 		return "", "", err
 	}

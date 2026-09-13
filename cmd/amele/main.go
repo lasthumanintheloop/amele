@@ -1102,7 +1102,8 @@ func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) 
 	}
 	cfg, err := config.Load(parsed.configPath, env)
 	if err == nil {
-		err = applyCLIOverrides(cfg, parsed.overrides)
+		// Inspection has no deadline to honor, so a background context.
+		err = applyCLIOverrides(context.Background(), cfg, parsed.overrides)
 	}
 	if err == nil {
 		err = cfg.Validate()
@@ -1168,7 +1169,7 @@ func cmdExplain(ctx context.Context, args []string, stdout, stderr io.Writer, en
 	// Applied before anything is inspected: explain describes the invocation
 	// it was given, overrides and all. A malformed --set is a usage error
 	// (the command line, not the file), so it keeps failing loudly.
-	if err := applyCLIOverrides(cfg, parsed.overrides); err != nil {
+	if err := applyCLIOverrides(ctx, cfg, parsed.overrides); err != nil {
 		_, _ = fmt.Fprintln(stderr, err)
 		return ExitConfigError
 	}
@@ -1555,6 +1556,28 @@ func rejectFlagInConfigPathSlot(name, usage, arg string, stderr io.Writer) {
 		name, arg, usage)
 }
 
+// flagsAgree applies the two rules a parsed flag set can still break after
+// the flag package accepted every flag on its own. It writes the reason to
+// stderr and reports false on a violation. CONTRACT: both are usage errors
+// like any other - exit 2, nothing loaded, no session log created.
+func (a agentArgs) flagsAgree(name, usage string, stderr io.Writer) bool {
+	if a.quiet && a.verbose {
+		// They ask for opposite things. Letting one silently win would hide a
+		// mistake in a script that means to change how noisy a cron job is.
+		_, _ = fmt.Fprintf(stderr, "amele %s: -q/--quiet and -v/--verbose cannot be combined\n", name)
+		return false
+	}
+	if a.resumeSet && a.resume == "" && name == "run" {
+		// The flag was given with nothing to read. Treating it as "no resume"
+		// would start a fresh run and exit 0 on what is almost certainly a
+		// script's empty substitution (issue #30). chat is exempt only
+		// because it refuses the flag at every value with its own sentence.
+		_, _ = fmt.Fprintf(stderr, "amele %s: --resume needs a path\n%s\n", name, usage)
+		return false
+	}
+	return true
+}
+
 // setFlag is a string flag that remembers whether it was given at all. The
 // flag package hands a *string flag its default for an absent flag and "" for
 // an explicitly empty one, and the two are indistinguishable afterwards; this
@@ -1643,25 +1666,12 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 		resumeSet:  resumeFlag.set,
 		rest:       fs.Args(),
 	}
-	// Help wins over the conflict below: someone who asked for the manual gets
-	// the manual, and the page is where the two flags are explained.
+	// Help wins over the conflicts below: someone who asked for the manual
+	// gets the manual, and the page is where the flags are explained.
 	if parsed.help {
 		return agentArgs{help: true}, true
 	}
-	if parsed.quiet && parsed.verbose {
-		// They ask for opposite things. Letting one silently win would hide a
-		// mistake in a script that means to change how noisy a cron job is.
-		// CONTRACT: a usage error like any other - exit 2, nothing loaded.
-		_, _ = fmt.Fprintf(stderr, "amele %s: -q/--quiet and -v/--verbose cannot be combined\n", name)
-		return agentArgs{}, false
-	}
-	if parsed.resumeSet && parsed.resume == "" && name == "run" {
-		// The flag was given with nothing to read. Treating it as "no resume"
-		// would start a fresh run and exit 0 on what is almost certainly a
-		// script's empty substitution (issue #30). chat is exempt only
-		// because it refuses the flag at every value with its own sentence.
-		// CONTRACT: exit 2, nothing loaded, no session log created.
-		_, _ = fmt.Fprintf(stderr, "amele %s: --resume needs a path\n%s\n", name, usage)
+	if !parsed.flagsAgree(name, usage, stderr) {
 		return agentArgs{}, false
 	}
 	resolved, err := resolveConfigArg(parsed.configPath)
@@ -1690,6 +1700,26 @@ func resolveConfigArg(path string) (string, error) {
 	return candidate, nil
 }
 
+// reportLoadError prints a config-load failure and maps it to an exit code.
+//
+// CONTRACT: a config that cannot be loaded is exit 2 - EXCEPT when what ended
+// the load was the run's own context: a SIGINT/SIGTERM that arrived while the
+// config file or a prompt file was being read (issue #29). That is an
+// interrupted run, reported as the Signals contract says (`run interrupted:
+// context canceled`, exit 1), not a broken config. No session log exists yet,
+// so there is no run_end to write.
+func reportLoadError(err error, stderr io.Writer) int {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(err, cause) {
+			err = interruptedError(cause)
+			_, _ = fmt.Fprintln(stderr, err)
+			return exitCodeFor(err)
+		}
+	}
+	_, _ = fmt.Fprintln(stderr, err)
+	return ExitConfigError
+}
+
 // loadAgentConfig loads, overrides, validates and compiles one agent config -
 // everything both commands must do before anything can block or contact a
 // provider. The returned validator is nil when the config declares no
@@ -1697,8 +1727,13 @@ func resolveConfigArg(path string) (string, error) {
 //
 // CONTRACT: every error here is exit 2 (config error) at the call site, and it
 // must be reported without spending a single token.
-func loadAgentConfig(parsed agentArgs, env config.LookupEnv) (*config.Config, *schema.Validator, error) {
-	cfg, err := config.Load(parsed.configPath, env)
+func loadAgentConfig(ctx context.Context, parsed agentArgs, env config.LookupEnv) (*config.Config, *schema.Validator, error) {
+	// Through the context: the config file and a prompt file are
+	// operator-named paths, and a read of one that blocks must end when a
+	// signal arrives rather than hold the process past it (issue #29). No
+	// deadline exists yet - limits.timeout is IN the file being read - so
+	// only a signal can end the read here.
+	cfg, err := config.LoadContext(ctx, parsed.configPath, env)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1706,7 +1741,7 @@ func loadAgentConfig(parsed agentArgs, env config.LookupEnv) (*config.Config, *s
 	// model in YAML but --set model=X given" is valid, "still no model" is
 	// caught, and a nonsense override (a negative budget, an unreachable
 	// workspace) is an exit-2 config error rather than a mid-run surprise.
-	if err := applyCLIOverrides(cfg, parsed.overrides); err != nil {
+	if err := applyCLIOverrides(ctx, cfg, parsed.overrides); err != nil {
 		return nil, nil, err
 	}
 	if err := cfg.Validate(); err != nil {
@@ -1730,7 +1765,7 @@ func loadAgentConfig(parsed agentArgs, env config.LookupEnv) (*config.Config, *s
 // injected). It is the base for CLI-given paths: a path typed in a shell means
 // what it means in that shell, while the same field written in YAML stays
 // relative to the YAML.
-func applyCLIOverrides(cfg *config.Config, overrides []string) error {
+func applyCLIOverrides(ctx context.Context, cfg *config.Config, overrides []string) error {
 	if len(overrides) == 0 {
 		return nil
 	}
@@ -1738,7 +1773,7 @@ func applyCLIOverrides(cfg *config.Config, overrides []string) error {
 	if err != nil {
 		return fmt.Errorf("resolving the working directory for --set paths: %w", err)
 	}
-	return config.ApplyOverrides(cfg, overrides, cwd)
+	return config.ApplyOverridesContext(ctx, cfg, overrides, cwd)
 }
 
 // inspectArgs is the argument shape `validate` and `explain` share: one config
@@ -1824,10 +1859,9 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	}
 	taskArgs := strings.Join(parsed.rest, " ")
 
-	cfg, validator, err := loadAgentConfig(parsed, env)
+	cfg, validator, err := loadAgentConfig(ctx, parsed, env)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return ExitConfigError
+		return reportLoadError(err, stderr)
 	}
 
 	// ONE registry for this run, built before the first sink exists so every
@@ -1851,10 +1885,8 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 
 	// The run timeout is armed BEFORE anything that can block - most
 	// importantly the stdin read below. An open pipe that never delivers
-	// data must be interruptible by limits.timeout (live-test finding B3).
-	// One gap remains: resume.Read takes no context (issue #29), so the
-	// --resume path's own file read is not interruptible yet - a log on an
-	// unresponsive mount blocks past this deadline.
+	// data must be interruptible by limits.timeout (live-test finding B3),
+	// and so must the --resume log's read (issue #29): both go through ctx.
 	if cfg.Limits.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Limits.Timeout.Std())
@@ -2046,7 +2078,7 @@ func prepareRun(ctx context.Context, cfg *config.Config, parsed agentArgs, taskA
 	// model on the same one, which is what `--resume --model x` asks for - is
 	// at best rejected. cfg.Model is the EFFECTIVE model, after --model and
 	// --set.
-	replay, err := resume.Read(parsed.resume,
+	replay, err := resume.Read(ctx, parsed.resume,
 		resume.Options{Provider: cfg.Provider.Identity(), Model: cfg.Model})
 	if err != nil {
 		return "", nil, nil, err
@@ -2415,10 +2447,9 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		return ExitConfigError
 	}
 
-	cfg, validator, err := loadAgentConfig(parsed, env)
+	cfg, validator, err := loadAgentConfig(ctx, parsed, env)
 	if err != nil {
-		_, _ = fmt.Fprintln(stderr, err)
-		return ExitConfigError
+		return reportLoadError(err, stderr)
 	}
 	// The compiled schema is deliberately NOT enforced, only reported.
 	//

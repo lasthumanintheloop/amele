@@ -53,10 +53,18 @@ func main() {
 	spawnChild := flag.Bool("spawn-child", false, "spawn a long-lived grandchild in the same process group")
 	exitOnStart := flag.Bool("exit-on-start", false, "exit(3) immediately instead of serving")
 	stderrBytes := flag.Int("stderr-bytes", 0, "write this many bytes of banner noise to stderr before serving")
+	hangOnStart := flag.Bool("hang-on-start", false, "never answer the handshake: block until killed")
 	flag.Parse()
 
 	if *exitOnStart {
 		os.Exit(3)
+	}
+	if *hangOnStart {
+		// The shape of a server that is up but unresponsive: the client's
+		// initialize request gets no answer, so a connect can only end by
+		// its own timeout or by the run being cancelled - which is what the
+		// signal-during-connect tests need to observe deterministically.
+		select {}
 	}
 	if *stderrBytes > 0 {
 		// One long line: the reader side must relay it whole, however chatty.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -182,19 +183,16 @@ func TestRunInterruptedDuringStdinReadIsReported(t *testing.T) {
 	tests := []struct {
 		name     string
 		extra    string
-		ctx      func(t *testing.T) context.Context
 		wantCode int
 		wantErr  string
 	}{
 		{
-			name:  "canceled",
-			extra: "session_dir: sessions\n",
-			ctx: func(t *testing.T) context.Context {
-				t.Helper()
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				return ctx
-			},
+			// The signal arrives WHILE stdin blocks: the reader cancels the
+			// context on its first Read. (A context cancelled before the run
+			// starts is a different case - it now stops the config read
+			// itself, before a session exists; see TestRunInterruptedDuringFileRead.)
+			name:     "canceled",
+			extra:    "session_dir: sessions\n",
 			wantCode: ExitTaskFailed,
 			wantErr:  "run interrupted",
 		},
@@ -203,7 +201,6 @@ func TestRunInterruptedDuringStdinReadIsReported(t *testing.T) {
 			// must leave the same evidence behind.
 			name:     "timeout",
 			extra:    "session_dir: sessions\nlimits:\n  timeout: 50ms\n",
-			ctx:      func(*testing.T) context.Context { return context.Background() },
 			wantCode: ExitBudgetExceeded,
 			wantErr:  "budget exceeded",
 		},
@@ -217,9 +214,15 @@ func TestRunInterruptedDuringStdinReadIsReported(t *testing.T) {
 			// is read - and this reader never delivers.
 			done := make(chan struct{})
 			t.Cleanup(func() { close(done) })
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stdin := io.Reader(hangingReader{done})
+			if tt.name == "canceled" {
+				stdin = cancelOnRead{cancel: cancel, then: hangingReader{done}}
+			}
 
 			var stdout, stderr bytes.Buffer
-			code := run(tt.ctx(t), []string{"run", cfgPath}, hangingReader{done}, &stdout, &stderr, env(t))
+			code := run(ctx, []string{"run", cfgPath}, stdin, &stdout, &stderr, env(t))
 
 			if code != tt.wantCode {
 				t.Fatalf("exit %d, want %d; stderr: %s", code, tt.wantCode, stderr.String())
@@ -245,6 +248,19 @@ func TestRunInterruptedDuringStdinReadIsReported(t *testing.T) {
 			}
 		})
 	}
+}
+
+// cancelOnRead is a stdin that cancels the run's context the moment it is
+// read from, then blocks like hangingReader: it is the shape of a signal
+// arriving while the run waits on an open pipe.
+type cancelOnRead struct {
+	cancel context.CancelFunc
+	then   hangingReader
+}
+
+func (c cancelOnRead) Read(p []byte) (int, error) {
+	c.cancel()
+	return c.then.Read(p)
 }
 
 // TestRunCanceledMidRunQuiet pins what -q may and may not silence when the run

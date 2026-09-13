@@ -1,6 +1,7 @@
 package resume_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -269,7 +270,7 @@ func TestReadFixtures(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := resume.Read(filepath.Join("testdata", tt.fixture), tt.opts)
+			got, err := resume.Read(context.Background(), filepath.Join("testdata", tt.fixture), tt.opts)
 			if err != nil {
 				t.Fatalf("Read(%s) = %v, want no error", tt.fixture, err)
 			}
@@ -324,7 +325,7 @@ const (
 // The reasoning payload is echoed back to a provider that signs it, so the
 // restored bytes must be the logged bytes - not a re-encoding of them.
 func TestCarrierBytesAreExact(t *testing.T) {
-	got, err := resume.Read(filepath.Join("testdata", "carriers-anthropic.jsonl"),
+	got, err := resume.Read(context.Background(), filepath.Join("testdata", "carriers-anthropic.jsonl"),
 		resume.Options{Provider: "anthropic", Model: "claude-sonnet-4"})
 	if err != nil {
 		t.Fatalf("Read = %v, want no error", err)
@@ -647,7 +648,7 @@ func TestClipMarkerIsSessionsMarker(t *testing.T) {
 // Read names the file it refused, so cmd can print the error as-is.
 func TestReadNamesThePath(t *testing.T) {
 	path := filepath.Join("testdata", "chat.jsonl")
-	_, err := resume.Read(path, resume.Options{})
+	_, err := resume.Read(context.Background(), path, resume.Options{})
 	if !errors.Is(err, resume.ErrNotResumable) {
 		t.Fatalf("Read(%s) = %v, want ErrNotResumable", path, err)
 	}
@@ -742,7 +743,7 @@ func TestReadFromReaderError(t *testing.T) {
 }
 
 func TestReadMissingFile(t *testing.T) {
-	_, err := resume.Read(filepath.Join(t.TempDir(), "nope.jsonl"), resume.Options{})
+	_, err := resume.Read(context.Background(), filepath.Join(t.TempDir(), "nope.jsonl"), resume.Options{})
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("Read of a missing file = %v, want a not-exist error", err)
 	}
