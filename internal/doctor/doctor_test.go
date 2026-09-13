@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,25 @@ func TestProviderProbeEdges(t *testing.T) {
 		expect(t, got, Fail, "unreachable")
 		if strings.Contains(got.Detail, "/v1/models") {
 			t.Fatalf("the detail names the path: %q", got.Detail)
+		}
+	})
+	t.Run("a redirect is not followed", func(t *testing.T) {
+		// SECURITY: the elsewhere server must never see the key.
+		var leaked bool
+		elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			leaked = leaked || r.Header.Get("X-Api-Key") != "" || r.Header.Get("Authorization") != ""
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(elsewhere.Close)
+		redirecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Redirect(w, &http.Request{URL: &url.URL{}}, elsewhere.URL+"/v1/models", http.StatusMovedPermanently)
+		}))
+		t.Cleanup(redirecting.Close)
+		cfg := baseConfig(t, config.ProviderConfig{Type: config.ProviderTypeAnthropic, BaseURL: redirecting.URL, APIKey: "sk-ant"})
+		got := find(t, Run(context.Background(), cfg, Options{}), "provider")
+		expect(t, got, Fail, "redirects the API (HTTP 301")
+		if leaked {
+			t.Fatal("the probe followed the redirect with the credential")
 		}
 	})
 	t.Run("an empty key fails before any request", func(t *testing.T) {

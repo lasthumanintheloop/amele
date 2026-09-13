@@ -2371,6 +2371,15 @@ func TestValidateProviderTuning(t *testing.T) {
 			"",
 		},
 		{
+			// stream_options is NOT reserved: it was legal before streaming
+			// existed, and a non-streaming request still forwards it.
+			"params stream_options stays legal",
+			func(c *Config) {
+				c.Provider.Params = map[string]any{"stream_options": map[string]any{"include_usage": true}}
+			},
+			"",
+		},
+		{
 			// ...and always free where amele never writes it.
 			"params cache_control is free on openai",
 			func(c *Config) {

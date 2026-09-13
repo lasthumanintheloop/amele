@@ -436,9 +436,10 @@ history would either invent that user turn or skip it - so it is refused,
 naming the log to resume instead (`run-2.jsonl continues run-1.jsonl but was
 written before JSONL v1.11 and does not record whether its resume was given
 an instruction; resume run-1.jsonl instead`). And a parent that **no longer
-ends where the link continued it** - its turn count or its pending calls
-differ from the `resumed_turn`/`resumed_pending` the link recorded, because
-the parent's run went on after the resume or the file was cut - is refused
+ends where the link continued it** - its turn count, its pending calls or its
+message count differ from the `resumed_turn`/`resumed_pending`/
+`resumed_messages` the link recorded, because the parent's run went on after
+the resume or the file was cut - is refused
 too (`run-1.jsonl no longer ends where this log continued it (turn 1 then,
 turn 2 now)`), since the link's run saw the parent as it was then. Added
 2026-09-13 (issue #31); before it, a resume rebuilt the named log's turns

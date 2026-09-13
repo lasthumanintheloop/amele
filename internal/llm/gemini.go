@@ -596,12 +596,12 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 // the signature carrier come out the same. sink receives answer text only,
 // never a thought part.
 //
-// The carrier of a streamed turn is REBUILT: consecutive text parts of one
-// kind are merged into one part (a signature that rode on any of them is
-// kept on it) and a functionCall part is kept as the event sent it. The
-// signature is verified on the part it rides on, not on the array's bytes,
-// so the rebuilt array is what the API checks - but it is not the API's own
-// bytes, which a non-streaming turn keeps. Live-unverified (#17).
+// The carrier of a streamed turn is the concatenation of the parts the
+// events sent, each kept verbatim: Google forbids merging or splitting a
+// signed part, and the decoder reads a multi-part answer the same way either
+// way. Live-unverified (#17). An endpoint that refuses to stream (a 400
+// naming stream) is asked once more through generateContent; the whole text
+// then reaches sink at the end.
 func (c *GeminiClient) ChatStream(ctx context.Context, req Request, sink func(string)) (*Response, error) {
 	return c.chat(ctx, req, sink)
 }
@@ -650,6 +650,9 @@ func (c *GeminiClient) chat(ctx context.Context, req Request, sink func(string))
 		attempts = defaultMaxAttempts
 	}
 
+	// streaming is whether the streaming endpoint is still the one to call;
+	// it turns off for good when the endpoint refuses it.
+	streaming := sink != nil
 	var lastErr error
 	var retryAfter time.Duration
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -663,21 +666,12 @@ func (c *GeminiClient) chat(ctx context.Context, req Request, sink func(string))
 			}
 		}
 
-		resp, retryable, ra, err := c.doOnce(ctx, req.Model, body, sink)
-		if shouldFallback(err, fallbackBody, (*statusError).rejectsResponseJSONSchema) {
-			// Capability discovery, not a transient failure: the API will
-			// reject the field just as firmly on the next attempt, so the
-			// schema-less repeat happens immediately, inside this same attempt.
-			// It therefore consumes no MaxAttempts budget (reserved for rate
-			// limits and 5xx) and no backoff sleep. Clearing fallbackBody bounds
-			// it to exactly one extra round-trip per chat call; the stripped
-			// body is then used for any remaining retries too.
-			body, fallbackBody = fallbackBody, nil
-			dropped = true
-			resp, retryable, ra, err = c.doOnce(ctx, req.Model, body, sink)
-		}
+		resp, retryable, ra, err := c.attempt(ctx, req.Model, &body, &fallbackBody, sink, &streaming, &dropped)
 		if err == nil {
 			resp.SchemaEnforcementDropped = dropped
+			if sink != nil && !streaming && resp.Message.Content != "" {
+				sink(resp.Message.Content)
+			}
 			return resp, nil
 		}
 		lastErr = err
@@ -687,6 +681,33 @@ func (c *GeminiClient) chat(ctx context.Context, req Request, sink func(string))
 		}
 	}
 	return nil, fmt.Errorf("%w: retries exhausted: %v", ErrProvider, lastErr)
+}
+
+// attempt is one attempt of the retry loop: the round-trip, then each of the
+// two one-shot fallbacks when its 400 arrives. Capability discovery is not a
+// transient failure: the API will reject the field just as firmly on the next
+// attempt, so the repeat happens immediately, inside this same attempt - it
+// consumes no MaxAttempts budget (reserved for rate limits and 5xx) and no
+// backoff sleep. body, fallbackBody, streaming and dropped are updated in
+// place so a fallback holds for every remaining retry; clearing fallbackBody
+// bounds the schema strip to one extra round-trip per chat call.
+func (c *GeminiClient) attempt(ctx context.Context, model string, body, fallbackBody *[]byte, sink func(string),
+	streaming, dropped *bool) (*Response, bool, time.Duration, error) {
+	streamSink := sink
+	if !*streaming {
+		streamSink = nil
+	}
+	resp, retryable, ra, err := c.doOnce(ctx, model, *body, streamSink)
+	if *streaming && rejectedBy(err, (*statusError).rejectsStreaming) {
+		*streaming, streamSink = false, nil
+		resp, retryable, ra, err = c.doOnce(ctx, model, *body, nil)
+	}
+	if shouldFallback(err, *fallbackBody, (*statusError).rejectsResponseJSONSchema) {
+		*body, *fallbackBody = *fallbackBody, nil
+		*dropped = true
+		resp, retryable, ra, err = c.doOnce(ctx, model, *body, streamSink)
+	}
+	return resp, retryable, ra, err
 }
 
 // doOnce performs a single HTTP round-trip. retryable reports whether the

@@ -5739,6 +5739,47 @@ func TestE2EChatContinuation(t *testing.T) {
 	}
 }
 
+// TestLineReaderTerminalCR: on a terminal a bare carriage return ends a line
+// - the shape raw-mode typeahead leaves in the shared buffer - while CRLF is
+// still one line and a pipe keeps "\n" as its only terminator.
+func TestLineReaderTerminalCR(t *testing.T) {
+	saved := stdinIsTerminal
+	stdinIsTerminal = func(io.Reader) bool { return true }
+	t.Cleanup(func() { stdinIsTerminal = saved })
+	lines := newLineReader(strings.NewReader("y\rnext\r\nlast"))
+	var got []string
+	for {
+		line, err := lines.ReadLine()
+		got = append(got, line)
+		if err != nil {
+			break
+		}
+	}
+	if strings.Join(got, "|") != "y|next|last" {
+		t.Errorf("terminal lines = %q", got)
+	}
+	stdinIsTerminal = saved
+	lines = newLineReader(strings.NewReader("a\rb\n"))
+	line, _ := lines.ReadLine()
+	if line != "a\rb" {
+		t.Errorf("piped line = %q, want the CR kept", line)
+	}
+}
+
+// TestE2EChatContinuationEmptyLine: a line that is only a backslash still
+// contributes its newline to the entry.
+func TestE2EChatContinuationEmptyLine(t *testing.T) {
+	srv, reqs := capturingServer(t, textBody("ok"))
+	cfgPath, _ := writeTestConfig(t, srv.URL, "")
+	code, _, stderr := execCLI(t, []string{"chat", cfgPath}, "\\\nhello\n")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if got := lastContent((*reqs)[0].Messages, "user"); got != "\nhello" {
+		t.Errorf("message = %q, want the leading newline kept", got)
+	}
+}
+
 // fakeChatTerminal stands in for the TTY in the editor path.
 type fakeChatTerminal struct{}
 
@@ -5893,6 +5934,20 @@ func TestE2EChatStreams(t *testing.T) {
 			t.Errorf("a schema run asked to stream")
 		}
 	})
+}
+
+// TestE2EChatSchemaNeverStreams: chat does not enforce output.schema, but the
+// contract's "nothing streams in schema mode" holds there too.
+func TestE2EChatSchemaNeverStreams(t *testing.T) {
+	srv, reqs := capturingServer(t, textBody(`{"score": 1}`))
+	cfgPath, _ := writeTestConfig(t, srv.URL, schemaBlock)
+	out := &recordingWriter{}
+	terminalStdout(t, out)
+	var errBuf bytes.Buffer
+	code := run(context.Background(), []string{"chat", cfgPath}, strings.NewReader("hi\n"), out, &errBuf, env(t))
+	if code != ExitOK || (*reqs)[0].Stream != nil || strings.Join(out.writes, "|") != "{\"score\": 1}\n" {
+		t.Fatalf("exit %d, streamed %v, writes %q", code, (*reqs)[0].Stream != nil, out.writes)
+	}
 }
 
 // TestE2ERunVerboseStreams: `run -v` on a terminal shows the text on stderr

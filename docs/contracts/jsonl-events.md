@@ -56,6 +56,7 @@ Consumers must treat an absent numeric field as `0`, an absent boolean as
 | `resumed_from` | string | The session log this run's conversation was rebuilt from, exactly as it was typed after `--resume` (cli.md). Written only by a resumed run, so absence means "this run started from its own task" - in every log, including every one written before v1.9. It is the **one** free-text field that is redacted but never clipped ([Clipping and redaction](#clipping-and-redaction)). Since v1.9. |
 | `resumed_turn` | int | How many turns precede turn 1 of this file, whose own numbering starts at 1 again: the highest `turn` the resumed log carried, plus - since v1.11, when that log itself continued earlier ones - the turns of every log in that chain. Absent means 0, which is a real case rather than a gap - a log whose run died before its first `llm_response` still resumes, it simply starts the task over. Since v1.9. |
 | `resumed_pending` | string[] | The tool call ids the interrupted run dispatched but never logged a `tool_result` for. Each was answered with a synthetic result telling the model the outcome is unknown, and **nothing was re-executed**, so this list is exactly the set of side effects that are unaccounted for. The ids belong to the OLD log, not to this run. Absent means none. Since v1.9. |
+| `resumed_messages` | int | How many messages the rebuilt history held when this run continued it - the task, every assistant turn, every tool message and every stand-in. With `resumed_turn` and `resumed_pending` it is the fingerprint a later chain read checks the parent against: a parent that grew inside a turn after the resume changes this count while changing neither of the other two. Absent means 0 (a log written before v1.11). Since v1.11. |
 | `resumed_instruction` | string | The follow-up instruction given beside `--resume`, sent verbatim as the last user message of the rebuilt history (clipped + redacted like `task`). **Always written by a resumed run from v1.11 on** - as `""` when no instruction was given - so that absence means exactly one thing: the log predates v1.11 and did not record whether there was one. It is the one user turn of a resumed run that no other event records, which is what lets a later `--resume` rebuild the chain as one conversation; a chain through a log that lacks the key is refused rather than guessed at. Since v1.11. |
 
 ### `llm_response` - one per provider round-trip
@@ -624,11 +625,12 @@ answering turn):
 
 ### v1.11 (amele v0.3.1) - the resume instruction (additive, `v` stays `1`)
 
-Added one optional field to `run_start`, `resumed_instruction`, written by
-every run started with `--resume`: the follow-up instruction given on the
-command line, or `""` when there was none. Nothing else changed a byte; a run
-that was not resumed writes exactly the bytes v1.10 wrote, and a resumed run
-gains exactly this one key.
+Added two optional fields to `run_start`, written by every run started with
+`--resume`: `resumed_instruction`, the follow-up instruction given on the
+command line, or `""` when there was none; and `resumed_messages`, the length
+of the rebuilt history. Nothing else changed a byte; a run that was not
+resumed writes exactly the bytes v1.10 wrote, and a resumed run gains exactly
+these two keys.
 
 ```
 {"v":1,"type":"run_start","ts":"2026-09-13T09:14:02.1Z","model":"gpt-5.6","provider":"openai","task":"scan the logs","resumed_from":"out/run-2.jsonl","resumed_turn":3,"resumed_instruction":"now open a ticket"}
@@ -655,9 +657,9 @@ for a chain: read `resumed_from` back to the first log, and put each link's
 its own turn 1. A link without the key was written before v1.11 and may or
 may not have had an instruction; amele's own `--resume` refuses to follow such
 a link, and a consumer should treat it the same way rather than assume either.
-Each link's `resumed_turn` and `resumed_pending` also say what its parent
-looked like when it was continued, which is how a reader can tell that a
-parent has since grown or been cut.
+Each link's `resumed_turn`, `resumed_pending` and `resumed_messages` also say
+what its parent looked like when it was continued, which is how a reader can
+tell that a parent has since grown or been cut.
 
 ### v1.10 (amele v0.3.1) - the schema validator's feedback turn (additive, `v` stays `1`)
 

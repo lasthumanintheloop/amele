@@ -168,7 +168,14 @@ func providerChecks(ctx context.Context, cfg *config.Config, opts Options) []Che
 		if timeout <= 0 {
 			timeout = defaultProbeTimeout
 		}
-		client = &http.Client{Timeout: timeout}
+		// SECURITY: redirects are not followed. Go keeps x-api-key and
+		// x-goog-api-key on a cross-host redirect (they are not Authorization),
+		// so a probe that followed one could hand the credential to another
+		// host - the same rule the run's clients apply (issue #21). A 3xx is
+		// reported as the answer it is.
+		client = &http.Client{Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
 	}
 	checks := []Check{probeTarget(ctx, client, "provider", &cfg.Provider)}
 	for i := range cfg.Provider.Fallback {
@@ -218,7 +225,12 @@ func probeTarget(ctx context.Context, client *http.Client, name string, p *confi
 		return Check{name, Fail, fmt.Sprintf("%s: %s unreachable: %v", identity, hostOf(probeURL), unwrapURLError(err))}
 	}
 	_ = resp.Body.Close()
-	host := hostOf(probeURL)
+	return verdict(name, identity, hostOf(probeURL), resp)
+}
+
+// verdict maps the probe's answer onto a check: what the status class says
+// about the endpoint and the key.
+func verdict(name, identity, host string, resp *http.Response) Check {
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		return Check{name, Pass, fmt.Sprintf("%s: %s reachable, key accepted", identity, host)}
@@ -226,6 +238,8 @@ func probeTarget(ctx context.Context, client *http.Client, name string, p *confi
 		return Check{name, Fail, fmt.Sprintf("%s: %s reachable, key rejected (HTTP %d)", identity, host, resp.StatusCode)}
 	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed:
 		return Check{name, Warn, fmt.Sprintf("%s: %s reachable; it exposes no models listing, so the key was not checked (HTTP %d)", identity, host, resp.StatusCode)}
+	case resp.StatusCode >= 300 && resp.StatusCode < 400:
+		return Check{name, Fail, fmt.Sprintf("%s: %s redirects the API (HTTP %d to %s); the credential is not sent on - point base_url at the final host", identity, host, resp.StatusCode, hostOf(resp.Header.Get("Location")))}
 	default:
 		return Check{name, Fail, fmt.Sprintf("%s: %s answered HTTP %d", identity, host, resp.StatusCode)}
 	}

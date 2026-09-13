@@ -793,6 +793,13 @@ func writeChainLog(t *testing.T, dir, name string, lines ...string) string {
 // a v1.11 writer does: the instruction is always present (empty when none),
 // and turn/pending record what the parent looked like at the time.
 func resumedStart(from, instruction string, turn int, pending ...string) string {
+	return resumedStartWith(from, instruction, turn, 0, pending...)
+}
+
+// resumedStartWith is resumedStart with an explicit resumed_messages count
+// (0 lets the test's parent decide: the count is filled from the parent
+// when the chain tests build their fixtures - see chainStart).
+func resumedStartWith(from, instruction string, turn, messages int, pending ...string) string {
 	ev := map[string]any{
 		"v": 1, "type": "run_start", "ts": "2026-09-13T03:00:00Z",
 		"model": "gpt-4o", "provider": "openai", "task": "scan the logs",
@@ -801,11 +808,26 @@ func resumedStart(from, instruction string, turn int, pending ...string) string 
 	if turn > 0 {
 		ev["resumed_turn"] = turn
 	}
+	if messages > 0 {
+		ev["resumed_messages"] = messages
+	}
 	if len(pending) > 0 {
 		ev["resumed_pending"] = pending
 	}
 	b, _ := json.Marshal(ev)
 	return string(b)
+}
+
+// chainStart renders the run_start of a log that continued parent, with the
+// fingerprint a real resume of that parent would have recorded: its turn
+// count, its pending calls and its message count are READ from the parent.
+func chainStart(t *testing.T, parent, instruction string) string {
+	t.Helper()
+	rep, err := resume.Read(context.Background(), parent, resume.Options{})
+	if err != nil {
+		t.Fatalf("reading the parent fixture %s: %v", parent, err)
+	}
+	return resumedStartWith(parent, instruction, rep.LastTurn, len(rep.Messages), rep.Pending...)
 }
 
 // legacyResumedStart is resumedStart as a v1.9/v1.10 writer wrote it: no
@@ -831,10 +853,10 @@ func TestReadFollowsTheChain(t *testing.T) {
 	// Run 1 died with c1 dispatched and unanswered.
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, turn1Call, turn1Dispat)
 	// Run 2 resumed it with an instruction and finished.
-	retry := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "be brief", 1, "c1"), finalTurn)
+	retry := writeChainLog(t, dir, "run-2.jsonl", chainStart(t, root, "be brief"), finalTurn)
 	// Run 3 resumed the retry, added another instruction, and died before its
 	// first turn.
-	third := writeChainLog(t, dir, "run-3.jsonl", resumedStart(retry, "now count them", 2))
+	third := writeChainLog(t, dir, "run-3.jsonl", chainStart(t, retry, "now count them"))
 
 	got, err := resume.Read(context.Background(), third, resume.Options{Provider: "openai", Model: "gpt-4o"})
 	if err != nil {
@@ -878,7 +900,7 @@ func TestReadFollowsTheChain(t *testing.T) {
 func TestChainCompletedFollowsTheParent(t *testing.T) {
 	dir := t.TempDir()
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
-	empty := writeChainLog(t, dir, "run-2.jsonl", resumedStart(root, "", 1))
+	empty := writeChainLog(t, dir, "run-2.jsonl", chainStart(t, root, ""))
 	got, err := resume.Read(context.Background(), empty, resume.Options{})
 	if err != nil {
 		t.Fatalf("Read = %v", err)
@@ -895,7 +917,7 @@ func TestChainCarriersPerLink(t *testing.T) {
 	dir := t.TempDir()
 	reasoning := `{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":1,"content":"done","finish_reason":"stop","reasoning_bytes":11,"reasoning":"[{\"a\":1}]"}`
 	root := writeChainLog(t, dir, "run-1.jsonl", runStart, reasoning)
-	otherModel := strings.Replace(resumedStart(root, "again", 1), `"model":"gpt-4o"`, `"model":"gpt-4o-mini"`, 1)
+	otherModel := strings.Replace(chainStart(t, root, "again"), `"model":"gpt-4o"`, `"model":"gpt-4o-mini"`, 1)
 	retry := writeChainLog(t, dir, "run-2.jsonl", otherModel, reasoning)
 
 	got, err := resume.Read(context.Background(), retry, resume.Options{Provider: "openai", Model: "gpt-4o"})
@@ -936,7 +958,7 @@ func TestChainRefusals(t *testing.T) {
 	})
 	t.Run("a clipped instruction", func(t *testing.T) {
 		root := writeChainLog(t, dir, "run-1.jsonl", runStart, finalTurn)
-		child := writeChainLog(t, dir, "run-clip.jsonl", resumedStart(root, "be brief"+session.ClipMarker, 1))
+		child := writeChainLog(t, dir, "run-clip.jsonl", resumedStartWith(root, "be brief"+session.ClipMarker, 1, 2))
 		_, err := resume.Read(context.Background(), child, resume.Options{})
 		if !errors.Is(err, resume.ErrClipped) || !strings.Contains(err.Error(), "instruction") {
 			t.Fatalf("err = %v, want ErrClipped naming the instruction", err)
@@ -984,15 +1006,27 @@ func TestChainRefusesAChangedOrLegacyParent(t *testing.T) {
 		// then went on (its result arrived and a second turn was written).
 		root := writeChainLog(t, dir, "run-grew-1.jsonl", runStart, turn1Call, turn1Dispat, turn1Result,
 			`{"v":1,"type":"llm_response","ts":"2026-09-13T03:00:05Z","turn":2,"content":"done","finish_reason":"stop"}`)
-		child := writeChainLog(t, dir, "run-grew-2.jsonl", resumedStart(root, "", 1, "c1"), finalTurn)
+		child := writeChainLog(t, dir, "run-grew-2.jsonl", resumedStartWith(root, "", 1, 3, "c1"), finalTurn)
 		_, err := resume.Read(context.Background(), child, resume.Options{})
 		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "turn 1 then, turn 2 now") {
 			t.Fatalf("err = %v, want ErrNotResumable naming both turn counts", err)
 		}
 	})
+	t.Run("a parent that grew inside its last turn", func(t *testing.T) {
+		// Resumed while turn 1 had announced c1 but not yet written it: the
+		// child's history dropped the call (2 messages, nothing pending).
+		// The parent then wrote the call and its result - same turn count,
+		// still nothing pending, two more messages.
+		root := writeChainLog(t, dir, "run-inner-1.jsonl", runStart, turn1Call, turn1Dispat, turn1Result)
+		child := writeChainLog(t, dir, "run-inner-2.jsonl", resumedStartWith(root, "", 1, 2), finalTurn)
+		_, err := resume.Read(context.Background(), child, resume.Options{})
+		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "2 messages then, 3 now") {
+			t.Fatalf("err = %v, want ErrNotResumable naming both message counts", err)
+		}
+	})
 	t.Run("a parent whose pending call was answered after the resume", func(t *testing.T) {
 		root := writeChainLog(t, dir, "run-ans-1.jsonl", runStart, turn1Call, turn1Dispat, turn1Result)
-		child := writeChainLog(t, dir, "run-ans-2.jsonl", resumedStart(root, "", 1, "c1"), finalTurn)
+		child := writeChainLog(t, dir, "run-ans-2.jsonl", resumedStartWith(root, "", 1, 3, "c1"), finalTurn)
 		_, err := resume.Read(context.Background(), child, resume.Options{})
 		if !errors.Is(err, resume.ErrNotResumable) || !strings.Contains(err.Error(), "pending tool calls") {
 			t.Fatalf("err = %v, want ErrNotResumable naming the pending calls", err)

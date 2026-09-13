@@ -63,15 +63,23 @@ type Editor struct {
 
 	mu      sync.Mutex
 	restore func() error
+	// closed is set by Close and never cleared: a ReadLine that starts after
+	// it (an abandoned goroutine reaching the call late) must not put the
+	// terminal back into raw mode behind the session's back.
+	closed bool
 }
+
+// ErrClosed is returned by ReadLine once Close has been called.
+var ErrClosed = errors.New("line editor closed")
 
 // The bounds. A history that grew without limit would only matter in a
 // session that outlives its usefulness; a line that grew without limit is the
-// 1 MB cap the cooked reader already enforces, applied here for the same
-// reason (a runaway paste must not allocate unboundedly).
+// 1 MB cap the cooked reader already enforces, applied here in runes for the
+// same reason (a runaway paste must not allocate unboundedly - it is read and
+// dropped past the cap, never retained).
 const (
-	maxHistory  = 1000
-	maxLineByte = 1 << 20
+	maxHistory   = 1000
+	maxLineRunes = 1 << 20
 )
 
 // New returns an editor reading from in and drawing on out. in MUST be the
@@ -135,7 +143,6 @@ func (e *Editor) ReadLine(prompt string) (string, error) {
 		return "", err
 	}
 	defer e.leaveRaw()
-	_, _ = io.WriteString(e.out, enablePaste)
 	defer func() { _, _ = io.WriteString(e.out, disablePast) }()
 
 	st := &state{prompt: prompt, histPos: len(e.history)}
@@ -202,7 +209,7 @@ func (e *Editor) key(st *state, r rune) (done, deliver bool, err error) {
 		}
 		st.deleteAt()
 	case keyEscape:
-		return false, false, e.escape(st)
+		return e.escape(st)
 	case keyCtrlP:
 		e.older(st)
 	case keyCtrlN:
@@ -251,11 +258,17 @@ func (st *state) edit(r rune) {
 
 // escape reads the rest of an escape sequence and applies it. An unknown
 // sequence is consumed and ignored: leaking its bytes into the line as text
-// is the failure mode this exists to prevent.
-func (e *Editor) escape(st *state) error {
+// is the failure mode this exists to prevent. A bare Escape - one not
+// followed by a sequence introducer - is dropped and the byte that followed
+// it is handled as the key it is, so Escape then Enter still submits and
+// Escape then Ctrl-C still interrupts. The returned flags are key's.
+func (e *Editor) escape(st *state) (done, deliver bool, err error) {
 	seq, err := e.readSequence()
 	if err != nil {
-		return err
+		return false, false, err
+	}
+	if len(seq) == 1 && seq != "[" && seq != "O" {
+		return e.key(st, rune(seq[0]))
 	}
 	switch seq {
 	case "[A", "OA":
@@ -273,9 +286,9 @@ func (e *Editor) escape(st *state) error {
 	case "[3~":
 		st.deleteAt()
 	case pasteBegin:
-		return e.paste(st)
+		return false, false, e.paste(st)
 	}
-	return nil
+	return false, false, nil
 }
 
 // readSequence reads one CSI/SS3 sequence after the escape byte: the
@@ -306,9 +319,10 @@ func (e *Editor) readSequence() (string, error) {
 
 // paste inserts everything up to the end marker verbatim, newlines included:
 // a pasted block is one entry. CR is normalized to LF so a block copied from
-// a CRLF source does not carry stray carriage returns into the message.
+// a CRLF source does not carry stray carriage returns into the message. The
+// block is inserted as it is read, so the line cap applies to it as it grows
+// and the excess of a runaway paste is read and dropped, never retained.
 func (e *Editor) paste(st *state) error {
-	var block []rune
 	var prev rune
 	for {
 		r, _, err := e.in.ReadRune()
@@ -335,9 +349,6 @@ func (e *Editor) paste(st *state) error {
 		if r == '\r' {
 			r = '\n'
 		}
-		block = append(block, r)
-	}
-	for _, r := range block {
 		st.insert(r)
 	}
 	return nil
@@ -372,7 +383,7 @@ func (e *Editor) newer(st *state) {
 }
 
 func (st *state) insert(r rune) {
-	if len(st.line) >= maxLineByte {
+	if len(st.line) >= maxLineRunes {
 		return
 	}
 	st.line = append(st.line, 0)
@@ -467,21 +478,22 @@ func (e *Editor) draw(st *state) {
 	_, _ = io.WriteString(e.out, b.String())
 }
 
-// enterRaw puts the terminal into raw mode for one ReadLine.
+// enterRaw puts the terminal into raw mode for one ReadLine and switches
+// bracketed paste on, both under the lock so neither can happen after Close.
 func (e *Editor) enterRaw() error {
-	if e.term == nil {
-		return nil
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.restore != nil {
-		return nil
+	if e.closed {
+		return ErrClosed
 	}
-	restore, err := e.term.MakeRaw()
-	if err != nil {
-		return fmt.Errorf("entering raw mode: %w", err)
+	if e.term != nil && e.restore == nil {
+		restore, err := e.term.MakeRaw()
+		if err != nil {
+			return fmt.Errorf("entering raw mode: %w", err)
+		}
+		e.restore = restore
 	}
-	e.restore = restore
+	_, _ = io.WriteString(e.out, enablePaste)
 	return nil
 }
 
@@ -502,6 +514,7 @@ func (e *Editor) leaveRaw() {
 func (e *Editor) Close() {
 	e.mu.Lock()
 	raw := e.restore != nil
+	e.closed = true
 	e.mu.Unlock()
 	if raw {
 		_, _ = io.WriteString(e.out, disablePast)

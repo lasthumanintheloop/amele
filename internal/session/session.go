@@ -77,10 +77,19 @@ type Event struct {
 	// (present, empty) from "this log predates v1.11 and did not record
 	// whether there was one" (absent). The chain reader refuses to follow the
 	// second kind rather than guess.
+	//
+	// ResumedMessages (v1.11, additive) is how many messages the rebuilt
+	// history held - the task, every assistant turn, every tool message,
+	// every stand-in - when this run continued it. Together with
+	// resumed_turn and resumed_pending it is the fingerprint a later chain
+	// read checks the parent against: a parent that grew inside a turn
+	// (a tool_call and its result written after the resume) changes this
+	// count while changing neither of the other two.
 	ResumedFrom        string   `json:"resumed_from,omitempty"`
 	ResumedTurn        int      `json:"resumed_turn,omitempty"`
 	ResumedPending     []string `json:"resumed_pending,omitempty"`
 	ResumedInstruction *string  `json:"resumed_instruction,omitempty"`
+	ResumedMessages    int      `json:"resumed_messages,omitempty"`
 
 	// llm_response. Content is the assistant's text (clipped); ToolCallIDs
 	// are the IDs of the tool calls requested in the same message. Together
@@ -636,6 +645,9 @@ type Resumed struct {
 	// Instruction is the follow-up the operator typed beside --resume, empty
 	// when there was none (Event.ResumedInstruction, v1.11).
 	Instruction string
+	// Messages is the length of the rebuilt history (Event.ResumedMessages,
+	// v1.11).
+	Messages int
 }
 
 // RunStartResumed records the beginning of a run that CONTINUES an earlier
@@ -658,7 +670,7 @@ func (w *Writer) RunStartResumed(model, provider, task string, r Resumed) {
 	w.runStart(Event{
 		Type: "run_start", Model: model, Provider: provider, Task: w.clip(task),
 		ResumedFrom: w.redactOnly(r.From), ResumedTurn: r.Turn, ResumedPending: r.Pending,
-		ResumedInstruction: &instruction,
+		ResumedInstruction: &instruction, ResumedMessages: r.Messages,
 	})
 }
 

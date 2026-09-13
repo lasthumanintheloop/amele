@@ -170,3 +170,24 @@ func TestAnthropicChatStreamFallsBackWhenStreamingIsRejected(t *testing.T) {
 		t.Errorf("streamed %d plain %d content %q sink %q", streamed, plain, resp.Message.Content, got)
 	}
 }
+
+// TestAnthropicChatStreamWithoutUsageIsMissing: a stream whose events carried
+// no usage object reports usage missing, so the token budget fails closed as
+// it does for a JSON reply without one.
+func TestAnthropicChatStreamWithoutUsageIsMissing(t *testing.T) {
+	srv, _ := anStreamServer(t, anSSE(
+		`{"type":"message_start","message":{"id":"m1"}}`,
+		`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`,
+		`{"type":"message_stop"}`,
+	))
+	client := &AnthropicClient{BaseURL: srv.URL, APIKey: "k"}
+	resp, err := client.ChatStream(context.Background(), Request{Model: "claude", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.UsageMissing {
+		t.Fatalf("usage reported as present: %+v", resp.Usage)
+	}
+}

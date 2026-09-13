@@ -69,8 +69,11 @@ type anStreamState struct {
 	byIndex map[int]*anStreamBlock
 	resp    anResponse
 	usage   anUsage
-	sawMsg  bool
-	stopped bool
+	// sawUsage records that at least one event carried a usage object; a
+	// stream without one must report usage missing, not zero.
+	sawUsage bool
+	sawMsg   bool
+	stopped  bool
 }
 
 // anReadStream reads the SSE body and returns the response the events add up
@@ -96,8 +99,10 @@ func anReadStream(body io.Reader, sink func(string)) (anResponse, error) {
 		return anResponse{}, fmt.Errorf("%w: stream ended before message_stop", ErrProvider)
 	}
 	st.resp.Content = anEncodeBlocks(st.blocks)
-	usage := st.usage
-	st.resp.Usage = &usage
+	if st.sawUsage {
+		usage := st.usage
+		st.resp.Usage = &usage
+	}
 	return st.resp, nil
 }
 
@@ -109,6 +114,7 @@ func (st *anStreamState) apply(e anEvent, sink func(string)) error {
 		st.sawMsg = true
 		if e.Message != nil && e.Message.Usage != nil {
 			st.usage = *e.Message.Usage
+			st.sawUsage = true
 		}
 	case "content_block_start":
 		return st.start(e)
@@ -175,6 +181,7 @@ func (st *anStreamState) messageDelta(e anEvent) {
 	if e.Usage == nil {
 		return
 	}
+	st.sawUsage = true
 	st.usage.OutputTokens = e.Usage.OutputTokens
 	if e.Usage.InputTokens != 0 {
 		st.usage.InputTokens = e.Usage.InputTokens

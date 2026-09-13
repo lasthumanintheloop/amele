@@ -2410,6 +2410,7 @@ func logRunStart(agent *loop.Loop, cfg *config.Config, task, from, instruction s
 	}
 	agent.Session.RunStartResumed(cfg.Model, cfg.Provider.Identity(), task, session.Resumed{
 		From: from, Turn: replay.LastTurn, Pending: replay.Pending, Instruction: instruction,
+		Messages: len(replay.Messages),
 	})
 }
 
@@ -2784,7 +2785,10 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	maps.Copy(hints, set.hints)
 	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx, secrets: secrets,
 		editor: newChatEditor(lines, stderr)}
-	if writerIsTerminal(stdout) {
+	// CONTRACT (docs/contracts/cli.md): output.schema mode never streams,
+	// in chat as in run - even though chat does not enforce the schema, the
+	// answer of a schema-bearing config is shown whole.
+	if writerIsTerminal(stdout) && validator == nil {
 		s.stream = &streamWriter{w: stdout}
 		agent.Stream = s.stream.write
 	}
@@ -3031,7 +3035,7 @@ const chatContinuation = "... "
 func (s *chatSession) readEntry(ctx context.Context, lines *lineReader, stderr io.Writer) (string, error) {
 	var entry strings.Builder
 	prompt := chatPrompt
-	for {
+	for physical := 0; ; physical++ {
 		var line string
 		var err error
 		if s.editor != nil {
@@ -3047,11 +3051,16 @@ func (s *chatSession) readEntry(ctx context.Context, lines *lineReader, stderr i
 		if continued {
 			line = strings.TrimSuffix(line, `\`)
 		}
-		if entry.Len() > 0 {
+		// Counted by physical lines, not by text: a line that was only a
+		// backslash still contributes its newline.
+		if physical > 0 {
 			entry.WriteByte('\n')
 		}
 		entry.WriteString(line)
-		if !continued {
+		// The whole entry is bounded like one line: past the cap the
+		// continuation ends and what was gathered is sent, so a runaway
+		// piped continuation cannot grow a message without limit.
+		if !continued || entry.Len() >= maxChatLineBytes {
 			return entry.String(), err
 		}
 		prompt = chatContinuation
@@ -3230,7 +3239,17 @@ func (l *lineReader) IsTerminal() bool { return stdinIsTerminal(l.src) }
 // must handle the value before the error. Lines longer than maxChatLineBytes
 // are truncated and the remainder is discarded - never re-served as if it were
 // the next line the user typed.
+//
+// On a terminal a bare carriage return ends a line too: the chat editor reads
+// the terminal in raw mode, where Enter arrives as "\r", and bytes typed ahead
+// of an approval question sit in the shared buffer in that raw form - the
+// kernel's CR-to-LF translation only ever applies to bytes it has not handed
+// over yet. A pipe keeps "\n" as its only terminator, so a CRLF file still
+// reads as one line per line.
 func (l *lineReader) ReadLine() (string, error) {
+	if l.IsTerminal() {
+		return l.readTerminalLine()
+	}
 	var b strings.Builder
 	for {
 		// ReadSlice (not ReadString) is what makes the cap real: it returns
@@ -3247,6 +3266,32 @@ func (l *lineReader) ReadLine() (string, error) {
 			continue // the line is longer than the buffer; keep consuming
 		}
 		return strings.TrimRight(b.String(), "\r\n"), err
+	}
+}
+
+// readTerminalLine reads one line ended by "\n", "\r" or "\r\n", under the
+// same byte cap as ReadLine.
+func (l *lineReader) readTerminalLine() (string, error) {
+	var b strings.Builder
+	for {
+		c, err := l.buf.ReadByte()
+		if err != nil {
+			return b.String(), err
+		}
+		if c == '\r' {
+			// Swallow the LF of a CRLF pair so it does not read as an
+			// empty next line.
+			if next, err := l.buf.Peek(1); err == nil && next[0] == '\n' {
+				_, _ = l.buf.ReadByte()
+			}
+			return b.String(), nil
+		}
+		if c == '\n' {
+			return b.String(), nil
+		}
+		if b.Len() < maxChatLineBytes {
+			b.WriteByte(c)
+		}
 	}
 }
 

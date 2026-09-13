@@ -12,24 +12,21 @@ import (
 	"io"
 )
 
-// gemStreamPart is one part under assembly. Text parts of one kind (answer
-// or thought) that arrive consecutively merge into one; a functionCall part
-// is kept as the raw object the event sent, so a signed call goes back as it
-// came.
-type gemStreamPart struct {
-	text      bytes.Buffer
-	thought   bool
-	signature string
-	raw       json.RawMessage // a functionCall (or any non-text) part, verbatim
-}
-
 // gemReadStream reads the SSE body and returns the response the events add up
 // to, delivering every answer-text part to sink on the way. usageMetadata is
 // cumulative on this wire, so the last one seen is the turn's; the finish
-// reason likewise comes on the last candidate that carries one.
+// reason comes on the last candidate that carries one, and a stream that
+// ends without one was cut.
+//
+// CONTRACT: every part is kept exactly as its event sent it - no merging, no
+// re-encoding. Google requires signed parts back unmodified and forbids
+// merging or splitting them, and a part's signature can ride on a text part
+// as well as on a call; the only faithful assembly is the concatenation of
+// the streamed parts, which the decoder reads like any multi-part answer
+// (text parts concatenate). Live-unverified (#17).
 func gemReadStream(body io.Reader, sink func(string)) (gemResponse, error) {
 	var (
-		parts  []*gemStreamPart
+		parts  []json.RawMessage
 		resp   gemResponse
 		events int
 	)
@@ -65,15 +62,17 @@ func gemReadStream(body io.Reader, sink func(string)) (gemResponse, error) {
 		return gemResponse{}, fmt.Errorf("%w: stream carried no event", ErrProvider)
 	}
 	if len(resp.Candidates) > 0 {
+		if resp.Candidates[0].FinishReason == "" {
+			return gemResponse{}, fmt.Errorf("%w: stream ended before the candidate finished", ErrProvider)
+		}
 		resp.Candidates[0].Content.Parts = gemEncodeParts(parts)
 	}
 	return resp, nil
 }
 
-// gemAppendParts folds one event's parts into the assembly: a call part is
-// kept verbatim, a text part joins the previous text part of the same kind or
-// opens a new one, and answer text (not thought text) goes to the sink.
-func gemAppendParts(parts []*gemStreamPart, raw json.RawMessage, sink func(string)) ([]*gemStreamPart, error) {
+// gemAppendParts adds one event's parts to the assembly verbatim and sends
+// the answer text (not thought text) to the sink.
+func gemAppendParts(parts []json.RawMessage, raw json.RawMessage, sink func(string)) ([]json.RawMessage, error) {
 	raws, err := gemRawParts(raw)
 	if err != nil {
 		return parts, fmt.Errorf("%w: decoding stream event: %v", ErrProvider, err)
@@ -83,41 +82,16 @@ func gemAppendParts(parts []*gemStreamPart, raw json.RawMessage, sink func(strin
 		if err := json.Unmarshal(raw, &part); err != nil {
 			return parts, fmt.Errorf("%w: decoding stream event: %v", ErrProvider, err)
 		}
-		if part.FunctionCall != nil || part.FunctionResponse != nil {
-			parts = append(parts, &gemStreamPart{raw: raw})
-			continue
-		}
-		last := lastTextPart(parts)
-		if last == nil || last.thought != part.Thought {
-			last = &gemStreamPart{thought: part.Thought}
-			parts = append(parts, last)
-		}
-		last.text.WriteString(part.Text)
-		if part.ThoughtSignature != "" {
-			last.signature = part.ThoughtSignature
-		}
-		if !part.Thought && part.Text != "" {
+		parts = append(parts, raw)
+		if !part.Thought && part.FunctionCall == nil && part.Text != "" {
 			sink(part.Text)
 		}
 	}
 	return parts, nil
 }
 
-// lastTextPart returns the most recent part when it is a text part, so a
-// text fragment can join it; nil when the previous part was a call.
-func lastTextPart(parts []*gemStreamPart) *gemStreamPart {
-	if len(parts) == 0 {
-		return nil
-	}
-	last := parts[len(parts)-1]
-	if last.raw != nil {
-		return nil
-	}
-	return last
-}
-
 // gemRawParts splits a parts array into its raw elements without decoding
-// them, so a functionCall part can be kept byte for byte.
+// them, so every part can be kept byte for byte.
 func gemRawParts(raw json.RawMessage) ([]json.RawMessage, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
@@ -129,11 +103,10 @@ func gemRawParts(raw json.RawMessage) ([]json.RawMessage, error) {
 	return parts, nil
 }
 
-// gemEncodeParts renders the assembled parts as the array the API would have
-// sent whole: text parts with their thought flag and signature, call parts
-// verbatim. Nil when nothing arrived, which the decoder reads as an empty
-// turn.
-func gemEncodeParts(parts []*gemStreamPart) json.RawMessage {
+// gemEncodeParts renders the streamed parts as one array, each compacted and
+// otherwise untouched. Nil when nothing arrived, which the decoder reads as
+// an empty turn.
+func gemEncodeParts(parts []json.RawMessage) json.RawMessage {
 	if len(parts) == 0 {
 		return nil
 	}
@@ -143,17 +116,12 @@ func gemEncodeParts(parts []*gemStreamPart) json.RawMessage {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		if p.raw != nil {
-			var compact bytes.Buffer
-			if err := json.Compact(&compact, p.raw); err == nil {
-				b.Write(compact.Bytes())
-			} else {
-				b.Write(p.raw)
-			}
-			continue
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, p); err == nil {
+			b.Write(compact.Bytes())
+		} else {
+			b.Write(p)
 		}
-		encoded, _ := json.Marshal(gemPart{Text: p.text.String(), Thought: p.thought, ThoughtSignature: p.signature})
-		b.Write(encoded)
 	}
 	b.WriteByte(']')
 	return b.Bytes()

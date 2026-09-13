@@ -52,6 +52,11 @@ type oaChunk struct {
 // sseDone is the OpenAI wire's stream terminator.
 const sseDone = "[DONE]"
 
+// maxStreamedToolCalls bounds the tool_calls index a chunk may address. No
+// turn asks for anywhere near it; it exists so a hostile index cannot size an
+// allocation.
+const maxStreamedToolCalls = 256
+
 // oaStreamState accumulates the chunks of one completion.
 type oaStreamState struct {
 	content          bytes.Buffer
@@ -62,6 +67,10 @@ type oaStreamState struct {
 	finish           string
 	usage            *oaUsage
 	sawChoice        bool
+	// done records the [DONE] terminator. A stream that neither reached it
+	// nor carried a finish reason was cut, and a cut answer must not pass
+	// as a finished one.
+	done bool
 }
 
 // readStream reads the SSE body and returns the assembled message, the last
@@ -72,6 +81,7 @@ func (c *OpenAIClient) readStream(body interface{ Read([]byte) (int, error) }, s
 	var st oaStreamState
 	err := readSSE(body, func(ev sseEvent) error {
 		if ev.data == sseDone {
+			st.done = true
 			return nil
 		}
 		var chunk oaChunk
@@ -88,6 +98,12 @@ func (c *OpenAIClient) readStream(body interface{ Read([]byte) (int, error) }, s
 	}
 	if !st.sawChoice {
 		return oaMessage{}, "", nil, fmt.Errorf("%w: response has no choices", ErrProvider)
+	}
+	if !st.done && st.finish == "" {
+		// EOF between two well-formed chunks: the connection was cut. The
+		// text so far is not an answer, and a tool turn assembled from it
+		// could dispatch a call the model never finished.
+		return oaMessage{}, "", nil, fmt.Errorf("%w: stream ended before the completion finished", ErrProvider)
 	}
 	msg := oaMessage{Role: RoleAssistant, Content: st.content.String(), ToolCalls: st.calls}
 	// The carriers are re-encoded values: each is the same JSON the provider
@@ -132,6 +148,11 @@ func (st *oaStreamState) apply(chunk oaChunk, sink func(string)) error {
 		}
 	}
 	for _, tc := range d.ToolCalls {
+		// The index is provider-controlled input: a negative one would panic
+		// and an absurd one would allocate past every bound the body has.
+		if tc.Index < 0 || tc.Index >= maxStreamedToolCalls {
+			return fmt.Errorf("%w: tool call index %d out of range", ErrProvider, tc.Index)
+		}
 		for len(st.calls) <= tc.Index {
 			st.calls = append(st.calls, oaToolCall{Type: "function"})
 		}
@@ -272,6 +293,12 @@ func (o *orderedObject) merge(frag *orderedObject) {
 			continue
 		}
 		if !streamedContentKey(key) {
+			// A placeholder (null or "") in an early fragment yields to the
+			// real value of a later one: OpenRouter sends the signature
+			// null first and filled in last.
+			if isJSONPlaceholder(existing) && !isJSONPlaceholder(value) {
+				o.values[key] = value
+			}
 			continue
 		}
 		var a, b string
@@ -279,6 +306,13 @@ func (o *orderedObject) merge(frag *orderedObject) {
 			o.values[key] = mustJSON(a + b)
 		}
 	}
+}
+
+// isJSONPlaceholder reports whether a member value is null or the empty
+// string - the two ways a fragment says "not yet".
+func isJSONPlaceholder(raw json.RawMessage) bool {
+	t := bytes.TrimSpace(raw)
+	return len(t) == 0 || bytes.Equal(t, []byte("null")) || bytes.Equal(t, []byte(`""`))
 }
 
 // streamedContentKey names the reasoning_details members that arrive in

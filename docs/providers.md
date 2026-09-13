@@ -1154,8 +1154,10 @@ log, each on its own `provider_fallback` event
 `amele chat` on a terminal, and `amele run -v` on a terminal, show the
 model's text as it is generated ([CLI contract](contracts/cli.md)). Every wire
 streams natively: the OpenAI-compatible wire with `stream: true` plus
-`stream_options: {include_usage: true}` (both keys are reserved in
-`provider.params`), the Anthropic wire with `stream: true`, and the Gemini wire
+`stream_options: {include_usage: true}` (`stream` is reserved in
+`provider.params`; a `params.stream_options` of your own keeps working on
+non-streaming requests and is set aside on the one that streams), the
+Anthropic wire with `stream: true`, and the Gemini wire
 through `streamGenerateContent?alt=sse`. The streamed events are assembled
 back into exactly the response the non-streaming path decodes whole - text,
 tool calls, finish reason, usage, and the reasoning carrier - so the loop, the

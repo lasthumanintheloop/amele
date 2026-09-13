@@ -76,7 +76,7 @@ func TestReadLineKeys(t *testing.T) {
 		{"utf-8 runes", "günaydın\r", "günaydın"},
 		{"tab inserts a space", "a\tb\r", "a b"},
 		{"unknown escape is swallowed", "he\x1b[15~llo\r", "hello"},
-		{"alt key is swallowed", "he\x1bxllo\r", "hello"},
+		{"a bare escape is dropped and the key after it kept", "he\x1bxllo\x1b\r", "hexllo"},
 		{"a pasted block keeps its newlines", "\x1b[200~line one\r\nline two\x1b[201~\r", "line one\nline two"},
 		{"ctrl-c discards the line and re-prompts", "junk\x03hello\r", "hello"},
 		{"control bytes are ignored", "he\x1fllo\r", "hello"},
@@ -237,6 +237,42 @@ func (s *syncBuffer) String() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.b.String()
+}
+
+// TestCloseIsPermanent: a ReadLine that starts after Close - the abandoned
+// goroutine of a cancelled read arriving late - must not touch the terminal.
+func TestCloseIsPermanent(t *testing.T) {
+	e, out, term := editor("late\r", 80)
+	e.Close()
+	if _, err := e.ReadLine("> "); !errors.Is(err, ErrClosed) {
+		t.Fatalf("err = %v, want ErrClosed", err)
+	}
+	if _, enters, _ := term.snapshot(); enters != 0 || strings.Contains(out.String(), enablePaste) {
+		t.Errorf("a closed editor entered raw mode or paste mode: enters %d, out %q", enters, out.String())
+	}
+}
+
+// TestEscapeThenKey: Escape followed by Enter submits and Escape followed by
+// Ctrl-C interrupts; the escape itself is dropped.
+func TestEscapeThenKey(t *testing.T) {
+	e, _, _ := editor("hi\x1b\r\x1b\x03", 80)
+	if got, err := e.ReadLine("> "); err != nil || got != "hi" {
+		t.Fatalf("ReadLine = %q, %v", got, err)
+	}
+	if _, err := e.ReadLine("> "); !errors.Is(err, ErrInterrupt) {
+		t.Fatalf("err = %v, want ErrInterrupt", err)
+	}
+}
+
+// TestPasteIsBounded: a paste past the line cap is read and dropped, not
+// retained.
+func TestPasteIsBounded(t *testing.T) {
+	input := "\x1b[200~" + strings.Repeat("x", maxLineRunes+100) + "\x1b[201~\r"
+	e, _, _ := editor(input, 80)
+	got, err := e.ReadLine("> ")
+	if err != nil || len(got) != maxLineRunes {
+		t.Fatalf("len = %d, err %v; want the cap", len(got), err)
+	}
 }
 
 // TestNoTerminal: with no Terminal the editor still works on the bytes it is

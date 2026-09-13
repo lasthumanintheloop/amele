@@ -121,8 +121,8 @@ type oaRequest struct {
 	// Stream and StreamOptions are set by ChatStream only: `stream: true`
 	// asks for server-sent events, and include_usage asks for the usage
 	// object on the final chunk, which this wire otherwise omits when
-	// streaming. Both keys are reserved in provider.params (config), so a
-	// config cannot fight the client for them.
+	// streaming. stream is reserved in provider.params (config); a params
+	// stream_options is set aside for a streaming request (chat).
 	Stream        bool             `json:"stream,omitempty"`
 	StreamOptions *oaStreamOptions `json:"stream_options,omitempty"`
 }
@@ -349,6 +349,11 @@ func (c *OpenAIClient) chat(ctx context.Context, req Request, sink func(string))
 	if sink != nil {
 		wire.Stream = true
 		wire.StreamOptions = &oaStreamOptions{IncludeUsage: true}
+		// A params stream_options was legal before streaming existed and
+		// stays legal; on the one request shape that streams, the client
+		// owns the key, so the config's copy is set aside rather than
+		// merged into a body that would then carry it twice.
+		delete(fields, "stream_options")
 	}
 	body, err := encodeBody(wire, fields)
 	if err != nil {

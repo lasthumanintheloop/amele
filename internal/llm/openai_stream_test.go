@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -146,6 +148,22 @@ func TestChatStreamReasoningCarriers(t *testing.T) {
 			t.Errorf("carrier = %s on %q\nwant    %s", resp.Message.Reasoning, resp.Message.ReasoningField, want)
 		}
 	})
+	t.Run("openrouter null signature is filled by a later fragment", func(t *testing.T) {
+		base, _ := streamServer(t, sseBody(
+			`{"choices":[{"index":0,"delta":{"role":"assistant","reasoning_details":[{"type":"reasoning.text","text":"I sho","signature":null,"index":0}]},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{"reasoning_details":[{"type":"reasoning.text","text":"uld","signature":"sig","index":0}]},"finish_reason":null}]}`,
+			`{"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}`,
+		))
+		client := &OpenAIClient{BaseURL: base, Dialect: DialectOpenRouter}
+		resp, err := client.ChatStream(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := `[{"type":"reasoning.text","text":"I should","signature":"sig","index":0}]`
+		if string(resp.Message.Reasoning) != want {
+			t.Errorf("carrier = %s\nwant    %s", resp.Message.Reasoning, want)
+		}
+	})
 	t.Run("groq bare reasoning is captured for the log", func(t *testing.T) {
 		base, _ := streamServer(t, sseBody(
 			`{"choices":[{"index":0,"delta":{"role":"assistant","reasoning":"hm"},"finish_reason":null}]}`,
@@ -180,6 +198,32 @@ func TestChatStreamFailures(t *testing.T) {
 		_, err := client.ChatStream(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
 		if !errors.Is(err, ErrProvider) || !strings.Contains(err.Error(), "no choices") {
 			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("a stream cut between chunks is a provider error", func(t *testing.T) {
+		base, _ := streamServer(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"par\"},\"finish_reason\":null}]}\n\n")
+		client := &OpenAIClient{BaseURL: base, MaxAttempts: 1}
+		_, err := client.ChatStream(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
+		if !errors.Is(err, ErrProvider) || !strings.Contains(err.Error(), "before the completion finished") {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("a finish reason without [DONE] is complete", func(t *testing.T) {
+		base, _ := streamServer(t, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n")
+		client := &OpenAIClient{BaseURL: base, MaxAttempts: 1}
+		resp, err := client.ChatStream(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
+		if err != nil || resp.Message.Content != "ok" {
+			t.Fatalf("resp = %+v, err = %v", resp, err)
+		}
+	})
+	t.Run("a tool call index out of range is a provider error", func(t *testing.T) {
+		for _, idx := range []string{"-1", "100000000"} {
+			base, _ := streamServer(t, sseBody(`{"choices":[{"index":0,"delta":{"tool_calls":[{"index":`+idx+`,"id":"c","function":{"name":"f","arguments":""}}]},"finish_reason":null}]}`))
+			client := &OpenAIClient{BaseURL: base, MaxAttempts: 1}
+			_, err := client.ChatStream(context.Background(), Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}}}, func(string) {})
+			if !errors.Is(err, ErrProvider) || !strings.Contains(err.Error(), "out of range") {
+				t.Fatalf("index %s: err = %v", idx, err)
+			}
 		}
 	})
 	t.Run("a malformed chunk is a provider error", func(t *testing.T) {
@@ -239,4 +283,42 @@ func TestChatDoesNotStreamWithoutASink(t *testing.T) {
 	if _, ok := seen["stream_options"]; ok {
 		t.Errorf("Chat sent stream_options: %v", seen)
 	}
+}
+
+// TestChatStreamSetsAsideParamsStreamOptions: a params stream_options was
+// legal before streaming existed and stays legal; on the request that
+// streams the client's own object is the only one sent.
+func TestChatStreamSetsAsideParamsStreamOptions(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		if strings.Contains(string(raw), `"stream":true`) {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte(sseAnswerBody("ok")))
+			return
+		}
+		_, _ = w.Write([]byte(okBody("ok")))
+	}))
+	t.Cleanup(srv.Close)
+	client := &OpenAIClient{BaseURL: srv.URL + "/v1"}
+	req := Request{Model: "m", Messages: []Message{{Role: RoleUser, Content: "x"}},
+		Extra: map[string]json.RawMessage{"stream_options": json.RawMessage(`{"include_usage":false}`), "verbosity": json.RawMessage(`"low"`)}}
+	if _, err := client.ChatStream(context.Background(), req, func(string) {}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(raw), `"stream_options"`) != 1 || !strings.Contains(string(raw), `"include_usage":true`) || !strings.Contains(string(raw), `"verbosity":"low"`) {
+		t.Errorf("request body = %s", raw)
+	}
+	if _, err := client.Chat(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"stream_options":{"include_usage":false}`) {
+		t.Errorf("the non-streaming request lost the params copy: %s", raw)
+	}
+}
+
+// sseAnswerBody is one streamed text answer.
+func sseAnswerBody(text string) string {
+	q, _ := json.Marshal(text)
+	return sseBody(`{"choices":[{"index":0,"delta":{"content":` + string(q) + `},"finish_reason":"stop"}]}`)
 }

@@ -55,7 +55,8 @@ func TestGeminiChatStreamAssemblesEverything(t *testing.T) {
 	if len(resp.Message.ToolCalls) != 1 || resp.Message.ToolCalls[0] != (ToolCall{ID: "fc1", Name: "fs_read", Arguments: `{"path":"app.log"}`}) {
 		t.Errorf("tool calls = %+v", resp.Message.ToolCalls)
 	}
-	want := `[{"text":"Thinking about it more","thought":true,"thoughtSignature":"c2ln"},{"text":"Let me read it."},{"functionCall":{"id":"fc1","name":"fs_read","args":{"path":"app.log"}},"thoughtSignature":"Y2FsbA=="}]`
+	// Every streamed part verbatim, in order: no merging, no re-encoding.
+	want := `[{"text":"Thinking about it","thought":true},{"text":" more","thought":true,"thoughtSignature":"c2ln"},{"text":"Let me "},{"text":"read it."},{"functionCall":{"id":"fc1","name":"fs_read","args":{"path":"app.log"}},"thoughtSignature":"Y2FsbA=="}]`
 	if string(resp.Message.Reasoning) != want {
 		t.Errorf("carrier =\n%s\nwant\n%s", resp.Message.Reasoning, want)
 	}
@@ -89,6 +90,7 @@ func TestGeminiChatStreamFailures(t *testing.T) {
 		{"an empty stream", "", "no event"},
 		{"a blocked prompt", gemSSE(`{"promptFeedback":{"blockReason":"SAFETY"}}`), "prompt blocked: SAFETY"},
 		{"a truncated answer is a length finish", gemSSE(`{"candidates":[{"content":{"parts":[{"text":"cut"}]},"finishReason":"MAX_TOKENS"}]}`), ""},
+		{"a stream cut before the finish", gemSSE(`{"candidates":[{"content":{"parts":[{"text":"par"}]},"index":0}]}`), "before the candidate finished"},
 		{"a malformed event", "data: {oops\n\n", "decoding stream event"},
 	}
 	for _, tc := range cases {
@@ -106,5 +108,32 @@ func TestGeminiChatStreamFailures(t *testing.T) {
 				t.Fatalf("err = %v, want ErrProvider containing %q", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestGeminiChatStreamFallsBackWhenStreamingIsRejected: a 400 naming stream
+// on the streaming endpoint sends the request once more to generateContent,
+// and the whole answer then reaches the sink.
+func TestGeminiChatStreamFallsBackWhenStreamingIsRejected(t *testing.T) {
+	var streamed, plain int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ":streamGenerateContent") {
+			streamed++
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"code":400,"message":"stream is not supported here","status":"INVALID_ARGUMENT"}}`))
+			return
+		}
+		plain++
+		_, _ = w.Write([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"whole"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1}}`))
+	}))
+	t.Cleanup(srv.Close)
+	client := &GeminiClient{BaseURL: srv.URL, APIKey: "AIza"}
+	var got []string
+	resp, err := client.ChatStream(context.Background(), Request{Model: "g", Messages: []Message{{Role: RoleUser, Content: "x"}}}, collect(&got))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if streamed != 1 || plain != 1 || resp.Message.Content != "whole" || strings.Join(got, "") != "whole" {
+		t.Errorf("streamed %d plain %d content %q sink %q", streamed, plain, resp.Message.Content, got)
 	}
 }

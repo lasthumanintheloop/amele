@@ -50,9 +50,9 @@
 // whether its resume was given an instruction (the key is absent, not empty),
 // because the rebuilt history would either invent a user turn or skip one.
 // And a parent that no longer ends where the link continued it - its turn
-// count or its pending calls differ from what the link's run_start recorded -
-// because the link's run saw the parent as it was then, and the file has
-// since grown or been cut.
+// count, its pending calls or its message count differ from what the link's
+// run_start recorded - because the link's run saw the parent as it was then,
+// and the file has since grown or been cut.
 //
 // A file whose LAST line is torn - a prefix of an event with no newline after
 // it, which is what a SIGKILL mid-write leaves behind - ends there: the events
@@ -311,11 +311,13 @@ type link struct {
 	// the key was absent - a pre-v1.11 writer - which is not the same as an
 	// empty instruction (see session.Event.ResumedInstruction).
 	instruction *string
-	// turn and pending are run_start.resumed_turn and resumed_pending: what
-	// the parent looked like when this log's run continued it, checked
-	// against the parent as it reads now (continues).
-	turn    int
-	pending []string
+	// turn, pending and messages are run_start.resumed_turn,
+	// resumed_pending and resumed_messages: what the parent looked like when
+	// this log's run continued it, checked against the parent as it reads
+	// now (continues).
+	turn     int
+	pending  []string
+	messages int
 	// opened is whether the log holds at least one llm_response; it decides
 	// whose Completed verdict a chain takes (see chain).
 	opened bool
@@ -339,6 +341,15 @@ func (l *link) continues(parent *Replay) error {
 	if !slices.Equal(parent.Pending, l.pending) {
 		return fmt.Errorf("%w: %s no longer has the pending tool calls this log continued from (%v then, %v now)",
 			ErrNotResumable, l.from, l.pending, parent.Pending)
+	}
+	// The message count catches what the two above cannot: a turn that grew
+	// inside itself. A tool call the parent had announced but not yet
+	// written when it was resumed is dropped from the child's history and
+	// leaves nothing pending; its later tool_call and tool_result add two
+	// messages and change neither the turn count nor the pending list.
+	if len(parent.Messages) != l.messages {
+		return fmt.Errorf("%w: %s no longer holds the conversation this log continued from (%d messages then, %d now)",
+			ErrNotResumable, l.from, l.messages, len(parent.Messages))
 	}
 	return nil
 }
@@ -364,7 +375,7 @@ func readOne(r io.Reader, opts Options) (*link, error) {
 	start := events[0]
 	return &link{
 		rep: b.rep, from: start.ResumedFrom, instruction: start.ResumedInstruction,
-		turn: start.ResumedTurn, pending: start.ResumedPending, opened: b.opened,
+		turn: start.ResumedTurn, pending: start.ResumedPending, messages: start.ResumedMessages, opened: b.opened,
 	}, nil
 }
 
