@@ -311,8 +311,20 @@ Direction, not dates. Details and discussion live in
   rebuilds an interrupted run's conversation from its session log and
   continues it without re-running a single tool call
   ([docs/features.md](docs/features.md#resuming-a-run---resume)).
-- **v0.4 - a person at the keyboard.** Streaming output; a nicer `chat`
-  (history, multi-line input); default config discovery; `amele doctor`.
+- **v0.4 - a person at the keyboard** - **done**: streaming output (`chat`
+  on a terminal shows the answer as it is generated, `run -v` streams it to a
+  terminal stderr; pipes keep the whole answer -
+  [docs/providers.md](docs/providers.md#streaming)); a line editor for `chat`
+  (history, cursor keys, pasted blocks as one message, backslash
+  continuation for multi-line messages -
+  [docs/features.md](docs/features.md#interactive-mode-amele-chat)); saved
+  agents by name (`amele run sentry` finds
+  `~/.config/amele/sentry.yaml` -
+  [docs/contracts/cli.md](docs/contracts/cli.md#directory-and-name-arguments));
+  and `amele doctor`, the pre-flight that checks the config, its variables,
+  every endpoint and key, the workspace and the terminal state before a token
+  is spent, and exits 1 on a failing check
+  ([docs/features.md](docs/features.md#pre-flight-amele-doctor)).
 - **v1.0** - not a feature: the contracts have held long enough to promise
   they will keep holding.
 
