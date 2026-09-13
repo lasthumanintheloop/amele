@@ -246,7 +246,11 @@ stdout gets nothing.
 
 **stderr**: config/run errors, permission questions
 (`amele: allow tool X with {...}? [y/N]`) and audit notes, the `-v` progress
-lines, and - unless `-q` - the one-line summary:
+lines - and, with `-v` on a terminal only, the model's text as it is generated
+(additive, 2026-09-13, issue #10: each progress line then starts on a fresh
+line; stdout is unaffected and still carries the whole answer; a stderr that is
+not a terminal gets the redacted progress lines and nothing else, as before;
+`output.schema` mode never streams) - and, unless `-q`, the one-line summary:
 `✓ 8 turns, 3 tool calls, 41.0k tokens, 34.2s` (`✗` on failure; the two nouns
 turn singular at a count of exactly 1: `✓ 1 turn, 1 tool call, ...`).
 When any turn was served from the provider's prompt cache the token figure
@@ -551,6 +555,21 @@ prompts is answered on a cooked line as before.
 *stream*, not a record format: answers routinely span several lines and there
 is no delimiter. A scripted consumer that needs a parseable boundary should
 use `amele run` (one answer per process).
+
+**Streaming** (additive, 2026-09-13, issue #10): when stdout is a terminal
+the answer appears as it is generated - the provider is asked for
+server-sent events and each text delta is written as it arrives, then the
+line is closed. Only visible text streams: reasoning and tool arguments never
+do, and a turn that ends in tool calls closes its line so the next turn's text
+starts fresh. When stdout is **not** a terminal - a pipe, a file - nothing
+streams and the answer is written whole, byte for byte as before: streamed
+text is model output that cannot be redacted in flight, and the terminal is
+the one channel that persists nothing. An endpoint that refuses to stream, or
+that answers a streaming request with one JSON body, is read whole and the
+text is shown when it arrives. In `output.schema` mode nothing ever streams
+(it is not enforced in chat anyway). The reasoning carriers of a streamed
+turn are rebuilt from the deltas; see
+[docs/providers.md](../providers.md#streaming) for what that means per wire.
 
 **stderr**: the `> ` prompt, approval questions, notes (e.g.
 `output.schema is ignored in chat`, and the `session log:` note when

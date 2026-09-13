@@ -21,6 +21,8 @@ type Fake struct {
 	// including the sampling, reasoning and Extra knobs - so tests can assert
 	// what the loop and the cmd wiring actually asked the provider for.
 	Requests []Request
+	// Streamed counts the calls that came through ChatStream.
+	Streamed int
 
 	calls int
 }
@@ -44,6 +46,24 @@ func (f *Fake) Chat(_ context.Context, req Request) (*Response, error) {
 	}
 	resp := f.Responses[idx]
 	return &resp, nil
+}
+
+// ChatStream implements the loop's Streamer: the scripted response is
+// replayed and its text delivered to sink in one piece, which is what a
+// provider that could not stream would do too. Streamed records how many
+// times it happened, so a test can tell the streaming path from Chat.
+func (f *Fake) ChatStream(ctx context.Context, req Request, sink func(string)) (*Response, error) {
+	resp, err := f.Chat(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.Streamed++
+	f.mu.Unlock()
+	if resp.Message.Content != "" {
+		sink(resp.Message.Content)
+	}
+	return resp, nil
 }
 
 // TextResponse is a convenience constructor for a plain assistant answer.

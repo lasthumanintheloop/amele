@@ -252,6 +252,26 @@ type Loop struct {
 	// (cmd/amele routes every event through safeForTerminal).
 	Progress func(event string)
 
+	// Stream, when non-nil, receives the model's visible text as it is
+	// generated (issue #10): the loop asks a backend that can stream
+	// (Streamer) for its text in deltas and hands each one here, in order,
+	// from the goroutine running RunMessages. It is never called in schema
+	// mode (ResponseFormat set): a structured answer is only ever shown
+	// whole, after it validated, so the stream would show text the caller
+	// must not print. A backend that cannot stream is asked the ordinary way
+	// and the hook sees nothing - the run is otherwise identical, and the
+	// text is still in the Response.
+	//
+	// A streamed turn that ends in tool calls is closed with one "\n" delta
+	// when it produced any text, so the next turn's text starts on a fresh
+	// line; a final answer is delivered as the model produced it, without a
+	// trailing newline, and the caller decides how to end the line.
+	//
+	// SECURITY: the deltas are model output, unredacted and not
+	// terminal-safe, like the Response text itself; the caller applies
+	// whatever the channel it writes to needs.
+	Stream func(text string)
+
 	// ResponseFormat, when non-nil, is forwarded verbatim on every provider
 	// request so providers with native structured output constrain decoding.
 	// The loop stays schema-agnostic: it never inspects or validates the
@@ -398,7 +418,7 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 		// and the request, the log line and the failure message must all name
 		// the same one.
 		b := l.backend()
-		resp, err := b.Provider.Chat(ctx, llm.Request{
+		resp, err := l.ask(ctx, b, llm.Request{
 			Model:          b.Model,
 			Messages:       messages,
 			Tools:          l.Registry.Defs(),
@@ -537,6 +557,33 @@ func (l *Loop) RunMessages(ctx context.Context, history []llm.Message) (*Result,
 			return finish(err)
 		}
 	}
+}
+
+// Streamer is a provider that can deliver its text as it is generated. It is
+// consulted by ask when the loop has a Stream hook; the neutral Response it
+// returns is the same one Chat would have. Defined here, in the consuming
+// package, and satisfied by every llm client.
+type Streamer interface {
+	ChatStream(ctx context.Context, req llm.Request, sink func(text string)) (*llm.Response, error)
+}
+
+// ask performs one provider round-trip, streaming when the loop has a hook,
+// the backend can, and the answer is not a structured one. The tool-call
+// newline rule (see Stream) is applied here, once the turn is known.
+func (l *Loop) ask(ctx context.Context, b Backend, req llm.Request) (*llm.Response, error) {
+	streamer, ok := b.Provider.(Streamer)
+	if l.Stream == nil || l.ResponseFormat != nil || !ok {
+		return b.Provider.Chat(ctx, req)
+	}
+	streamed := 0
+	resp, err := streamer.ChatStream(ctx, req, func(text string) {
+		streamed += len(text)
+		l.Stream(text)
+	})
+	if err == nil && streamed > 0 && len(resp.Message.ToolCalls) > 0 {
+		l.Stream("\n")
+	}
+	return resp, err
 }
 
 // validateFinal consults FinalValidator on a clean final answer. It reports

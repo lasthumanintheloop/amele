@@ -1149,6 +1149,46 @@ you wrote, top to bottom, once. When the list runs out the run fails with the
 log, each on its own `provider_fallback` event
 ([JSONL contract](contracts/jsonl-events.md)).
 
+## Streaming
+
+`amele chat` on a terminal, and `amele run -v` on a terminal, show the
+model's text as it is generated ([CLI contract](contracts/cli.md)). Every wire
+streams natively: the OpenAI-compatible wire with `stream: true` plus
+`stream_options: {include_usage: true}` (both keys are reserved in
+`provider.params`), the Anthropic wire with `stream: true`, and the Gemini wire
+through `streamGenerateContent?alt=sse`. The streamed events are assembled
+back into exactly the response the non-streaming path decodes whole - text,
+tool calls, finish reason, usage, and the reasoning carrier - so the loop, the
+session log and the echo path see no difference. Piped output never streams,
+and a structured-output run never streams.
+
+Two things change under streaming, and both are worth knowing:
+
+- **The reasoning carrier is rebuilt, not received.** A non-streaming turn
+  keeps the provider's own bytes and echoes them back verbatim. A streamed
+  turn's carrier is assembled from the deltas: on the OpenAI wire
+  `reasoning_content` (and groq's bare `reasoning`) become one JSON string of
+  the concatenated text, and OpenRouter's `reasoning_details` items are merged
+  by their `index`, string content appended and the first-seen key order kept;
+  on the Anthropic wire the content blocks are re-encoded from their deltas
+  (a thinking block from `thinking_delta` and `signature_delta`, a tool_use
+  block from its `input_json_delta` fragments) in their original order; on the
+  Gemini wire consecutive text parts of one kind are merged into one part, a
+  signature kept on it, and a `functionCall` part is kept as its event sent
+  it. In every case that is the same JSON *value* the provider verifies -
+  DeepSeek hash-checks the text, Anthropic signs the thinking text, Gemini
+  signs the part - but it is not the provider's own bytes.
+  **Live-unverified (#17):** none of the three assemblies has been echoed back
+  to a live endpoint yet. A thinking-enabled tool loop in `chat` is where a
+  mismatch would show, as a 400 on the turn after a streamed one; `amele
+  chat < script.txt` (a pipe) is the way to run the same conversation without
+  streaming if it does.
+- **An endpoint that will not stream is asked again without it.** A 400
+  naming `stream` (or `stream_options`) makes the client repeat the request
+  once as a plain one, and a 200 that carries a JSON body instead of an event
+  stream (a gateway that ignores the flag) is decoded whole; either way the
+  text is shown when it arrives, and the run is otherwise unchanged.
+
 ## What amele does not do
 
 - **No dialect auto-detection.** `explain` prints

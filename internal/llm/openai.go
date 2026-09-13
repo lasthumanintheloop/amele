@@ -118,6 +118,18 @@ type oaRequest struct {
 	// dialect and whenever caching was not asked for. The type is the
 	// anthropic wire's, because it is the same object.
 	CacheControl *anCacheControl `json:"cache_control,omitempty"`
+	// Stream and StreamOptions are set by ChatStream only: `stream: true`
+	// asks for server-sent events, and include_usage asks for the usage
+	// object on the final chunk, which this wire otherwise omits when
+	// streaming. Both keys are reserved in provider.params (config), so a
+	// config cannot fight the client for them.
+	Stream        bool             `json:"stream,omitempty"`
+	StreamOptions *oaStreamOptions `json:"stream_options,omitempty"`
+}
+
+// oaStreamOptions is the stream_options object of a streaming request.
+type oaStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // oaResponseFormat is the response_format object. Which variant it carries is
@@ -246,31 +258,37 @@ type oaResponse struct {
 	// Usage is a pointer so "provider omitted usage entirely" is
 	// distinguishable from "zero tokens" - token budgets fail closed on
 	// the former (see llm.Response.UsageMissing).
-	// int64, not int: a 32-bit build must be able to DECODE an absurd count
-	// (json rejects an int overflow outright) so parseUsage can clamp it.
-	Usage *struct {
-		PromptTokens     int64 `json:"prompt_tokens"`
-		CompletionTokens int64 `json:"completion_tokens"`
-		// PromptTokensDetails is the canonical spelling of the cached share of
-		// the prompt: OpenAI documents both cached_tokens and
-		// cache_write_tokens there for Chat Completions (prompt-caching
-		// guide), and the compatible gateways copy it. It is a POINTER so "the
-		// provider sent the object" is distinguishable from "it sent no object
-		// at all" - only the latter falls back to the DeepSeek spelling below.
-		// A wire that sends the object without cache_write_tokens decodes to
-		// zero, which is the honest reading.
-		PromptTokensDetails *struct {
-			CachedTokens     int64 `json:"cached_tokens"`
-			CacheWriteTokens int64 `json:"cache_write_tokens"`
-		} `json:"prompt_tokens_details"`
-		// PromptCacheHitTokens is the FALLBACK spelling of the same read
-		// count: DeepSeek reports it at the top level of usage instead of
-		// sending a details object. Its sibling prompt_cache_miss_tokens is
-		// deliberately not decoded - it is the non-cached remainder, which
-		// prompt_tokens already covers, so reading it would only invite
-		// double-counting.
-		PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens"`
-	} `json:"usage"`
+	Usage *oaUsage `json:"usage"`
+}
+
+// oaUsage is the usage object of a response - or of the final chunk of a
+// stream, which is why it is a named type shared by both decoders.
+//
+// int64, not int: a 32-bit build must be able to DECODE an absurd count
+// (json rejects an int overflow outright) so parseUsage can clamp it.
+type oaUsage struct {
+	PromptTokens     int64 `json:"prompt_tokens"`
+	CompletionTokens int64 `json:"completion_tokens"`
+
+	// PromptTokensDetails is the canonical spelling of the cached share of
+	// the prompt: OpenAI documents both cached_tokens and
+	// cache_write_tokens there for Chat Completions (prompt-caching
+	// guide), and the compatible gateways copy it. It is a POINTER so "the
+	// provider sent the object" is distinguishable from "it sent no object
+	// at all" - only the latter falls back to the DeepSeek spelling below.
+	// A wire that sends the object without cache_write_tokens decodes to
+	// zero, which is the honest reading.
+	PromptTokensDetails *struct {
+		CachedTokens     int64 `json:"cached_tokens"`
+		CacheWriteTokens int64 `json:"cache_write_tokens"`
+	} `json:"prompt_tokens_details"`
+	// PromptCacheHitTokens is the FALLBACK spelling of the same read
+	// count: DeepSeek reports it at the top level of usage instead of
+	// sending a details object. Its sibling prompt_cache_miss_tokens is
+	// deliberately not decoded - it is the non-cached remainder, which
+	// prompt_tokens already covers, so reading it would only invite
+	// double-counting.
+	PromptCacheHitTokens int64 `json:"prompt_cache_hit_tokens"`
 }
 
 // rejectsResponseFormat reports whether this failure looks like "I do not
@@ -297,43 +315,65 @@ func (e *statusError) rejectsResponseFormat() bool {
 //
 // When the request carries a ResponseFormat and the provider rejects it, Chat
 // transparently repeats the call once without the field; see the fallback
-// comment below.
+// comment in chat.
 func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error) {
+	return c.chat(ctx, req, nil)
+}
+
+// ChatStream is Chat with the answer's text delivered to sink as it is
+// generated (issue #10). The request asks for server-sent events and the
+// usage object on the final chunk; the chunks are assembled into the same
+// Response Chat returns - text, tool calls, finish reason, usage and the
+// dialect's reasoning carrier - so the loop, the log and the echo path see no
+// difference. sink receives visible text only, never reasoning or tool
+// arguments, in order, from the calling goroutine.
+//
+// The reasoning carrier of a streamed turn is REBUILT from the deltas:
+// reasoning_content and groq's bare reasoning are the concatenated text
+// re-encoded as one JSON string, and OpenRouter's reasoning_details are the
+// streamed items merged by their index. That is the same value the provider
+// would have sent whole - it is what the hash-checking dialects verify - but
+// it is not the provider's own bytes, which a non-streaming turn keeps.
+// Live-unverified (#17).
+//
+// An endpoint that refuses to stream (a 400 naming stream) is asked once more
+// without it; the whole text then reaches sink at the end.
+func (c *OpenAIClient) ChatStream(ctx context.Context, req Request, sink func(string)) (*Response, error) {
+	return c.chat(ctx, req, sink)
+}
+
+// chat is the shared body of Chat and ChatStream: the retry loop plus the two
+// one-shot fallbacks (response_format, streaming), each spent at most once.
+func (c *OpenAIClient) chat(ctx context.Context, req Request, sink func(string)) (*Response, error) {
 	wire, fields := c.toWire(req)
+	if sink != nil {
+		wire.Stream = true
+		wire.StreamOptions = &oaStreamOptions{IncludeUsage: true}
+	}
 	body, err := encodeBody(wire, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encoding request: %v", ErrProvider, err)
 	}
 
-	// fallbackBody is the same request with response_format stripped, built
-	// up-front only when a schema was actually requested. Capability is
-	// rediscovered on every Chat call rather than cached on the client:
-	// per-call state keeps OpenAIClient free of global mutable state
-	// (docs/engineering.md §5.1), and the cost - one extra 400 round-trip - is paid
-	// only by the misconfigured combination of a schema and a provider that
-	// cannot honor it.
+	// Capability is rediscovered on every chat call rather than cached on the
+	// client: per-call state keeps OpenAIClient free of global mutable state
+	// (docs/engineering.md §5.1), and the cost - one extra 400 round-trip - is
+	// paid only by the misconfigured combination of a field and a provider
+	// that cannot honor it. Each fallback may fire once per call, and once
+	// fired it holds for every remaining retry.
 	//
-	// dropped remembers that this response was produced WITHOUT provider-native
-	// schema enforcement. On the json_object dialects it is known before the
-	// first request: that mode carries no schema at all, so there is nothing to
-	// probe for.
-	//
-	// The stripped body is built for json_object too. Skipping the SCHEMA probe
-	// must not cost the degradation path: an endpoint that refuses
-	// response_format outright - an older self-hosted build, a strict proxy -
-	// would otherwise turn a run the local validate+retry layer could have
-	// completed (exit 0) into a provider error (exit 5). It stays free when the
-	// endpoint is healthy, because the extra round-trip fires only on a real 400.
-	var fallbackBody []byte
-	dropped := false
-	if wire.ResponseFormat != nil {
-		dropped = wire.ResponseFormat.JSONSchema == nil
-		wire.ResponseFormat = nil
-		fallbackBody, err = encodeBody(wire, fields)
-		if err != nil {
-			return nil, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
-		}
-	}
+	// dropped remembers that this response was produced WITHOUT
+	// provider-native schema enforcement. On the json_object dialects it is
+	// known before the first request: that mode carries no schema at all, so
+	// there is nothing to probe for. The strip is still available to them:
+	// an endpoint that refuses response_format outright - an older
+	// self-hosted build, a strict proxy - would otherwise turn a run the local
+	// validate+retry layer could have completed (exit 0) into a provider error
+	// (exit 5). It stays free when the endpoint is healthy, because the extra
+	// round-trip fires only on a real 400.
+	dropped := wire.ResponseFormat != nil && wire.ResponseFormat.JSONSchema == nil
+	schemaStrip := wire.ResponseFormat != nil
+	streamStrip := sink != nil
 
 	attempts := c.MaxAttempts
 	if attempts <= 0 {
@@ -342,11 +382,6 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 
 	var lastErr error
 	var retryAfter time.Duration
-	// Beyond the json_object case above, dropped also records that the fallback
-	// fired: every response produced after that point - the fallback response
-	// itself and any later retry in this Chat call - was generated without
-	// native schema enforcement and must say so
-	// (Response.SchemaEnforcementDropped).
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
 			// Exponential backoff from InitialBackoff (1s, 2s, 4s... by
@@ -358,22 +393,14 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 			}
 		}
 
-		resp, retryable, ra, err := c.doOnce(ctx, body)
-		if shouldFallback(err, fallbackBody, (*statusError).rejectsResponseFormat) {
-			// Capability discovery, not a transient failure: the provider
-			// will reject the field just as firmly on the next attempt, so
-			// the schema-less repeat happens immediately, inside this same
-			// attempt. It therefore consumes no MaxAttempts budget (which is
-			// reserved for rate limits and 5xx) and no backoff sleep. Setting
-			// fallbackBody to nil bounds it to exactly one extra round-trip
-			// per Chat call; the stripped body is then used for any remaining
-			// retries too.
-			body, fallbackBody = fallbackBody, nil
-			dropped = true
-			resp, retryable, ra, err = c.doOnce(ctx, body)
-		}
+		resp, retryable, ra, err := c.attempt(ctx, &wire, &body, fields, sink, &schemaStrip, &streamStrip, &dropped)
 		if err == nil {
 			resp.SchemaEnforcementDropped = dropped
+			if sink != nil && !wire.Stream && resp.Message.Content != "" {
+				// The endpoint would not stream: the caller still gets the
+				// text, whole, when it arrives.
+				sink(resp.Message.Content)
+			}
 			return resp, nil
 		}
 		lastErr = err
@@ -385,10 +412,59 @@ func (c *OpenAIClient) Chat(ctx context.Context, req Request) (*Response, error)
 	return nil, fmt.Errorf("%w: retries exhausted: %v", ErrProvider, lastErr)
 }
 
+// attempt is one attempt of the retry loop: the round-trip, then each of the
+// two one-shot fallbacks when its 400 arrives. Capability discovery is not a
+// transient failure: the provider will reject the field just as firmly on the
+// next attempt, so the stripped repeat happens immediately, inside this same
+// attempt - it consumes no MaxAttempts budget (reserved for rate limits and
+// 5xx) and no backoff sleep. wire and body are updated in place so the
+// stripped shape holds for every remaining retry; the three flags record
+// which fallbacks are still available and whether schema enforcement was lost.
+func (c *OpenAIClient) attempt(ctx context.Context, wire *oaRequest, body *[]byte, fields map[string]json.RawMessage,
+	sink func(string), schemaStrip, streamStrip, dropped *bool) (*Response, bool, time.Duration, error) {
+	streamSink := sink
+	if !wire.Stream {
+		streamSink = nil
+	}
+	resp, retryable, ra, err := c.doOnce(ctx, *body, streamSink)
+	if *schemaStrip && rejectedBy(err, (*statusError).rejectsResponseFormat) {
+		*schemaStrip, *dropped = false, true
+		wire.ResponseFormat = nil
+		if *body, err = encodeBody(*wire, fields); err != nil {
+			return nil, false, 0, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
+		}
+		resp, retryable, ra, err = c.doOnce(ctx, *body, streamSink)
+	}
+	if *streamStrip && rejectedBy(err, (*statusError).rejectsStreaming) {
+		*streamStrip = false
+		wire.Stream, wire.StreamOptions = false, nil
+		if *body, err = encodeBody(*wire, fields); err != nil {
+			return nil, false, 0, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
+		}
+		resp, retryable, ra, err = c.doOnce(ctx, *body, nil)
+	}
+	return resp, retryable, ra, err
+}
+
+// rejectedBy reports whether err is a typed status failure that rejected
+// recognizes - the one-shot fallback trigger.
+func rejectedBy(err error, rejected func(*statusError) bool) bool {
+	var se *statusError
+	return err != nil && errors.As(err, &se) && rejected(se)
+}
+
+// rejectsStreaming reports whether this failure looks like "I do not support
+// streaming" (or stream_options): a 400 whose message names the field. The
+// same heuristic, with the same conservative bias, as rejectsResponseFormat.
+func (e *statusError) rejectsStreaming() bool {
+	return e.code == http.StatusBadRequest && strings.Contains(e.snippet, "stream")
+}
+
 // doOnce performs a single HTTP round-trip. retryable reports whether the
 // failure is worth retrying; retryAfter carries the provider's Retry-After
-// wish (0 when absent).
-func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
+// wish (0 when absent). With a sink the body is read as a stream of chunks;
+// without one it is one JSON document.
+func (c *OpenAIClient) doOnce(ctx context.Context, body []byte, sink func(string)) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
 	url := strings.TrimSuffix(c.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
@@ -422,6 +498,13 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 		return nil, retryable, retryAfter, err
 	}
 
+	if sink != nil && isEventStream(httpResp) {
+		msg, finish, usage, err := c.readStream(httpResp.Body, sink)
+		if err != nil {
+			return nil, false, 0, err
+		}
+		return c.response(msg, finish, usage), false, 0, nil
+	}
 	var wire oaResponse
 	if err := decodeResponseBody(httpResp.Body, &wire); err != nil {
 		return nil, false, 0, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
@@ -429,9 +512,20 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	if len(wire.Choices) == 0 {
 		return nil, false, 0, fmt.Errorf("%w: response has no choices", ErrProvider)
 	}
-
 	choice := wire.Choices[0]
-	msg := Message{Role: choice.Message.Role, Content: choice.Message.Content}
+	resp = c.response(choice.Message, choice.FinishReason, wire.Usage)
+	if sink != nil && resp.Message.Content != "" {
+		// A streaming request answered with one JSON body (a gateway that
+		// ignores `stream`): the answer is whole, so the sink gets it whole.
+		sink(resp.Message.Content)
+	}
+	return resp, false, 0, nil
+}
+
+// response maps one decoded choice - assembled from a stream or read whole -
+// onto the neutral Response.
+func (c *OpenAIClient) response(wireMsg oaMessage, finishReason string, wireUsage *oaUsage) *Response {
+	msg := Message{Role: wireMsg.Role, Content: wireMsg.Content}
 	if msg.Role == "" {
 		msg.Role = RoleAssistant
 	}
@@ -445,8 +539,8 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	// The bytes are stored as they arrived; nothing here parses them, and the
 	// key they arrived on travels with them so the echo cannot pick another
 	// one (see echoesReasoningFrom).
-	msg.Reasoning, msg.ReasoningField = captureReasoning(c.Dialect, &choice.Message)
-	for _, tc := range choice.Message.ToolCalls {
+	msg.Reasoning, msg.ReasoningField = captureReasoning(c.Dialect, &wireMsg)
+	for _, tc := range wireMsg.ToolCalls {
 		msg.ToolCalls = append(msg.ToolCalls, ToolCall{
 			ID:        tc.ID,
 			Name:      tc.Function.Name,
@@ -454,12 +548,12 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 		})
 	}
 
-	resp = &Response{Message: msg, FinishReason: choice.FinishReason}
-	if wire.Usage != nil {
+	resp := &Response{Message: msg, FinishReason: finishReason}
+	if wireUsage != nil {
 		// CONTRACT: provider counts are sanitized here, at the parse boundary,
 		// so the loop's budget arithmetic only ever sees non-negative bounded
 		// values (see parseUsage).
-		usage, trustworthy := parseUsage(wire.Usage.PromptTokens, wire.Usage.CompletionTokens)
+		usage, trustworthy := parseUsage(wireUsage.PromptTokens, wireUsage.CompletionTokens)
 		// CONTRACT: prompt_tokens ALREADY includes the cached share on this
 		// wire, so InputTokens is left alone and the cache counts are recorded
 		// as a subset of it. Adding them in (as the Anthropic client must)
@@ -468,8 +562,8 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 		// The details object wins whenever the provider sent one, even empty:
 		// it is the field that belongs to this response, so a stale or
 		// duplicated top-level count must not override it.
-		read, write := wire.Usage.PromptCacheHitTokens, int64(0)
-		if d := wire.Usage.PromptTokensDetails; d != nil {
+		read, write := wireUsage.PromptCacheHitTokens, int64(0)
+		if d := wireUsage.PromptTokensDetails; d != nil {
 			read, write = d.CachedTokens, d.CacheWriteTokens
 		}
 		usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(read, write)
@@ -478,7 +572,7 @@ func (c *OpenAIClient) doOnce(ctx context.Context, body []byte) (resp *Response,
 	} else {
 		resp.UsageMissing = true
 	}
-	return resp, false, 0, nil
+	return resp
 }
 
 // parseRetryAfter reads the seconds form of a Retry-After header. The

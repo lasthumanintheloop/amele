@@ -2364,3 +2364,63 @@ func TestNonProviderErrorNeverFallsBack(t *testing.T) {
 		}
 	}
 }
+
+// TestStreamHook (issue #10): with a hook the loop streams through a backend
+// that can, hands every delta over in order, closes a streamed tool-call turn
+// with a newline, and leaves a final answer's text as the model produced it.
+func TestStreamHook(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{
+		{Message: llm.Message{Role: llm.RoleAssistant, Content: "let me look", ToolCalls: []llm.ToolCall{{ID: "c1", Name: "echo_tool", Arguments: `{}`}}}, Usage: usage(1, 1), FinishReason: "tool_calls"},
+		llm.TextResponse("done", usage(1, 1)),
+	}}
+	l := newLoop(t, fake, Limits{})
+	var got []string
+	l.Stream = func(text string) { got = append(got, text) }
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "let me look|\n|done"; strings.Join(got, "|") != want {
+		t.Errorf("stream = %q, want %q", got, want)
+	}
+	if fake.Streamed != 2 {
+		t.Errorf("ChatStream calls = %d, want 2", fake.Streamed)
+	}
+}
+
+// TestStreamHookIsOffInSchemaMode: a structured answer is shown whole after
+// it validated, never streamed.
+func TestStreamHookIsOffInSchemaMode(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{llm.TextResponse(`{"a":1}`, usage(1, 1))}}
+	l := newLoop(t, fake, Limits{})
+	l.ResponseFormat = &llm.ResponseFormat{Name: "out", Schema: json.RawMessage(`{"type":"object"}`)}
+	calls := 0
+	l.Stream = func(string) { calls++ }
+	if _, err := l.Run(context.Background(), "task"); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || fake.Streamed != 0 {
+		t.Errorf("schema mode streamed: hook calls %d, ChatStream calls %d", calls, fake.Streamed)
+	}
+}
+
+// plainProvider cannot stream; the loop must fall back to Chat silently.
+type plainProvider struct{ fake *llm.Fake }
+
+func (p plainProvider) Chat(ctx context.Context, req llm.Request) (*llm.Response, error) {
+	return p.fake.Chat(ctx, req)
+}
+
+func TestStreamHookFallsBackToChat(t *testing.T) {
+	fake := &llm.Fake{Responses: []llm.Response{llm.TextResponse("whole", usage(1, 1))}}
+	l := newLoop(t, fake, Limits{})
+	l.Provider = plainProvider{fake}
+	calls := 0
+	l.Stream = func(string) { calls++ }
+	res, err := l.Run(context.Background(), "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 || res.FinalText != "whole" {
+		t.Errorf("hook calls %d, final %q", calls, res.FinalText)
+	}
+}

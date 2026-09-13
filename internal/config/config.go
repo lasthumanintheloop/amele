@@ -382,7 +382,7 @@ var effortValues = []string{"none", "low", "medium", "high", "xhigh", "max"}
 // ones an operator reaches for. Refusing the whole key is one rule to state and
 // one rule to test, and it needs no per-target table of which value is fatal
 // where.
-var reservedWireFields = []string{"stream", "tool_choice"}
+var reservedWireFields = []string{"stream", "stream_options", "tool_choice"}
 
 // SubprocessTool declares an external executable the model may invoke as a
 // tool. The command is a fixed argv vector: there is no shell involved, so

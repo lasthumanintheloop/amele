@@ -54,8 +54,10 @@ type capturedToolCall struct {
 // capturedRequest is the subset of an OpenAI-compatible request body the e2e
 // tests assert on.
 type capturedRequest struct {
-	Model          string            `json:"model"`
-	Messages       []capturedMessage `json:"messages"`
+	Model    string            `json:"model"`
+	Messages []capturedMessage `json:"messages"`
+	// Stream is a pointer so "the key was absent" (nil) can be asserted.
+	Stream         *bool `json:"stream"`
 	ResponseFormat *struct {
 		Type       string `json:"type"`
 		JSONSchema struct {
@@ -5778,6 +5780,141 @@ func TestE2EChatEditorHistory(t *testing.T) {
 			t.Fatalf("exit %d, stderr %q", code, stderr)
 		}
 	})
+}
+
+// sseAnswer renders one OpenAI-style streamed answer, delta by delta.
+func sseAnswer(deltas ...string) string {
+	var b strings.Builder
+	for _, d := range deltas {
+		q, _ := json.Marshal(d)
+		b.WriteString(`data: {"choices":[{"index":0,"delta":{"content":` + string(q) + `},"finish_reason":null}]}` + "\n\n")
+	}
+	b.WriteString(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}` + "\n\n")
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// streamingServer answers each request with the next SSE body.
+func streamingServer(t *testing.T, bodies ...string) *httptest.Server {
+	t.Helper()
+	var call int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if call >= len(bodies) {
+			t.Errorf("unexpected extra provider call #%d", call+1)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(bodies[call]))
+		call++
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// recordingWriter keeps every Write as its own element, so a test can see
+// that text arrived in pieces rather than only what it added up to.
+type recordingWriter struct{ writes []string }
+
+func (r *recordingWriter) Write(p []byte) (int, error) {
+	r.writes = append(r.writes, string(p))
+	return len(p), nil
+}
+
+// terminalStdout makes the streaming seam treat the given writer as a
+// terminal for the test's duration.
+func terminalStdout(t *testing.T, w io.Writer) {
+	t.Helper()
+	saved := writerIsTerminal
+	writerIsTerminal = func(x io.Writer) bool { return x == w }
+	t.Cleanup(func() { writerIsTerminal = saved })
+}
+
+// TestE2EChatStreams (issue #10): on a terminal the answer reaches stdout as
+// it is generated, delta by delta, and its line is closed once; on a pipe
+// stdout is the whole answer plus newline, byte for byte as before.
+func TestE2EChatStreams(t *testing.T) {
+	t.Run("a terminal sees the deltas", func(t *testing.T) {
+		srv := streamingServer(t, sseAnswer("Hel", "lo", " there"))
+		cfgPath, _ := writeTestConfig(t, srv.URL, "")
+		out := &recordingWriter{}
+		terminalStdout(t, out)
+		var errBuf bytes.Buffer
+		code := run(context.Background(), []string{"chat", cfgPath}, strings.NewReader("hi\n"), out, &errBuf, env(t))
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, errBuf.String())
+		}
+		if want := "Hel|lo| there|\n"; strings.Join(out.writes, "|") != want {
+			t.Errorf("stdout writes = %q, want %q", out.writes, want)
+		}
+	})
+	t.Run("a pipe gets the whole answer", func(t *testing.T) {
+		// A pipe never asks to stream, so a JSON-answering server is what it
+		// talks to; a streaming answer here would be a decode error.
+		srv, reqs := capturingServer(t, textBody("Hello"))
+		cfgPath, _ := writeTestConfig(t, srv.URL, "")
+		t.Cleanup(func() {
+			if len(*reqs) > 0 && (*reqs)[0].Stream != nil {
+				t.Errorf("a piped chat asked to stream")
+			}
+		})
+		out := &recordingWriter{}
+		var errBuf bytes.Buffer
+		code := run(context.Background(), []string{"chat", cfgPath}, strings.NewReader("hi\n"), out, &errBuf, env(t))
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, errBuf.String())
+		}
+		if strings.Join(out.writes, "|") != "Hello\n" {
+			t.Errorf("stdout writes = %q, want the answer whole", out.writes)
+		}
+	})
+	t.Run("a gateway that ignores stream still answers", func(t *testing.T) {
+		srv := scriptedServer(t, textBody("whole"))
+		cfgPath, _ := writeTestConfig(t, srv.URL, "")
+		out := &recordingWriter{}
+		terminalStdout(t, out)
+		var errBuf bytes.Buffer
+		code := run(context.Background(), []string{"chat", cfgPath}, strings.NewReader("hi\n"), out, &errBuf, env(t))
+		if code != ExitOK || strings.Join(out.writes, "|") != "whole|\n" {
+			t.Fatalf("exit %d, stdout writes %q, stderr %s", code, out.writes, errBuf.String())
+		}
+	})
+	t.Run("schema mode never streams", func(t *testing.T) {
+		srv, reqs := capturingServer(t, textBody(`{"score": 1}`))
+		cfgPath, _ := writeTestConfig(t, srv.URL, schemaBlock)
+		errW := &recordingWriter{}
+		terminalStdout(t, errW)
+		var out bytes.Buffer
+		code := run(context.Background(), []string{"run", cfgPath, "-v", "score"}, strings.NewReader(""), &out, errW, env(t))
+		if code != ExitOK {
+			t.Fatalf("exit %d, stderr: %s", code, strings.Join(errW.writes, ""))
+		}
+		if (*reqs)[0].Stream != nil {
+			t.Errorf("a schema run asked to stream")
+		}
+	})
+}
+
+// TestE2ERunVerboseStreams: `run -v` on a terminal shows the text on stderr
+// as it arrives, each progress line starting on a fresh line, while stdout
+// stays the whole answer.
+func TestE2ERunVerboseStreams(t *testing.T) {
+	srv := streamingServer(t, sseAnswer("part ", "one"))
+	cfgPath, _ := writeTestConfig(t, srv.URL, "")
+	errW := &recordingWriter{}
+	terminalStdout(t, errW)
+	var out bytes.Buffer
+	code := run(context.Background(), []string{"run", cfgPath, "-v", "go"}, strings.NewReader(""), &out, errW, env(t))
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, strings.Join(errW.writes, ""))
+	}
+	if out.String() != "part one\n" {
+		t.Errorf("stdout = %q, want the whole answer", out.String())
+	}
+	joined := strings.Join(errW.writes, "")
+	if !strings.Contains(joined, "part one\namele: turn 1: final answer") {
+		t.Errorf("stderr does not stream the text before a fresh progress line:\n%q", errW.writes)
+	}
 }
 
 // TestChatRejectsResume: --resume is registered on chat only so the refusal

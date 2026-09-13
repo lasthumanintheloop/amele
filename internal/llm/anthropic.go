@@ -116,6 +116,10 @@ type anRequest struct {
 	// exact setting a deterministic run asks for.
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
+	// Stream is set by ChatStream only: it asks for server-sent events. The
+	// key is reserved in provider.params (config), so a config cannot fight
+	// the client for it.
+	Stream bool `json:"stream,omitempty"`
 }
 
 // AnthropicOwnedWireFields returns the request-body keys the native Messages
@@ -283,16 +287,20 @@ type anResponse struct {
 	// the former (see llm.Response.UsageMissing).
 	// int64, not int: a 32-bit build must be able to DECODE an absurd count
 	// (json rejects an int overflow outright) so parseUsage can clamp it.
-	Usage *struct {
-		InputTokens  int64 `json:"input_tokens"`
-		OutputTokens int64 `json:"output_tokens"`
-		// CacheCreationInputTokens and CacheReadInputTokens are the two halves
-		// of the prompt cache on this wire, and input_tokens above EXCLUDES
-		// both of them. They are absent when nothing was cached, which decodes
-		// to zero - the honest reading here.
-		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
-		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
-	} `json:"usage"`
+	Usage *anUsage `json:"usage"`
+}
+
+// anUsage is the usage object of a response, and of the message_start and
+// message_delta events of a stream, which is why it is a named type.
+type anUsage struct {
+	InputTokens  int64 `json:"input_tokens"`
+	OutputTokens int64 `json:"output_tokens"`
+	// CacheCreationInputTokens and CacheReadInputTokens are the two halves
+	// of the prompt cache on this wire, and input_tokens above EXCLUDES
+	// both of them. They are absent when nothing was cached, which decodes
+	// to zero - the honest reading here.
+	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 }
 
 // anResponseBlock is one decoded content block of a response. Only the fields
@@ -319,15 +327,41 @@ const (
 // Chat implements Provider. It retries 429, 5xx and 529 (Anthropic's
 // "overloaded" status) with exponential backoff, honoring Retry-After.
 //
-// The retry loop is a deliberate copy of OpenAIClient.Chat's rather than a
+// The retry loop is a deliberate copy of OpenAIClient.chat's rather than a
 // shared helper: the two clients evolve independently - each carries its own
 // capability-discovery fallback for the field its wire spells differently
 // (response_format there, output_config here) - and extracting the ~20 shared
 // lines would couple their futures for no robustness gain. What IS shared is
-// the machinery both fallbacks stand on: shouldFallback, statusFailure and
-// encodeBody.
+// the machinery both fallbacks stand on: rejectedBy, statusFailure, encodeBody
+// and readSSE.
 func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, error) {
+	return c.chat(ctx, req, nil)
+}
+
+// ChatStream is Chat with the answer's text delivered to sink as it is
+// generated (issue #10). The Messages API streams content blocks as events;
+// they are assembled back into the content array the non-streaming path
+// receives whole, so text, tool calls, stop reason, usage and the reasoning
+// carrier come out the same. sink receives text_delta text only - never
+// thinking, never tool input.
+//
+// The carrier of a streamed turn is REBUILT: the blocks are re-encoded from
+// their deltas (a thinking block from its thinking and signature deltas, a
+// tool_use block from its partial JSON) in their original order. The
+// signature covers the thinking text, not the JSON bytes, so the rebuilt
+// array is what the API verifies - but it is not the API's own bytes, which
+// a non-streaming turn keeps. Live-unverified (#17).
+//
+// An endpoint that refuses to stream (a 400 naming stream) is asked once more
+// without it; the whole text then reaches sink at the end.
+func (c *AnthropicClient) ChatStream(ctx context.Context, req Request, sink func(string)) (*Response, error) {
+	return c.chat(ctx, req, sink)
+}
+
+// chat is the shared body of Chat and ChatStream.
+func (c *AnthropicClient) chat(ctx context.Context, req Request, sink func(string)) (*Response, error) {
 	wire, fields := c.toWire(req)
+	wire.Stream = sink != nil
 	body, err := encodeBody(wire, fields)
 	if err != nil {
 		return nil, fmt.Errorf("%w: encoding request: %v", ErrProvider, err)
@@ -335,30 +369,24 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 	// The error-signature table is built HERE, where the thinking shape amele
 	// is about to send is still visible: the thinking-shape hint is derived
 	// from the request, not from the server's wording (see
-	// anthropicSignatures). The output_config fallback below never touches
-	// wire.Thinking, so this table stays right for every attempt in this call.
+	// anthropicSignatures). The fallbacks below never touch wire.Thinking, so
+	// this table stays right for every attempt in this call.
 	signatures := anthropicSignatures(wire.Thinking)
 
-	// fallbackBody is the same request with output_config stripped, built
-	// up-front only when a schema was actually requested. Capability is
-	// rediscovered on every Chat call rather than cached on the client:
-	// per-call state keeps the client free of global mutable state
+	// Capability is rediscovered on every chat call rather than cached on the
+	// client: per-call state keeps the client free of global mutable state
 	// (docs/engineering.md §5.1), and the cost - one extra 400 round-trip - is
-	// paid only by an endpoint that cannot honor the field.
+	// paid only by an endpoint that cannot honor the field. Each fallback may
+	// fire once per call, and once fired it holds for every remaining retry.
 	//
-	// CONTRACT: the WHOLE object goes, not just its format key. An endpoint
-	// that rejects output_config rejects it just as firmly when it carries
-	// only an effort, so stripping the field named in the 400 is the only
-	// fallback that can succeed; a co-present effort is dropped with it, while
-	// the thinking object - which still carries the on/off decision - stays.
-	var fallbackBody []byte
-	if wire.OutputConfig != nil && wire.OutputConfig.Format != nil {
-		wire.OutputConfig = nil
-		fallbackBody, err = encodeBody(wire, fields)
-		if err != nil {
-			return nil, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
-		}
-	}
+	// CONTRACT: the schema strip drops the WHOLE output_config object, not
+	// just its format key. An endpoint that rejects output_config rejects it
+	// just as firmly when it carries only an effort, so stripping the field
+	// named in the 400 is the only fallback that can succeed; a co-present
+	// effort is dropped with it, while the thinking object - which still
+	// carries the on/off decision - stays.
+	schemaStrip := wire.OutputConfig != nil && wire.OutputConfig.Format != nil
+	streamStrip := sink != nil
 
 	attempts := c.MaxAttempts
 	if attempts <= 0 {
@@ -367,10 +395,10 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 
 	var lastErr error
 	var retryAfter time.Duration
-	// dropped remembers that the fallback fired: every response produced after
-	// that point - the fallback response itself and any later retry in this
-	// Chat call - was generated without native schema enforcement and must say
-	// so (Response.SchemaEnforcementDropped).
+	// dropped remembers that the schema fallback fired: every response
+	// produced after that point - the fallback response itself and any later
+	// retry in this call - was generated without native schema enforcement
+	// and must say so (Response.SchemaEnforcementDropped).
 	dropped := false
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 {
@@ -383,21 +411,12 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 			}
 		}
 
-		resp, retryable, ra, err := c.doOnce(ctx, body, signatures)
-		if shouldFallback(err, fallbackBody, (*statusError).rejectsOutputConfig) {
-			// Capability discovery, not a transient failure: the endpoint will
-			// reject the field just as firmly on the next attempt, so the
-			// stripped repeat happens immediately, inside this same attempt. It
-			// therefore consumes no MaxAttempts budget (reserved for rate limits
-			// and 5xx) and no backoff sleep. Setting fallbackBody to nil bounds
-			// it to exactly one extra round-trip per Chat call; the stripped body
-			// is then used for any remaining retries too.
-			body, fallbackBody = fallbackBody, nil
-			dropped = true
-			resp, retryable, ra, err = c.doOnce(ctx, body, signatures)
-		}
+		resp, retryable, ra, err := c.attempt(ctx, &wire, &body, fields, signatures, sink, &schemaStrip, &streamStrip, &dropped)
 		if err == nil {
 			resp.SchemaEnforcementDropped = dropped
+			if sink != nil && !wire.Stream && resp.Message.Content != "" {
+				sink(resp.Message.Content)
+			}
 			return resp, nil
 		}
 		lastErr = err
@@ -409,15 +428,46 @@ func (c *AnthropicClient) Chat(ctx context.Context, req Request) (*Response, err
 	return nil, fmt.Errorf("%w: retries exhausted: %v", ErrProvider, lastErr)
 }
 
+// attempt is one attempt of the retry loop: the round-trip, then each of the
+// two one-shot fallbacks when its 400 arrives. Capability discovery is not a
+// transient failure: the endpoint will reject the field just as firmly on the
+// next attempt, so the stripped repeat happens immediately, inside this same
+// attempt - it consumes no MaxAttempts budget (reserved for rate limits and
+// 5xx) and no backoff sleep. wire and body are updated in place so the
+// stripped shape holds for every remaining retry; the three flags record
+// which fallbacks are still available (schemaStrip, streamStrip) and whether
+// schema enforcement was lost (dropped).
+func (c *AnthropicClient) attempt(ctx context.Context, wire *anRequest, body *[]byte, fields map[string]json.RawMessage,
+	signatures []errorSignature, sink func(string), schemaStrip, streamStrip, dropped *bool) (*Response, bool, time.Duration, error) {
+	streamSink := sink
+	if !wire.Stream {
+		streamSink = nil
+	}
+	resp, retryable, ra, err := c.doOnce(ctx, *body, signatures, streamSink)
+	if *schemaStrip && rejectedBy(err, (*statusError).rejectsOutputConfig) {
+		*schemaStrip, *dropped = false, true
+		wire.OutputConfig = nil
+		if *body, err = encodeBody(*wire, fields); err != nil {
+			return nil, false, 0, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
+		}
+		resp, retryable, ra, err = c.doOnce(ctx, *body, signatures, streamSink)
+	}
+	if *streamStrip && rejectedBy(err, (*statusError).rejectsStreaming) {
+		*streamStrip = false
+		wire.Stream = false
+		if *body, err = encodeBody(*wire, fields); err != nil {
+			return nil, false, 0, fmt.Errorf("%w: encoding fallback request: %v", ErrProvider, err)
+		}
+		resp, retryable, ra, err = c.doOnce(ctx, *body, signatures, nil)
+	}
+	return resp, retryable, ra, err
+}
+
 // doOnce performs a single HTTP round-trip. retryable reports whether the
 // failure is worth retrying; retryAfter carries the provider's Retry-After
-// wish (0 when absent).
-//
-// signatures is the table a 400 body is judged by. It is a parameter rather
-// than the package-level table because part of it depends on what THIS request
-// carries (anthropicSignatures), and the caller is the last place that still
-// knows.
-func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []errorSignature) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
+// wish (0 when absent). With a sink the body is read as a stream of events;
+// without one it is one JSON document.
+func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []errorSignature, sink func(string)) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
 	base := c.BaseURL
 	if base == "" {
 		base = defaultAnthropicBaseURL
@@ -463,49 +513,74 @@ func (c *AnthropicClient) doOnce(ctx context.Context, body []byte, signatures []
 		return nil, retryable, retryAfter, err
 	}
 
+	resp, err = c.decode(httpResp, sink)
+	if err != nil {
+		return nil, false, 0, err
+	}
+	return resp, false, 0, nil
+}
+
+// decode turns a 200 reply into the neutral Response: an event stream is
+// assembled, a JSON body decoded whole - and a JSON body that answered a
+// streaming request is delivered to the sink whole, since that is the whole
+// answer.
+func (c *AnthropicClient) decode(httpResp *http.Response, sink func(string)) (*Response, error) {
 	var wire anResponse
-	if err := decodeResponseBody(httpResp.Body, &wire); err != nil {
-		return nil, false, 0, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
+	var err error
+	streamed := sink != nil && isEventStream(httpResp)
+	if streamed {
+		wire, err = anReadStream(httpResp.Body, sink)
+		if err != nil {
+			return nil, err
+		}
+	} else if err := decodeResponseBody(httpResp.Body, &wire); err != nil {
+		return nil, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
 	}
 	msg, err := anAssistantMessage(wire.Content)
 	if err != nil {
-		return nil, false, 0, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
+		return nil, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
 	}
+	if sink != nil && !streamed && msg.Content != "" {
+		sink(msg.Content)
+	}
+	resp := &Response{Message: msg, FinishReason: mapStopReason(wire.StopReason)}
+	resp.Usage, resp.UsageMissing = anNeutralUsage(wire.Usage)
+	return resp, nil
+}
 
-	resp = &Response{Message: msg, FinishReason: mapStopReason(wire.StopReason)}
-	if wire.Usage != nil {
-		// CONTRACT: same sanitizing boundary as the OpenAI client - the loop
-		// must never accumulate a negative or unbounded provider count.
-		usage, trustworthy := parseUsage(wire.Usage.InputTokens, wire.Usage.OutputTokens)
-		usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(
-			wire.Usage.CacheReadInputTokens, wire.Usage.CacheCreationInputTokens)
-		// CONTRACT: on THIS wire alone, input_tokens excludes the cached
-		// share, so the neutral InputTokens - which means "total billed
-		// input" everywhere - must add the two cache counters back in. Left
-		// out, limits.max_tokens would undercount every cached turn by exactly
-		// the cache share, and the better the cache worked the further the
-		// budget would drift from the truth.
-		//
-		// The sum saturates and is then clamped, so InputTokens keeps the
-		// bound every other field has: three counts clamped to
-		// maxTokensPerResponse can still add up past it, and Usage promises
-		// callers a value inside [0, maxTokensPerResponse]. The clamp cannot
-		// shrink an honest report - maxTokensPerResponse is an order of
-		// magnitude above the largest context window - so it only ever bites
-		// a broken or hostile one.
-		usage.InputTokens = min(
-			saturatingAdd(usage.InputTokens,
-				saturatingAdd(usage.CacheReadTokens, usage.CacheWriteTokens)),
-			maxTokensPerResponse)
-		resp.Usage = usage
-		// The trustworthy signal stays keyed on input_tokens/output_tokens
-		// only: parseCacheTokens clamps a broken sub-count rather than
-		// failing the whole report closed (see its doc).
-		resp.UsageMissing = !trustworthy
-	} else {
-		resp.UsageMissing = true
+// anNeutralUsage maps this wire's usage object onto the neutral Usage. A nil
+// object is "the provider omitted usage", which fails the token budget closed
+// (Response.UsageMissing).
+func anNeutralUsage(wireUsage *anUsage) (Usage, bool) {
+	if wireUsage == nil {
+		return Usage{}, true
 	}
-	return resp, false, 0, nil
+	// CONTRACT: same sanitizing boundary as the OpenAI client - the loop
+	// must never accumulate a negative or unbounded provider count.
+	usage, trustworthy := parseUsage(wireUsage.InputTokens, wireUsage.OutputTokens)
+	usage.CacheReadTokens, usage.CacheWriteTokens = parseCacheTokens(
+		wireUsage.CacheReadInputTokens, wireUsage.CacheCreationInputTokens)
+	// CONTRACT: on THIS wire alone, input_tokens excludes the cached share,
+	// so the neutral InputTokens - which means "total billed input"
+	// everywhere - must add the two cache counters back in. Left out,
+	// limits.max_tokens would undercount every cached turn by exactly the
+	// cache share, and the better the cache worked the further the budget
+	// would drift from the truth.
+	//
+	// The sum saturates and is then clamped, so InputTokens keeps the bound
+	// every other field has: three counts clamped to maxTokensPerResponse
+	// can still add up past it, and Usage promises callers a value inside
+	// [0, maxTokensPerResponse]. The clamp cannot shrink an honest report -
+	// maxTokensPerResponse is an order of magnitude above the largest
+	// context window - so it only ever bites a broken or hostile one.
+	usage.InputTokens = min(
+		saturatingAdd(usage.InputTokens,
+			saturatingAdd(usage.CacheReadTokens, usage.CacheWriteTokens)),
+		maxTokensPerResponse)
+	// The trustworthy signal stays keyed on input_tokens/output_tokens only:
+	// parseCacheTokens clamps a broken sub-count rather than failing the
+	// whole report closed (see its doc).
+	return usage, !trustworthy
 }
 
 // anAssistantMessage turns the raw content array of one response into the

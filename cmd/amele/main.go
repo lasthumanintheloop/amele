@@ -2170,7 +2170,7 @@ func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 		return ExitConfigError
 	}
 	if parsed.verbose {
-		agent.Progress = progressLogger(stderr, secrets)
+		verboseOutput(agent, stderr, secrets)
 	}
 
 	if interrupted {
@@ -2784,6 +2784,10 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 	maps.Copy(hints, set.hints)
 	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx, secrets: secrets,
 		editor: newChatEditor(lines, stderr)}
+	if writerIsTerminal(stdout) {
+		s.stream = &streamWriter{w: stdout}
+		agent.Stream = s.stream.write
+	}
 	if mcpErr != nil {
 		// The conversation never starts: a chat whose tools are missing would
 		// mislead the human at the keyboard for its whole length. A Ctrl-C
@@ -2808,6 +2812,76 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 // says events are clipped for readability, not clipped to N
 // (docs/contracts/cli.md).
 const maxProgressLine = 600
+
+// verboseOutput wires -v: the progress feed, and - on a terminal only - the
+// model's text as it is generated (issue #10), on the same channel. stdout
+// stays the whole answer, so a redirect of it is unchanged. Each progress line
+// first closes any line the stream left open.
+func verboseOutput(agent *loop.Loop, stderr io.Writer, secrets *session.SecretSet) {
+	progress := progressLogger(stderr, secrets)
+	agent.Progress = progress
+	if !writerIsTerminal(stderr) {
+		return
+	}
+	stream := &streamWriter{w: stderr}
+	agent.Stream = stream.write
+	agent.Progress = func(event string) {
+		stream.endLine()
+		progress(event)
+	}
+}
+
+// writerIsTerminal reports whether w is an interactive terminal - the one
+// place streamed model text may go. It is a variable so the streaming paths
+// can be driven by a test with a buffer standing in for the terminal.
+//
+// CONTRACT: streamed text is written to a TERMINAL only. A pipe, a file and
+// a cron mail keep the byte-identical output they always had: the answer
+// whole on stdout, the redacted progress lines on stderr. The deltas are
+// model output that cannot be redacted in flight (a secret can span two of
+// them), and the terminal is the one channel that persists nothing.
+var writerIsTerminal = func(w io.Writer) bool {
+	f, ok := w.(*os.File)
+	return ok && isTerminal(f)
+}
+
+// streamWriter carries the loop's text deltas to a terminal and remembers
+// whether the cursor is mid-line, so the next thing written to that terminal
+// - a progress line, an error, the summary - can start on a fresh line.
+type streamWriter struct {
+	w io.Writer
+	// midLine is whether the last delta did not end in a newline.
+	midLine bool
+	// streamed is whether any delta was written since the last reset: it
+	// decides whether the answer still has to be printed whole.
+	streamed bool
+}
+
+// write is the loop's Stream hook.
+func (s *streamWriter) write(text string) {
+	if text == "" {
+		return
+	}
+	_, _ = io.WriteString(s.w, text)
+	s.streamed = true
+	s.midLine = !strings.HasSuffix(text, "\n")
+}
+
+// endLine closes a line the stream left open.
+func (s *streamWriter) endLine() {
+	if s.midLine {
+		_, _ = io.WriteString(s.w, "\n")
+		s.midLine = false
+	}
+}
+
+// take reports whether anything was streamed since the last call, and
+// resets for the next exchange.
+func (s *streamWriter) take() bool {
+	streamed := s.streamed
+	s.streamed = false
+	return streamed
+}
 
 // progressLogger renders loop progress events to stderr for -v: one line per
 // event, prefixed like every other note this binary writes. secrets is the
@@ -2856,6 +2930,10 @@ type chatSession struct {
 	// cursor keys, bracketed paste - issue #11), nil otherwise. It reads
 	// through the same buffered reader as the approval prompter.
 	editor *lineedit.Editor
+	// stream carries the model's text to stdout as it is generated, when
+	// stdout is a terminal (issue #10); nil on a pipe, where the answer is
+	// printed whole as before.
+	stream *streamWriter
 
 	// history is the conversation the caller owns. loop.RunMessages never
 	// mutates it, so every turn is appended here explicitly.
@@ -2908,6 +2986,9 @@ func (s *chatSession) repl(ctx context.Context, lines *lineReader, stdout, stder
 		if strings.TrimSpace(line) != "" {
 			answer, err := s.nextTurn(ctx, line)
 			if err != nil {
+				if s.stream != nil {
+					s.stream.endLine()
+				}
 				return s.finish(stderr, exitCodeFor(err), err)
 			}
 			// CONTRACT: stdout carries only the model's answers - each one
@@ -2915,8 +2996,13 @@ func (s *chatSession) repl(ctx context.Context, lines *lineReader, stdout, stder
 			// record format: a final answer routinely spans several lines, so
 			// a consumer must not assume one line per answer (there is
 			// deliberately no delimiter; use `amele run` when a scripted
-			// consumer needs a parseable boundary).
-			_, _ = fmt.Fprintln(stdout, answer)
+			// consumer needs a parseable boundary). On a terminal the answer
+			// has already been streamed, and only its line is closed.
+			if s.stream != nil && s.stream.take() {
+				s.stream.endLine()
+			} else {
+				_, _ = fmt.Fprintln(stdout, answer)
+			}
 		}
 
 		if readErr != nil { // io.EOF: Ctrl-D or the end of a scripted session.

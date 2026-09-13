@@ -198,6 +198,10 @@ Same YAML, same tools, same permissions as `run`. Details that matter:
 - **`ask` policies work interactively** here, because stdin is a terminal. The
   REPL and the approval prompt share one reader, so answering a question never
   eats your next chat line.
+- **Streaming on a terminal.** The answer appears as it is generated when
+  stdout is a terminal; a pipe gets the whole answer as before, and
+  `amele run -v` streams the text to a terminal stderr the same way. See
+  [docs/providers.md](providers.md#streaming) for how each wire streams.
 - **A line editor on a terminal.** Up/Down recall this session's earlier
   messages, the usual cursor and kill keys edit the line, and a pasted block
   arrives as one message with its line breaks intact. A line ending in a

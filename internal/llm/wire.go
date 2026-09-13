@@ -54,6 +54,14 @@ func backoffDelay(initial time.Duration, attempt int, retryAfter time.Duration) 
 	return delay
 }
 
+// isEventStream reports whether a 200 reply is a server-sent-event stream.
+// A streaming request answered with a JSON body - a gateway that ignores
+// `stream` - is decoded whole instead, which is what the caller would have
+// received without asking to stream.
+func isEventStream(resp *http.Response) bool {
+	return strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")
+}
+
 // statusError carries the HTTP status and body snippet of a non-200 reply so
 // Chat can route on them programmatically. docs/engineering.md §5.3 bans deciding
 // control flow by matching error strings; this typed error is how the

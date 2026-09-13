@@ -576,14 +576,38 @@ func (e *statusError) rejectsResponseJSONSchema() bool {
 // Retry-After header (design doc §"Gemini-specific mechanics" item 3).
 //
 // When the request carries a ResponseFormat and the API rejects the schema
-// field, Chat repeats the call once without it; see the fallback comment below.
+// field, Chat repeats the call once without it; see the fallback comment in
+// chat.
 //
 // The retry loop mirrors the other two clients' rather than sharing a helper:
 // they evolve independently - each carries its own capability fallback for the
 // field its wire spells differently - and extracting the ~20 shared lines would
 // couple their futures for no robustness gain. What IS shared is the machinery
-// underneath: backoffDelay, statusFailure, shouldFallback and encodeBody.
+// underneath: backoffDelay, statusFailure, rejectedBy, encodeBody and readSSE.
 func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error) {
+	return c.chat(ctx, req, nil)
+}
+
+// ChatStream is Chat with the answer's text delivered to sink as it is
+// generated (issue #10). It calls streamGenerateContent with alt=sse; each
+// event is a GenerateContentResponse carrying the parts generated since the
+// previous one, and the parts are assembled back into the array the
+// non-streaming path receives whole, so text, calls, finish reason, usage and
+// the signature carrier come out the same. sink receives answer text only,
+// never a thought part.
+//
+// The carrier of a streamed turn is REBUILT: consecutive text parts of one
+// kind are merged into one part (a signature that rode on any of them is
+// kept on it) and a functionCall part is kept as the event sent it. The
+// signature is verified on the part it rides on, not on the array's bytes,
+// so the rebuilt array is what the API checks - but it is not the API's own
+// bytes, which a non-streaming turn keeps. Live-unverified (#17).
+func (c *GeminiClient) ChatStream(ctx context.Context, req Request, sink func(string)) (*Response, error) {
+	return c.chat(ctx, req, sink)
+}
+
+// chat is the shared body of Chat and ChatStream.
+func (c *GeminiClient) chat(ctx context.Context, req Request, sink func(string)) (*Response, error) {
 	wire, fields := c.toWire(req)
 	body, err := encodeBody(wire, fields)
 	if err != nil {
@@ -591,7 +615,7 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 	}
 
 	// fallbackBody is the same request with the schema stripped, built up-front
-	// only when one was actually requested. Capability is rediscovered per Chat
+	// only when one was actually requested. Capability is rediscovered per chat
 	// call rather than cached on the client (no global mutable state,
 	// docs/engineering.md §5.1); the cost - one extra 400 round-trip - is paid
 	// only by the combination of a schema and an endpoint that cannot honor it.
@@ -639,18 +663,18 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 			}
 		}
 
-		resp, retryable, ra, err := c.doOnce(ctx, req.Model, body)
+		resp, retryable, ra, err := c.doOnce(ctx, req.Model, body, sink)
 		if shouldFallback(err, fallbackBody, (*statusError).rejectsResponseJSONSchema) {
 			// Capability discovery, not a transient failure: the API will
 			// reject the field just as firmly on the next attempt, so the
 			// schema-less repeat happens immediately, inside this same attempt.
 			// It therefore consumes no MaxAttempts budget (reserved for rate
 			// limits and 5xx) and no backoff sleep. Clearing fallbackBody bounds
-			// it to exactly one extra round-trip per Chat call; the stripped
+			// it to exactly one extra round-trip per chat call; the stripped
 			// body is then used for any remaining retries too.
 			body, fallbackBody = fallbackBody, nil
 			dropped = true
-			resp, retryable, ra, err = c.doOnce(ctx, req.Model, body)
+			resp, retryable, ra, err = c.doOnce(ctx, req.Model, body, sink)
 		}
 		if err == nil {
 			resp.SchemaEnforcementDropped = dropped
@@ -668,13 +692,17 @@ func (c *GeminiClient) Chat(ctx context.Context, req Request) (*Response, error)
 // doOnce performs a single HTTP round-trip. retryable reports whether the
 // failure is worth retrying; retryAfter carries the provider's wish (0 when
 // absent). The model is a parameter rather than a body field because this wire
-// puts it in the URL.
-func (c *GeminiClient) doOnce(ctx context.Context, model string, body []byte) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
+// puts it in the URL. With a sink the streaming endpoint is called and its
+// events assembled; without one the JSON body is decoded whole.
+func (c *GeminiClient) doOnce(ctx context.Context, model string, body []byte, sink func(string)) (resp *Response, retryable bool, retryAfter time.Duration, err error) {
 	endpoint, err := c.endpoint(model)
 	if err != nil {
 		// A target that cannot be addressed will not become addressable on the
 		// next attempt, so this is not retryable.
 		return nil, false, 0, err
+	}
+	if sink != nil {
+		endpoint = streamEndpoint(endpoint)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
@@ -710,15 +738,45 @@ func (c *GeminiClient) doOnce(ctx context.Context, model string, body []byte) (r
 		return c.failure(httpResp)
 	}
 
-	var wire gemResponse
-	if err := decodeResponseBody(httpResp.Body, &wire); err != nil {
-		return nil, false, 0, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
-	}
-	resp, err = geminiResponse(wire)
+	resp, err = c.decode(httpResp, sink)
 	if err != nil {
 		return nil, false, 0, err
 	}
 	return resp, false, 0, nil
+}
+
+// decode turns a 200 reply into the neutral Response: an event stream is
+// assembled, a JSON body decoded whole - and a JSON body that answered a
+// streaming request is delivered to the sink whole, since that is the whole
+// answer.
+func (c *GeminiClient) decode(httpResp *http.Response, sink func(string)) (*Response, error) {
+	var wire gemResponse
+	var err error
+	streamed := sink != nil && isEventStream(httpResp)
+	if streamed {
+		wire, err = gemReadStream(httpResp.Body, sink)
+		if err != nil {
+			return nil, err
+		}
+	} else if err := decodeResponseBody(httpResp.Body, &wire); err != nil {
+		return nil, fmt.Errorf("%w: decoding response: %v", ErrProvider, err)
+	}
+	resp, err := geminiResponse(wire)
+	if err != nil {
+		return nil, err
+	}
+	if sink != nil && !streamed && resp.Message.Content != "" {
+		sink(resp.Message.Content)
+	}
+	return resp, nil
+}
+
+// streamEndpoint turns a generateContent URL into its streaming sibling:
+// the method name changes and alt=sse selects server-sent events over the
+// default JSON-array framing. Both backends (AI Studio and Vertex) spell it
+// this way.
+func streamEndpoint(generate string) string {
+	return strings.Replace(generate, ":generateContent", ":streamGenerateContent", 1) + "?alt=sse"
 }
 
 // authorize sets the credential header for one request. Which credential that
