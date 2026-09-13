@@ -1056,33 +1056,59 @@ func (w *Writer) RunEnd(r RunEnd) {
 	_ = w.w.Close()
 }
 
+// Stats is what the summary line reports. It is a struct rather than a
+// parameter list for the same reason LLMResponse is one: five ints in a row
+// let a transposed call site compile and then print a lie.
+type Stats struct {
+	Turns     int
+	ToolCalls int
+	// TotalTokens is input+output over the run; CachedTokens is the share of
+	// it that came back from a prompt cache (a subset, never an addition).
+	TotalTokens  int
+	CachedTokens int
+	// Fallbacks is how many times the run moved along its provider fallback
+	// chain (loop.Result.Fallbacks).
+	Fallbacks int
+	Duration  time.Duration
+}
+
 // Summary renders the single-line run summary printed to stderr after every
 // run: `✓ 8 turns, 3 tool calls, 41k tokens, 34.2s`. The turn and tool-call
 // nouns are singular for a count of exactly 1 (`✓ 1 turn, 1 tool call, ...`);
 // tokens and seconds are units, which stay as they are at any count.
 //
-// cachedTokens is the share of totalTokens that came back from a prompt cache.
-// When it is positive the token figure gains a parenthetical -
-// `41.0k tokens (28.0k cached)` - and when it is zero the line is byte-for-byte
-// the one every pre-v0.3 run printed: an operator grepping the old shape, and
-// a provider that reports no cache counts at all, must see no change.
-func Summary(ok bool, turns, toolCalls, totalTokens, cachedTokens int, duration time.Duration) string {
+// Two parentheticals are added only when they have something to say, so a run
+// that needs neither prints byte-for-byte the line every pre-v0.3 run printed
+// (an operator grepping the old shape must see no change):
+//
+//   - a positive CachedTokens puts the cached share beside the token figure:
+//     `41.0k tokens (28.0k cached)`;
+//   - a positive Fallbacks closes the line with the count of provider moves:
+//     `..., 34.2s (1 provider fallback)`. It is there so a fallback that
+//     succeeded - and may be masking a misconfigured primary for the whole
+//     run - is visible from a cron mail without -v or a session log
+//     (issue #27).
+func Summary(ok bool, s Stats) string {
 	mark := "✓"
 	if !ok {
 		mark = "✗"
 	}
 	cached := ""
-	if cachedTokens > 0 {
-		cached = fmt.Sprintf(" (%s cached)", formatTokens(cachedTokens))
+	if s.CachedTokens > 0 {
+		cached = fmt.Sprintf(" (%s cached)", formatTokens(s.CachedTokens))
 	}
-	return fmt.Sprintf("%s %d %s, %d %s, %s tokens%s, %.1fs",
-		mark, turns, plural(turns, "turn"), toolCalls, plural(toolCalls, "tool call"),
-		formatTokens(totalTokens), cached, duration.Seconds())
+	fallbacks := ""
+	if s.Fallbacks > 0 {
+		fallbacks = fmt.Sprintf(" (%d %s)", s.Fallbacks, plural(s.Fallbacks, "provider fallback"))
+	}
+	return fmt.Sprintf("%s %d %s, %d %s, %s tokens%s, %.1fs%s",
+		mark, s.Turns, plural(s.Turns, "turn"), s.ToolCalls, plural(s.ToolCalls, "tool call"),
+		formatTokens(s.TotalTokens), cached, s.Duration.Seconds(), fallbacks)
 }
 
 // plural returns noun as-is for a count of exactly 1 and the "+s" form
 // otherwise, including for 0 ("0 turns" is how English counts nothing).
-// Only the two nouns Summary counts go through it, so the naive "+s" rule
+// Only the three nouns Summary counts go through it, so the naive "+s" rule
 // cannot meet an irregular word.
 func plural(n int, noun string) string {
 	if n == 1 {

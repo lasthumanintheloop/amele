@@ -1039,9 +1039,16 @@ a rate-limited primary can burn its whole ladder - up to 9 x 60s of backoff at
 misconfigured one hands over at once.
 
 The consequence of the second half is worth stating plainly - **a fallback that
-succeeds can mask a primary misconfiguration for the rest of the run.** The
-`provider_fallback` event in the session log and the `-v` line are how you
-notice:
+succeeds can mask a primary misconfiguration for the rest of the run.** Three
+things say it happened. The summary line every run prints closes with the
+count of moves, so a cron mail shows it without any flag:
+
+```
+✓ 4 turns, 2 tool calls, 12.0k tokens, 8.1s (1 provider fallback)
+```
+
+The `provider_fallback` event in the session log records where the run went
+and why, and the `-v` line says it as it happens:
 
 ```
 amele: turn 1: provider error on gpt-5.6 (openai); falling back to claude-opus-5 (anthropic)

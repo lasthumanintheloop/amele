@@ -250,7 +250,12 @@ lines, and - unless `-q` - the one-line summary:
 turn singular at a count of exactly 1: `✓ 1 turn, 1 tool call, ...`).
 When any turn was served from the provider's prompt cache the token figure
 carries a suffix: `✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s`;
-a run with no cache reads prints the line exactly as before.
+a run with no cache reads prints the line exactly as before. When the run
+moved along its `provider.fallback` chain the line closes with the count of
+moves - `✓ 4 turns, 2 tool calls, 12.0k tokens, 8.1s (1 provider fallback)` -
+so a fallback that succeeded, and may be masking a misconfigured primary, is
+visible from a cron mail without `-v` or a session log (added 2026-09-13,
+issue #27; a run that never fell back prints the line exactly as before).
 With `print_session_path: true` in the config, one further note - `session log:
 <path>` - is printed once, as soon as the session file is open, naming the
 timestamped file this run is writing so it can be followed with `tail -f`. It

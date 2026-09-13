@@ -4937,8 +4937,11 @@ func TestE2EProviderFallback(t *testing.T) {
 		if !strings.Contains(raw, `"fallbacks":1`) {
 			t.Errorf("run_end does not count the switch:\n%s", raw)
 		}
-		if !strings.Contains(stderr, "tokens") {
-			t.Errorf("the run summary is missing: %q", stderr)
+		// The summary says the run fell back (issue #27): without it a
+		// successful fallback is invisible to a cron mail, and docs/providers.md
+		// names masking a misconfigured primary as the hazard of that.
+		if !strings.Contains(stderr, "s (1 provider fallback)\n") {
+			t.Errorf("the run summary does not mention the fallback: %q", stderr)
 		}
 	})
 

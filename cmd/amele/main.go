@@ -2230,7 +2230,11 @@ func reportRun(agent *loop.Loop, res *loop.Result, runErr error, code int, schem
 	if quiet {
 		return
 	}
-	_, _ = fmt.Fprintln(stderr, session.Summary(runErr == nil, res.Turns, res.ToolCalls, res.Usage.Total(), res.Usage.CacheReadTokens, res.Duration))
+	_, _ = fmt.Fprintln(stderr, session.Summary(runErr == nil, session.Stats{
+		Turns: res.Turns, ToolCalls: res.ToolCalls,
+		TotalTokens: res.Usage.Total(), CachedTokens: res.Usage.CacheReadTokens,
+		Fallbacks: res.Fallbacks, Duration: res.Duration,
+	}))
 	// The native-downgrade warning follows the summary, once per run: in
 	// schema mode the operator must learn when provider-native enforcement was
 	// unavailable and the validate+retry layer carried output.schema alone. It
@@ -2701,7 +2705,10 @@ func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
 		Duration:  s.duration,
 	})
 	if !s.quiet {
-		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, s.turns, s.toolCalls, s.tokens, s.cached, s.duration))
+		_, _ = fmt.Fprintln(stderr, session.Summary(err == nil, session.Stats{
+			Turns: s.turns, ToolCalls: s.toolCalls, TotalTokens: s.tokens,
+			CachedTokens: s.cached, Fallbacks: s.fallbacks, Duration: s.duration,
+		}))
 	}
 	return code
 }

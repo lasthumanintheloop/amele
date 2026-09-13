@@ -384,34 +384,45 @@ func TestSummary(t *testing.T) {
 		toolCalls int
 		tokens    int
 		cached    int
+		fallbacks int
 		want      string
 	}{
-		{"plural", true, 8, 3, 41234, 0, "✓ 8 turns, 3 tool calls, 41.2k tokens, 34.0s"},
-		{"failure mark", false, 8, 3, 900, 0, "✗ 8 turns, 3 tool calls, 900 tokens, 34.0s"},
-		{"millions of tokens", true, 8, 3, 2_500_000, 0, "✓ 8 turns, 3 tool calls, 2.5M tokens, 34.0s"},
+		{"plural", true, 8, 3, 41234, 0, 0, "✓ 8 turns, 3 tool calls, 41.2k tokens, 34.0s"},
+		{"failure mark", false, 8, 3, 900, 0, 0, "✗ 8 turns, 3 tool calls, 900 tokens, 34.0s"},
+		{"millions of tokens", true, 8, 3, 2_500_000, 0, 0, "✓ 8 turns, 3 tool calls, 2.5M tokens, 34.0s"},
 		// The one-turn run is the common case for a cron agent that answers
 		// without calling a tool, so "1 turns, 0 tool calls" was the line
 		// operators read most often.
-		{"single turn", true, 1, 1, 12, 0, "✓ 1 turn, 1 tool call, 12 tokens, 34.0s"},
-		{"zero counts stay plural", true, 0, 0, 0, 0, "✓ 0 turns, 0 tool calls, 0 tokens, 34.0s"},
+		{"single turn", true, 1, 1, 12, 0, 0, "✓ 1 turn, 1 tool call, 12 tokens, 34.0s"},
+		{"zero counts stay plural", true, 0, 0, 0, 0, 0, "✓ 0 turns, 0 tool calls, 0 tokens, 34.0s"},
 		// The cached parenthetical: present only when the run actually read
 		// from a cache, so an uncached run prints the pre-v0.3 line unchanged
 		// (the four rows above are that claim).
-		{"cached share", true, 8, 3, 41000, 28000, "✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s"},
+		{"cached share", true, 8, 3, 41000, 28000, 0, "✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s"},
 		// Small cached counts stay bare integers, like the token total does.
-		{"small cached share", true, 1, 0, 1200, 999, "✓ 1 turn, 0 tool calls, 1.2k tokens (999 cached), 34.2s"},
+		{"small cached share", true, 1, 0, 1200, 999, 0, "✓ 1 turn, 0 tool calls, 1.2k tokens (999 cached), 34.2s"},
 		// A failed run still reports what its cache reads saved.
-		{"cached on failure", false, 2, 0, 5000, 1000, "✗ 2 turns, 0 tool calls, 5.0k tokens (1.0k cached), 34.2s"},
+		{"cached on failure", false, 2, 0, 5000, 1000, 0, "✗ 2 turns, 0 tool calls, 5.0k tokens (1.0k cached), 34.2s"},
+		// The fallback parenthetical (issue #27): a run that moved along its
+		// fallback chain says so at the end of the line, so a masked primary
+		// misconfiguration is visible without -v or a session log. A run
+		// that never fell back prints the line exactly as before.
+		{"one fallback", true, 4, 2, 12000, 0, 1, "✓ 4 turns, 2 tool calls, 12.0k tokens, 34.2s (1 provider fallback)"},
+		{"several fallbacks", false, 4, 2, 12000, 0, 2, "✗ 4 turns, 2 tool calls, 12.0k tokens, 34.2s (2 provider fallbacks)"},
+		{"cached and fallback", true, 4, 2, 12000, 3000, 1, "✓ 4 turns, 2 tool calls, 12.0k tokens (3.0k cached), 34.2s (1 provider fallback)"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// The cached rows want a fractional second in the line, so the
-			// duration differs per row: 34.0s for the uncached legacy rows.
+			// The newer rows want a fractional second in the line, so the
+			// duration differs per row: 34.0s for the legacy rows.
 			d := 34 * time.Second
-			if tt.cached > 0 {
+			if tt.cached > 0 || tt.fallbacks > 0 {
 				d = 34200 * time.Millisecond
 			}
-			got := Summary(tt.ok, tt.turns, tt.toolCalls, tt.tokens, tt.cached, d)
+			got := Summary(tt.ok, Stats{
+				Turns: tt.turns, ToolCalls: tt.toolCalls, TotalTokens: tt.tokens,
+				CachedTokens: tt.cached, Fallbacks: tt.fallbacks, Duration: d,
+			})
 			if got != tt.want {
 				t.Errorf("Summary: got %q want %q", got, tt.want)
 			}

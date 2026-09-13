@@ -284,7 +284,9 @@ class, after that target's own retries - and **stays** on whichever entry
 answers: sequential, sticky, never back to the primary, never two endpoints
 raced against each other. The failed attempt and the retry are both ordinary
 turns, so a chain cannot overspend `limits.max_turns`. When the list runs out
-the run fails with the last endpoint's error at exit 5.
+the run fails with the last endpoint's error at exit 5. A run that fell back
+says so on its summary line - `✓ 4 turns, 2 tool calls, 12.0k tokens, 8.1s
+(1 provider fallback)` - so the move is visible from a cron mail.
 
 Full rules - what falls back and what deliberately does not, the reasoning
 carriers dropped when a switch crosses wire families, and why a fallback that
