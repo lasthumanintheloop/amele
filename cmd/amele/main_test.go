@@ -5758,6 +5758,25 @@ func TestLineReaderTerminalCR(t *testing.T) {
 	if strings.Join(got, "|") != "y|next|last" {
 		t.Errorf("terminal lines = %q", got)
 	}
+	// A typed-ahead "y\r" with nothing after it must answer at once: the
+	// CRLF check may only look at bytes already buffered, never wait for one.
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	go func() { _, _ = pw.Write([]byte("y\r")) }()
+	open := newLineReader(pr)
+	done := make(chan string, 1)
+	go func() {
+		line, _ := open.ReadLine()
+		done <- line
+	}()
+	select {
+	case line := <-done:
+		if line != "y" {
+			t.Errorf("typed-ahead answer = %q, want y", line)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadLine blocked after a bare CR waiting for a byte that never comes")
+	}
 	stdinIsTerminal = saved
 	lines = newLineReader(strings.NewReader("a\rb\n"))
 	line, _ := lines.ReadLine()

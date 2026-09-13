@@ -3279,10 +3279,14 @@ func (l *lineReader) readTerminalLine() (string, error) {
 			return b.String(), err
 		}
 		if c == '\r' {
-			// Swallow the LF of a CRLF pair so it does not read as an
-			// empty next line.
-			if next, err := l.buf.Peek(1); err == nil && next[0] == '\n' {
-				_, _ = l.buf.ReadByte()
+			// Swallow the LF of a CRLF pair so it does not read as an empty
+			// next line - but only one already in the buffer: peeking past
+			// it would block on the terminal for a byte that may never come,
+			// and a typed-ahead "y\r" must answer at once.
+			if l.buf.Buffered() > 0 {
+				if next, err := l.buf.Peek(1); err == nil && next[0] == '\n' {
+					_, _ = l.buf.ReadByte()
+				}
 			}
 			return b.String(), nil
 		}

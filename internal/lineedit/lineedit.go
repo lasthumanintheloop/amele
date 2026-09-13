@@ -263,12 +263,19 @@ func (st *state) edit(r rune) {
 // it is handled as the key it is, so Escape then Enter still submits and
 // Escape then Ctrl-C still interrupts. The returned flags are key's.
 func (e *Editor) escape(st *state) (done, deliver bool, err error) {
-	seq, err := e.readSequence()
+	// The byte after Escape decides: a sequence introducer, or a key of its
+	// own - read as a rune, so Escape then a non-ASCII character keeps that
+	// character whole.
+	r, _, err := e.in.ReadRune()
 	if err != nil {
 		return false, false, err
 	}
-	if len(seq) == 1 && seq != "[" && seq != "O" {
-		return e.key(st, rune(seq[0]))
+	if r != '[' && r != 'O' {
+		return e.key(st, r)
+	}
+	seq, err := e.readSequence(byte(r))
+	if err != nil {
+		return false, false, err
 	}
 	switch seq {
 	case "[A", "OA":
@@ -291,23 +298,18 @@ func (e *Editor) escape(st *state) (done, deliver bool, err error) {
 	return false, false, nil
 }
 
-// readSequence reads one CSI/SS3 sequence after the escape byte: the
-// introducer ([ or O), then parameter bytes up to and including the final
-// byte in 0x40-0x7e. A bare escape (nothing follows) is consumed alone.
-func (e *Editor) readSequence() (string, error) {
+// readSequence reads the rest of one CSI/SS3 sequence whose introducer ([ or
+// O) has already been read: parameter bytes up to and including the final
+// byte in 0x40-0x7e, bounded so an unknown sequence cannot eat the line.
+func (e *Editor) readSequence(introducer byte) (string, error) {
 	var b strings.Builder
+	b.WriteByte(introducer)
 	for {
 		c, err := e.in.ReadByte()
 		if err != nil {
 			return b.String(), err
 		}
 		b.WriteByte(c)
-		if b.Len() == 1 {
-			if c != '[' && c != 'O' {
-				return b.String(), nil // Alt-<key>: consumed, not interpreted
-			}
-			continue
-		}
 		if c >= 0x40 && c <= 0x7e {
 			return b.String(), nil
 		}
@@ -330,14 +332,21 @@ func (e *Editor) paste(st *state) error {
 			return err
 		}
 		if r == keyEscape {
-			seq, err := e.readSequence()
+			intro, err := e.in.ReadByte()
+			if err != nil {
+				return err
+			}
+			if intro != '[' && intro != 'O' {
+				continue // an escape inside a paste is not a key
+			}
+			seq, err := e.readSequence(intro)
 			if err != nil {
 				return err
 			}
 			if seq == pasteEnd {
 				break
 			}
-			continue // an escape inside a paste is not a key
+			continue
 		}
 		// CRLF and a bare CR both become one LF; the LF of a CRLF pair is
 		// the one byte skipped.
