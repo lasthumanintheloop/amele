@@ -521,6 +521,32 @@ provider call, no turn, no tokens. EOF (Ctrl-D, or the end of a piped script)
 ends the session with exit 0. The REPL and the `ask`-policy approval prompt
 share one reader, so answering a question never eats the next chat line.
 
+**Multi-line entry** (additive, 2026-09-13, issue #11): a line ending in a
+single backslash continues on the next line - the backslash is dropped, the
+prompt becomes `... `, and the lines are joined with a newline into one
+message. The rule is the same on a terminal and on a pipe, so a scripted
+session can send multi-line messages; a line ending in two backslashes is
+sent as-is. EOF in the middle of a continuation sends what was gathered.
+
+**Line editing and history** (same slice): when both stdin and stderr are a
+terminal, the prompt is a line editor rather than a cooked read. Up/Down (or
+Ctrl-P/Ctrl-N) recall this session's earlier messages newest first, Down past
+the newest returns to the line being typed; Left/Right, Home/End
+(Ctrl-A/Ctrl-E), Backspace/Delete, Ctrl-U (kill to start), Ctrl-K (kill to
+end) and Ctrl-W (kill the word before the cursor) edit the line; Ctrl-L clears
+the screen. A pasted block arrives as **one** message with its line breaks
+intact (bracketed paste; CRLF is normalized to LF) and no backslash is
+needed. Ctrl-C on an empty line ends the session exactly as a signal would
+(exit 1, `chat interrupted: interrupted`); on a line with text it discards the
+line and prompts again. Ctrl-D on an empty line is EOF (exit 0). The editor
+draws one row: a line wider than the terminal scrolls horizontally instead of
+wrapping, and a newline inside the entry is shown as `↵`. History is kept in
+memory for the session only and is never written to disk - a chat line is
+where people paste secrets. Piped stdin, or a stderr that is not a terminal,
+keeps the cooked line reader and its byte-identical behavior; the raw mode is
+entered only while a line is being read, so an approval question between two
+prompts is answered on a cooked line as before.
+
 **stdout**: the model's answers only, each followed by a newline. It is a
 *stream*, not a record format: answers routinely span several lines and there
 is no delimiter. A scripted consumer that needs a parseable boundary should

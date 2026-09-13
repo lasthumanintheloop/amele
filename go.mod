@@ -7,6 +7,7 @@ require (
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
 	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sys v0.47.0
+	golang.org/x/term v0.40.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

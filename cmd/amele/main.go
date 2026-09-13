@@ -38,6 +38,7 @@ import (
 	"github.com/lasthumanintheloop/amele/internal/ctxfile"
 	"github.com/lasthumanintheloop/amele/internal/doctor"
 	"github.com/lasthumanintheloop/amele/internal/explain"
+	"github.com/lasthumanintheloop/amele/internal/lineedit"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/loop"
 	"github.com/lasthumanintheloop/amele/internal/mcp"
@@ -438,6 +439,18 @@ STDIN
   script) ends the session with exit 0. The REPL and the ask-policy approval
   prompt share one reader, so answering a question never eats the next chat
   line.
+
+  A line ending in a backslash continues on the next line: the backslash is
+  dropped, the prompt becomes "... ", and the lines are joined with a newline
+  into one message. The rule holds on a pipe too.
+
+  On a terminal the prompt is a line editor: Up/Down (or Ctrl-P/Ctrl-N)
+  recall this session's earlier messages, Left/Right, Home/End (Ctrl-A/
+  Ctrl-E), Ctrl-U/Ctrl-K/Ctrl-W edit the line, and a pasted block arrives as
+  one message with its line breaks intact (bracketed paste). Ctrl-C on an
+  empty line ends the session like a signal would; on a line with text it
+  discards the line. History is kept in memory for the session only - it is
+  never written to disk.
 
 STDOUT
   The model's answers only, each followed by a newline. It is a stream, not a
@@ -2660,6 +2673,20 @@ func lockFilePath(configPath string) (string, error) {
 	return abs + ".lock", nil
 }
 
+// newChatEditor builds the chat line editor when both stdin and stderr are a
+// terminal - the editor draws on stderr, and a prompt drawn on a pipe would be
+// noise - and returns nil otherwise, which keeps the cooked line reader (and
+// the byte-identical piped behavior) for every other case. It is a variable
+// so the terminal path can be driven by a test with a fake terminal.
+var newChatEditor = func(lines *lineReader, stderr io.Writer) *lineedit.Editor {
+	stdin, ok := lines.src.(*os.File)
+	errFile, okErr := stderr.(*os.File)
+	if !ok || !okErr || !lines.IsTerminal() || !isTerminal(errFile) {
+		return nil
+	}
+	return lineedit.New(lines.buf, stderr, lineedit.NewTTY(stdin))
+}
+
 // chatPrompt is written to stderr before every input line. It lives on stderr
 // so stdout stays the answer channel: `amele chat cfg.yaml < script.txt` still
 // pipes cleanly.
@@ -2755,7 +2782,8 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 
 	set, mcpErr := connectMCP(ctx, cfg, agent.Registry, agent.Session, stderr, env, parsed.quiet, version, secrets)
 	maps.Copy(hints, set.hints)
-	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx, secrets: secrets}
+	s := &chatSession{cfg: cfg, agent: agent, quiet: parsed.quiet, mcp: set, runCtx: ctx, secrets: secrets,
+		editor: newChatEditor(lines, stderr)}
 	if mcpErr != nil {
 		// The conversation never starts: a chat whose tools are missing would
 		// mislead the human at the keyboard for its whole length. A Ctrl-C
@@ -2824,6 +2852,10 @@ type chatSession struct {
 	// runCtx is the session's context, kept only so finish can derive an
 	// uncancellable one for the orderly MCP shutdown after a signal.
 	runCtx context.Context //nolint:containedctx // session lifetime, not request scope
+	// editor is the line editor when stdin and stderr are a terminal (history,
+	// cursor keys, bracketed paste - issue #11), nil otherwise. It reads
+	// through the same buffered reader as the approval prompter.
+	editor *lineedit.Editor
 
 	// history is the conversation the caller owns. loop.RunMessages never
 	// mutates it, so every turn is appended here explicitly.
@@ -2854,8 +2886,7 @@ func (s *chatSession) repl(ctx context.Context, lines *lineReader, stdout, stder
 	}
 
 	for {
-		_, _ = fmt.Fprint(stderr, chatPrompt)
-		line, readErr := readAsync(ctx, lines.ReadLine)
+		line, readErr := s.readEntry(ctx, lines, stderr)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			// Ctrl-C at the prompt, a deadline inherited from the caller, or a
 			// stdin that broke. None of them can be answered by asking again.
@@ -2892,6 +2923,52 @@ func (s *chatSession) repl(ctx context.Context, lines *lineReader, stdout, stder
 			_, _ = fmt.Fprintln(stderr)
 			return s.finish(stderr, ExitOK, nil)
 		}
+	}
+}
+
+// chatContinuation is the prompt shown for the lines that follow a line
+// ending in a backslash - the multi-line entry rule (readEntry).
+const chatContinuation = "... "
+
+// readEntry reads one user entry: a physical line from the editor (terminal)
+// or the cooked reader (pipe), then every continuation line the entry asks
+// for.
+//
+// CONTRACT (docs/contracts/cli.md, chat): a line ending in a single backslash
+// continues on the next line - the backslash is dropped, the lines are joined
+// with a newline, and the prompt becomes "... " until a line does not end in
+// one. The rule is the same on a terminal and on a pipe, so a scripted
+// session can carry multi-line messages too. A pasted block on a terminal
+// needs no backslash: bracketed paste already delivers it whole. EOF in the
+// middle of a continuation sends what was gathered and reports EOF on the next
+// read, the same as a final line without a newline.
+func (s *chatSession) readEntry(ctx context.Context, lines *lineReader, stderr io.Writer) (string, error) {
+	var entry strings.Builder
+	prompt := chatPrompt
+	for {
+		var line string
+		var err error
+		if s.editor != nil {
+			line, err = readAsync(ctx, func() (string, error) { return s.editor.ReadLine(prompt) })
+		} else {
+			_, _ = fmt.Fprint(stderr, prompt)
+			line, err = readAsync(ctx, lines.ReadLine)
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", err
+		}
+		continued := err == nil && strings.HasSuffix(line, `\`) && !strings.HasSuffix(line, `\\`)
+		if continued {
+			line = strings.TrimSuffix(line, `\`)
+		}
+		if entry.Len() > 0 {
+			entry.WriteByte('\n')
+		}
+		entry.WriteString(line)
+		if !continued {
+			return entry.String(), err
+		}
+		prompt = chatContinuation
 	}
 }
 
@@ -2972,6 +3049,12 @@ func (s *chatSession) applyBudget() error {
 // finish closes the session log and prints the one-line cumulative summary,
 // returning the exit code it was given.
 func (s *chatSession) finish(stderr io.Writer, code int, err error) int {
+	// The terminal goes back to cooked mode before anything else is printed:
+	// a read abandoned on a cancelled context may have left it raw, and the
+	// summary below must land on a terminal that shows it.
+	if s.editor != nil {
+		s.editor.Close()
+	}
 	// CONTRACT: the mcp_disconnect events precede run_end. WithoutCancel so a
 	// Ctrl-C at the prompt still buys the servers their orderly close.
 	s.mcp.close(context.WithoutCancel(s.runCtx))

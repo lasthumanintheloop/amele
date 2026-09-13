@@ -198,6 +198,13 @@ Same YAML, same tools, same permissions as `run`. Details that matter:
 - **`ask` policies work interactively** here, because stdin is a terminal. The
   REPL and the approval prompt share one reader, so answering a question never
   eats your next chat line.
+- **A line editor on a terminal.** Up/Down recall this session's earlier
+  messages, the usual cursor and kill keys edit the line, and a pasted block
+  arrives as one message with its line breaks intact. A line ending in a
+  backslash continues on the next (`... `) - on a pipe too, so a scripted
+  session can send multi-line messages. History is in memory only; nothing is
+  written to disk. Details: the
+  [CLI contract](contracts/cli.md#amele-chat-configyamldir---model-model---set-keyvalue--w-dir--q-v).
 - Any error ends the session with its usual exit code (5 provider, 4 permission
   abort, 3 budget, 1 interrupted/failed) - the exit code contract is identical
   to `run`.

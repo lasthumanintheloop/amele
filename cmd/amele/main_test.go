@@ -22,6 +22,7 @@ import (
 	goyaml "gopkg.in/yaml.v3"
 
 	"github.com/lasthumanintheloop/amele/internal/config"
+	"github.com/lasthumanintheloop/amele/internal/lineedit"
 	"github.com/lasthumanintheloop/amele/internal/llm"
 	"github.com/lasthumanintheloop/amele/internal/resume"
 	"github.com/lasthumanintheloop/amele/internal/runlock"
@@ -5707,6 +5708,76 @@ func TestE2EResumeEmptyPathIsRefused(t *testing.T) {
 	if code != ExitConfigError || !strings.Contains(stderr, "chat has no --resume") {
 		t.Errorf("chat --resume \"\": exit %d, stderr %q; want exit %d and the chat refusal", code, stderr, ExitConfigError)
 	}
+}
+
+// TestE2EChatContinuation (issue #11): a line ending in a backslash continues
+// on the next line, on a pipe as on a terminal - the joined text is one
+// message, and the continuation prompt is shown.
+func TestE2EChatContinuation(t *testing.T) {
+	srv, reqs := capturingServer(t, textBody("ok"), textBody("kept"))
+	cfgPath, _ := writeTestConfig(t, srv.URL, "")
+	code, stdout, stderr := execCLI(t, []string{"chat", cfgPath}, "first line \\\nsecond line\nends in two \\\\\n")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "ok\nkept\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if len(*reqs) != 2 {
+		t.Fatalf("provider calls = %d, want 2", len(*reqs))
+	}
+	if got := lastContent((*reqs)[0].Messages, "user"); got != "first line \nsecond line" {
+		t.Errorf("first message = %q, want the two lines joined", got)
+	}
+	if got := lastContent((*reqs)[1].Messages, "user"); got != "ends in two \\\\" {
+		t.Errorf("second message = %q, want the double backslash kept", got)
+	}
+	if !strings.Contains(stderr, "> ... ") {
+		t.Errorf("stderr does not show the continuation prompt: %q", stderr)
+	}
+}
+
+// fakeChatTerminal stands in for the TTY in the editor path.
+type fakeChatTerminal struct{}
+
+func (fakeChatTerminal) MakeRaw() (func() error, error) { return func() error { return nil }, nil }
+func (fakeChatTerminal) Width() int                     { return 80 }
+
+// TestE2EChatEditorHistory drives the terminal path through the seam: the
+// editor reads the same buffered stdin the REPL shares with the prompter, Up
+// recalls the previous message, and Ctrl-D ends the session with exit 0.
+func TestE2EChatEditorHistory(t *testing.T) {
+	saved := newChatEditor
+	newChatEditor = func(lines *lineReader, stderr io.Writer) *lineedit.Editor {
+		return lineedit.New(lines.buf, stderr, fakeChatTerminal{})
+	}
+	t.Cleanup(func() { newChatEditor = saved })
+
+	srv, reqs := capturingServer(t, textBody("one"), textBody("two"))
+	cfgPath, _ := writeTestConfig(t, srv.URL, "")
+	// "hello", Enter; Up (recall "hello"), Enter; Ctrl-D.
+	code, stdout, stderr := execCLI(t, []string{"chat", cfgPath}, "hello\r\x1b[A\r\x04")
+	if code != ExitOK {
+		t.Fatalf("exit %d, stderr: %s", code, stderr)
+	}
+	if stdout != "one\ntwo\n" {
+		t.Errorf("stdout: %q", stdout)
+	}
+	if len(*reqs) != 2 || lastContent((*reqs)[1].Messages, "user") != "hello" {
+		t.Errorf("the recalled line was not sent: %+v", *reqs)
+	}
+	if !strings.Contains(stderr, "\r> hello\x1b[K") {
+		t.Errorf("the editor did not draw the prompt line on stderr: %q", stderr)
+	}
+
+	t.Run("ctrl-c on an empty line ends the session like a signal", func(t *testing.T) {
+		srv := scriptedServer(t)
+		cfgPath, _ := writeTestConfig(t, srv.URL, "")
+		code, _, stderr := execCLI(t, []string{"chat", cfgPath}, "\x03")
+		if code != ExitTaskFailed || !strings.Contains(stderr, "chat interrupted: interrupted") {
+			t.Fatalf("exit %d, stderr %q", code, stderr)
+		}
+	})
 }
 
 // TestChatRejectsResume: --resume is registered on chat only so the refusal
