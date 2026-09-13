@@ -330,6 +330,11 @@ and before any session log is opened - a refused resume leaves no file behind:
   In the file it looks like two adjacent `llm_response` events where the first
   requested no tool calls;
 - a missing or unreadable file (`opening session log: ...`);
+- an **empty path** - `--resume ""` or `--resume=` - is a usage error
+  (`amele run: --resume needs a path`), not a run started from scratch: in a
+  pipeline an empty value is a broken `$(...)` substitution far more often
+  than an intent, and a fresh run exiting 0 there would hide it. Added
+  2026-09-13 (issue #30); before it the empty value was read as "no resume";
 - a log whose run **already produced a final answer**, resumed with no
   instruction to add: `run already produced a final answer; pass an
   instruction to continue`. Whitespace-only task text is no instruction.

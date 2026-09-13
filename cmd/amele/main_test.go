@@ -5393,6 +5393,42 @@ func TestE2EResumeCompletedRun(t *testing.T) {
 	})
 }
 
+// TestE2EResumeEmptyPathIsRefused (issue #30): `--resume ""` is a usage error,
+// not a fresh run. The flag package cannot tell an explicitly empty value from
+// an absent flag, and in a pipeline an empty value is far more likely a broken
+// `$(...)` substitution than an intent - so the run must not silently start
+// from scratch and exit 0. CONTRACT: exit 2 before anything is loaded, no
+// provider call, nothing on stdout.
+func TestE2EResumeEmptyPathIsRefused(t *testing.T) {
+	srv := scriptedServer(t) // no bodies: any provider call fails the test
+	cfgPath, dir := writeResumeConfig(t, srv.URL, "")
+
+	code, stdout, stderr := execCLI(t, []string{"run", cfgPath, "--resume", "", "scan", "the", "logs"}, "")
+	if code != ExitConfigError {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, ExitConfigError, stderr)
+	}
+	if stdout != "" {
+		t.Errorf("a refused run wrote to stdout: %q", stdout)
+	}
+	if !strings.Contains(stderr, "--resume needs a path") {
+		t.Errorf("stderr = %q, want the empty-path refusal", stderr)
+	}
+	if files, _ := filepath.Glob(filepath.Join(dir, "sessions", "*.jsonl")); len(files) != 0 {
+		t.Errorf("a refused run left a session log behind: %v", files)
+	}
+	// The equals spelling is the one a script most likely produces.
+	code, _, stderr = execCLI(t, []string{"run", cfgPath, "--resume=", "scan"}, "")
+	if code != ExitConfigError || !strings.Contains(stderr, "--resume needs a path") {
+		t.Errorf("--resume=: exit %d, stderr %q; want exit %d and the refusal", code, stderr, ExitConfigError)
+	}
+	// chat keeps its own refusal for the empty spelling too: the flag was
+	// given, and chat has no use for it at any value.
+	code, _, stderr = execCLI(t, []string{"chat", cfgPath, "--resume", ""}, "")
+	if code != ExitConfigError || !strings.Contains(stderr, "chat has no --resume") {
+		t.Errorf("chat --resume \"\": exit %d, stderr %q; want exit %d and the chat refusal", code, stderr, ExitConfigError)
+	}
+}
+
 // TestChatRejectsResume: --resume is registered on chat only so the refusal
 // can say what is actually wrong. A conversation is resumed by having it, not
 // by replaying a log.

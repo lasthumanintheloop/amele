@@ -1525,6 +1525,12 @@ type agentArgs struct {
 	// what run_start.resumed_from records, so the log names the file the
 	// operator can find rather than a resolved form they never wrote.
 	resume string
+	// resumeSet records that --resume was given at all, which the value alone
+	// cannot say: `--resume ""` and no flag both leave resume empty. It is
+	// what lets an empty path be refused (issue #30) instead of read as "start
+	// from scratch" - in a pipeline an empty value is a broken `$(...)`
+	// substitution far more often than an intent.
+	resumeSet bool
 	// rest is the free-form remainder: task text for `run`; for `chat` any
 	// remainder is a usage error, because a chat reads its input from stdin.
 	rest []string
@@ -1546,6 +1552,25 @@ func rejectFlagInConfigPathSlot(name, usage, arg string, stderr io.Writer) {
 	_, _ = fmt.Fprintf(stderr,
 		"amele %s: %q is a flag, but the first argument is the config path - write the flags after it\n%s\n",
 		name, arg, usage)
+}
+
+// setFlag is a string flag that remembers whether it was given at all. The
+// flag package hands a *string flag its default for an absent flag and "" for
+// an explicitly empty one, and the two are indistinguishable afterwards; this
+// Value keeps the distinction so a flag that NEEDS a value can refuse an empty
+// one (--resume, issue #30) without turning "" into a sentinel path.
+type setFlag struct {
+	value string
+	set   bool
+}
+
+// String implements flag.Value. It returns the value as given.
+func (f *setFlag) String() string { return f.value }
+
+// Set implements flag.Value: it records the value and that the flag was seen.
+func (f *setFlag) Set(v string) error {
+	f.value, f.set = v, true
+	return nil
 }
 
 // parseAgentArgs parses that shared shape for the named command. On a usage
@@ -1601,7 +1626,8 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 	// unknown-flag error would tell a chat user that the flag does not exist,
 	// which is not the useful half of the truth. cmdChat refuses a non-empty
 	// value with the reason.
-	resumeFlag := fs.String("resume", "", "continue the run recorded in this session log")
+	var resumeFlag setFlag
+	fs.Var(&resumeFlag, "resume", "continue the run recorded in this session log")
 	if err := fs.Parse(args[1:]); err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n%s\n", name, err, usage)
 		return agentArgs{}, false
@@ -1612,7 +1638,8 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 		help:       *helpShort || *helpLong,
 		quiet:      *quietShort || *quietLong,
 		verbose:    *verboseShort || *verboseLong,
-		resume:     *resumeFlag,
+		resume:     resumeFlag.value,
+		resumeSet:  resumeFlag.set,
 		rest:       fs.Args(),
 	}
 	// Help wins over the conflict below: someone who asked for the manual gets
@@ -1625,6 +1652,15 @@ func parseAgentArgs(name, usage string, args []string, stderr io.Writer) (agentA
 		// mistake in a script that means to change how noisy a cron job is.
 		// CONTRACT: a usage error like any other - exit 2, nothing loaded.
 		_, _ = fmt.Fprintf(stderr, "amele %s: -q/--quiet and -v/--verbose cannot be combined\n", name)
+		return agentArgs{}, false
+	}
+	if parsed.resumeSet && parsed.resume == "" && name == "run" {
+		// The flag was given with nothing to read. Treating it as "no resume"
+		// would start a fresh run and exit 0 on what is almost certainly a
+		// script's empty substitution (issue #30). chat is exempt only
+		// because it refuses the flag at every value with its own sentence.
+		// CONTRACT: exit 2, nothing loaded, no session log created.
+		_, _ = fmt.Fprintf(stderr, "amele %s: --resume needs a path\n%s\n", name, usage)
 		return agentArgs{}, false
 	}
 	resolved, err := resolveConfigArg(parsed.configPath)
@@ -2363,7 +2399,7 @@ func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr
 		_, _ = fmt.Fprintf(stderr, "amele chat takes no task arguments (got %q); use `amele run` for a one-shot task\n", strings.Join(parsed.rest, " "))
 		return ExitConfigError
 	}
-	if parsed.resume != "" {
+	if parsed.resumeSet {
 		// The flag exists on this command only to make this sentence
 		// possible. A conversation is continued by having it - the REPL keeps
 		// its own history - and a chat log is refused by internal/resume
