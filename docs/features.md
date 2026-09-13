@@ -389,8 +389,10 @@ line's token figure carries a parenthetical -
 `✓ 8 turns, 3 tool calls, 41.0k tokens (28.0k cached), 34.2s` - and a run with
 no cache reads prints the line exactly as before. Where the caching comes from
 depends on the wire: amele places the markers itself on the anthropic wire
-(`provider.prompt_cache`, on by default), while every other endpoint decides on
-its own - see [docs/providers.md](providers.md#prompt-caching).
+(`provider.prompt_cache`, on by default), asks the OpenRouter gateway for its
+automatic caching with the same key (`dialect: openrouter`, opt-in), and every
+other endpoint decides on its own - see
+[docs/providers.md](providers.md#prompt-caching).
 
 `run_start` names the backend the run started on (`provider`: `openai`,
 `openai/<dialect>`, `anthropic`, `gemini` or `gemini/vertex`), and any turn

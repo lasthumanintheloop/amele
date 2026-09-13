@@ -181,16 +181,23 @@ type ProviderConfig struct {
 	// gemini config written before this block carries. It is refused with any
 	// other provider.type - the block describes ONE wire's endpoint.
 	Vertex *VertexConfig `yaml:"vertex"`
-	// PromptCache configures explicit prompt caching on the ANTHROPIC wire:
-	// cache_control breakpoints on the tool list, the system prompt and the
-	// last message, so an unchanged prefix is read back instead of re-billed.
+	// PromptCache configures explicit prompt caching where a request has to
+	// ask for it. On the ANTHROPIC wire: cache_control breakpoints on the tool
+	// list, the system prompt and the last message, so an unchanged prefix is
+	// read back instead of re-billed; nil means on - the default every
+	// anthropic config gets - and false sends the request without markers,
+	// byte-for-byte as it was sent before the key existed. It is a pointer
+	// for exactly that reason: "unset" and "false" must ask for opposite
+	// request bytes, which a bool cannot express.
 	//
-	// nil means on - the default every anthropic config gets - and false sends
-	// the request without markers, byte-for-byte as it was sent before the key
-	// existed. It is a pointer for exactly that reason: "unset" and "false"
-	// must ask for opposite request bytes, which a bool cannot express.
+	// With dialect: openrouter it asks the gateway for its automatic
+	// Anthropic-style caching (a body-root cache_control, issue #25). There it
+	// is OPT-IN: nil and false both send the pre-existing bytes, only true
+	// adds the key - the field is documented by the gateway but not yet
+	// observed live by amele (#17), so the default stays what every existing
+	// openrouter config gets.
 	//
-	// An explicit value with any other provider.type is a validation error
+	// An explicit value anywhere else is a validation error
 	// (validatePromptCache), not a silently ignored key: caching is automatic
 	// on those wires and there is no marker for the config to place.
 	PromptCache *bool `yaml:"prompt_cache"`
@@ -1415,36 +1422,44 @@ func (p *ProviderConfig) validateTuning(prefix string, add func(format string, a
 	dialect, known := p.tuningDialect(prefix, add)
 	p.validateReasoning(prefix, add, dialect, known)
 	p.validateSampling(prefix, add, dialect, known)
-	p.validatePromptCache(prefix, add)
+	p.validatePromptCache(prefix, add, dialect, known)
 	validateParams(prefix, add, p.Params, p.ownedParamsKeys(dialect, known), reservedWireFields)
 }
 
-// validatePromptCache scopes provider.prompt_cache to the wire that has
-// something to configure.
+// validatePromptCache scopes provider.prompt_cache to the targets that have
+// something to configure: the anthropic wire, and the openrouter dialect of
+// the openai wire.
 //
 // CONTRACT: the key decides whether the anthropic client places cache_control
-// breakpoints. The openai-compatible endpoints and the gemini wire cache
-// automatically - the request carries no marker amele could add or withhold -
-// so an explicit value there would be a dropped field while the file claims a
-// setting. Refused rather than ignored, following provider.reasoning.
-// budget_tokens: a knob that cannot reach the wire it is written for is a
-// mistake the operator can only find by reading amele's source otherwise.
+// breakpoints, and whether the openrouter request carries the gateway's
+// top-level cache_control (issue #25). Every other openai-compatible endpoint
+// and the gemini wire cache automatically - the request carries no marker
+// amele could add or withhold - so an explicit value there would be a dropped
+// field while the file claims a setting. Refused rather than ignored,
+// following provider.reasoning.budget_tokens: a knob that cannot reach the
+// wire it is written for is a mistake the operator can only find by reading
+// amele's source otherwise.
 //
-// Not gated on the dialect: this is a WIRE question, and the dialect describes
-// a variation of the openai one, so an unparseable dialect cannot make it
-// unanswerable (the budget-fits-cap precedent).
+// The dialect is consulted only to ADMIT openrouter: an unparseable dialect is
+// reported on its own line and, being unknown, admits nothing - the key is then
+// refused with the wire answer, which stays true whatever the dialect turns
+// out to be.
 //
 // nil is always legal, on every wire: it is what every config written before
-// the key existed carries, and it means "the wire's own default".
-func (p *ProviderConfig) validatePromptCache(prefix string, add func(format string, args ...any)) {
+// the key existed carries, and it means "the target's own default".
+func (p *ProviderConfig) validatePromptCache(prefix string, add func(format string, args ...any), dialect llm.Dialect, known bool) {
 	if p.PromptCache == nil || p.Type == ProviderTypeAnthropic {
+		return
+	}
+	if p.Type != ProviderTypeGemini && known && dialect == llm.DialectOpenRouter {
 		return
 	}
 	// The message says caching still HAPPENS before it says to remove the key:
 	// an operator who set it to turn caching on must not read "remove it" as
 	// "this endpoint does not cache".
 	add("%s.prompt_cache: caching is automatic on this wire; "+
-		"the key configures the anthropic wire's cache_control markers - remove it", prefix)
+		"the key configures the anthropic wire's cache_control markers "+
+		"(and, with dialect: openrouter, the gateway's top-level cache_control) - remove it", prefix)
 }
 
 // tuningDialect resolves the dialect the dialect-DEPENDENT rules are checked

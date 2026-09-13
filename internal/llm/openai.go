@@ -77,6 +77,16 @@ type OpenAIClient struct {
 	// Determinism rule (docs/engineering.md §5.4): time-dependent behavior must be
 	// injectable.
 	Sleep func(ctx context.Context, d time.Duration) error
+	// PromptCache asks the OpenRouter gateway for Anthropic-style prompt
+	// caching: a body-root `cache_control: {"type":"ephemeral"}`, which the
+	// gateway documents as "automatic caching" - it places one breakpoint at
+	// the last cacheable block and moves it forward as the conversation grows,
+	// the same moving mark the anthropic wire's third breakpoint is. The
+	// message bytes are untouched, so nothing about the content shape
+	// changes. Honored on DialectOpenRouter only; every other dialect ignores
+	// it, because no other endpoint documents the field (issue #25). The zero
+	// value sends the request exactly as before the field existed.
+	PromptCache bool
 }
 
 // Wire types for the OpenAI-compatible JSON body. Kept unexported: the rest
@@ -103,6 +113,11 @@ type oaRequest struct {
 	// exact setting a deterministic run asks for.
 	Temperature *float64 `json:"temperature,omitempty"`
 	TopP        *float64 `json:"top_p,omitempty"`
+	// CacheControl is OpenRouter's top-level automatic-caching marker (see
+	// OpenAIClient.PromptCache). Nil - the key absent - on every other
+	// dialect and whenever caching was not asked for. The type is the
+	// anthropic wire's, because it is the same object.
+	CacheControl *anCacheControl `json:"cache_control,omitempty"`
 }
 
 // oaResponseFormat is the response_format object. Which variant it carries is
@@ -545,6 +560,13 @@ func (c *OpenAIClient) toWire(req Request) (oaRequest, map[string]json.RawMessag
 	// silently by amele.
 	out.Temperature = req.Temperature
 	out.TopP = req.TopP
+	// CONTRACT: the dialect gate is here, not at the caller: a PromptCache
+	// set on a client of another dialect must not reach an endpoint that has
+	// no meaning for the field (config validation refuses the key there, but
+	// the client is a public type and defends its own wire).
+	if c.PromptCache && c.Dialect == DialectOpenRouter {
+		out.CacheControl = ephemeralCacheControl()
+	}
 
 	// MapReasoning allocates a fresh map per call, so extending it with the
 	// raw params below cannot leak into another request.

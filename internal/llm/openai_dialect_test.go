@@ -34,7 +34,9 @@ type wireCase struct {
 	name    string
 	golden  string
 	dialect Dialect
-	req     Request
+	// cache sets OpenAIClient.PromptCache for the case.
+	cache bool
+	req   Request
 }
 
 func wireCases() []wireCase {
@@ -186,6 +188,27 @@ func wireCases() []wireCase {
 			},
 		},
 		{
+			// OpenRouter's automatic caching is ONE body-root key; the
+			// messages keep their string content (issue #25).
+			name:    "openrouter prompt cache",
+			golden:  "openrouter-cache.json",
+			dialect: DialectOpenRouter,
+			cache:   true,
+			req: Request{
+				Model:    "anthropic/claude-opus-5",
+				Messages: baseMessages(),
+			},
+		},
+		{
+			// The same flag on any other dialect is inert: no endpoint but
+			// the gateway documents the field, so the bytes are the baseline's.
+			name:    "openai ignores the prompt cache flag",
+			golden:  "openai-baseline.json",
+			dialect: DialectOpenAI,
+			cache:   true,
+			req:     Request{Model: "gpt-5.6-sol", Messages: baseMessages()},
+		},
+		{
 			// deepseek has no json_schema on this wire, so the schema-carrying
 			// request would be a guaranteed 400 followed by a schema-LESS
 			// repeat. It sends the JSON mode the provider does have instead.
@@ -216,7 +239,7 @@ func wireCases() []wireCase {
 func TestToWireGolden(t *testing.T) {
 	for _, tc := range wireCases() {
 		t.Run(tc.name, func(t *testing.T) {
-			client := &OpenAIClient{Dialect: tc.dialect}
+			client := &OpenAIClient{Dialect: tc.dialect, PromptCache: tc.cache}
 			wire, fields := client.toWire(tc.req)
 			got, err := encodeBody(wire, fields)
 			if err != nil {

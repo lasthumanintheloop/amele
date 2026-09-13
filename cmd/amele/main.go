@@ -3162,6 +3162,10 @@ func buildProviderFrom(p *config.ProviderConfig, registerSecret func(...string))
 		RequestTimeout: p.RequestTimeout.Std(),
 		MaxAttempts:    maxAttempts,
 		InitialBackoff: initialBackoff,
+		// Opt-in here, unlike the anthropic wire: only an explicit true asks
+		// the gateway for its caching (config.ProviderConfig.PromptCache).
+		// The client applies it on the openrouter dialect alone.
+		PromptCache: p.PromptCache != nil && *p.PromptCache,
 	}, nil
 }
 

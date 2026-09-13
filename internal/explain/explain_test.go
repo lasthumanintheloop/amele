@@ -1320,6 +1320,8 @@ func TestRenderPromptCacheRow(t *testing.T) {
 	const anthropicOn = "  prompt cache:    anthropic cache_control on tools, system and the last message (up to 3 breakpoints)\n"
 	const anthropicOff = "  prompt cache:    disabled (provider.prompt_cache: false)\n"
 	const automatic = "  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)\n"
+	const openRouterOn = "  prompt cache:    openrouter top-level cache_control (the gateway caches up to the last block and moves the mark every turn; live-unverified)\n"
+	const openRouterOff = "  prompt cache:    whatever OpenRouter does on its own (provider.prompt_cache: true asks it for Anthropic-style caching)\n"
 
 	cases := []struct {
 		name    string
@@ -1361,6 +1363,23 @@ func TestRenderPromptCacheRow(t *testing.T) {
 			mutate:  func(*config.Config) {},
 			want:    automatic,
 			notWant: []string{anthropicOn, anthropicOff},
+		},
+		{
+			// openrouter is the one openai-wire dialect with a request of its
+			// own to describe, in both directions (issue #25).
+			name:    "openrouter with the key omitted is the gateway's own",
+			mutate:  func(c *config.Config) { c.Provider.Dialect = "openrouter" },
+			want:    openRouterOff,
+			notWant: []string{automatic, openRouterOn},
+		},
+		{
+			name: "openrouter with the key true asks for the marker",
+			mutate: func(c *config.Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.PromptCache = ptrBool(true)
+			},
+			want:    openRouterOn,
+			notWant: []string{automatic, openRouterOff},
 		},
 		{
 			name: "so does the gemini wire",

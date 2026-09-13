@@ -1789,7 +1789,8 @@ const wantReservedStream = `provider.params key "stream" is reserved on every ta
 // operator who set it hoping to TURN CACHING ON does not read "remove it" as
 // "you cannot have caching".
 const wantPromptCacheOffWire = `provider.prompt_cache: caching is automatic on this wire; ` +
-	`the key configures the anthropic wire's cache_control markers - remove it`
+	`the key configures the anthropic wire's cache_control markers ` +
+	`(and, with dialect: openrouter, the gateway's top-level cache_control) - remove it`
 
 // TestValidateProviderTuning is the rule-by-rule table for the tuning surface.
 // Every case is a rule an operator can only learn about at exit 2, so each
@@ -2327,6 +2328,44 @@ func TestValidateProviderTuning(t *testing.T) {
 			"prompt_cache on the openai wire",
 			func(c *Config) { c.Provider.PromptCache = ptrBool(true) },
 			wantPromptCacheOffWire,
+		},
+		{
+			// The openrouter dialect has a marker of its own to place (the
+			// gateway's top-level cache_control, issue #25), so the key is
+			// legal there in both directions.
+			"prompt_cache on with dialect openrouter",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.PromptCache = ptrBool(true)
+			},
+			"",
+		},
+		{
+			"prompt_cache off with dialect openrouter",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.PromptCache = ptrBool(false)
+			},
+			"",
+		},
+		{
+			// The gateway's marker is owned on openrouter whether or not the
+			// key is set: a params copy would silently win or lose against
+			// provider.prompt_cache.
+			"params cache_control collides on openrouter",
+			func(c *Config) {
+				c.Provider.Dialect = "openrouter"
+				c.Provider.Params = map[string]any{"cache_control": map[string]any{"type": "ephemeral"}}
+			},
+			`provider.params key "cache_control" is a request field amele sets itself on this target; remove it (params carries provider-specific extras only)`,
+		},
+		{
+			// ...and only there: the plain openai dialect never writes it.
+			"params cache_control is free on openai",
+			func(c *Config) {
+				c.Provider.Params = map[string]any{"cache_control": map[string]any{"type": "ephemeral"}}
+			},
+			"",
 		},
 		{
 			// false is refused as loudly as true: the operator is switching off

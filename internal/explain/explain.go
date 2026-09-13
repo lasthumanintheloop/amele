@@ -999,6 +999,18 @@ func retryRow(b *strings.Builder, cfg *config.Config) {
 // API. It is the first question every mapping row asks: on that wire the
 // dialect is not consulted at all, and the reasoning knob takes a different
 // shape entirely.
+// openRouterDialect reports whether the primary speaks the openai wire in its
+// openrouter variation - the one dialect with a prompt-cache request of its
+// own. A gemini-typed config with a leftover dialect is not it: that wire
+// never reads the dialect.
+func openRouterDialect(cfg *config.Config) bool {
+	if cfg.Provider.Type == config.ProviderTypeGemini {
+		return false
+	}
+	d, err := llm.ParseDialect(cfg.Provider.Dialect)
+	return err == nil && d == llm.DialectOpenRouter
+}
+
 func anthropicWire(cfg *config.Config) bool {
 	return cfg.Provider.Type == config.ProviderTypeAnthropic
 }
@@ -1093,6 +1105,17 @@ func dialectRow(b *strings.Builder, cfg *config.Config) {
 // would both leave the reviewer believing this run pays full price.
 func promptCacheRow(b *strings.Builder, cfg *config.Config) {
 	if !anthropicWire(cfg) {
+		if openRouterDialect(cfg) {
+			// The one openai-wire target where amele can ask: the row says
+			// which of the two requests will be sent, and that the default is
+			// the gateway's own behavior rather than an amele marker.
+			if pc := cfg.Provider.PromptCache; pc != nil && *pc {
+				fmt.Fprint(b, "  prompt cache:    openrouter top-level cache_control (the gateway caches up to the last block and moves the mark every turn; live-unverified)\n")
+			} else {
+				fmt.Fprint(b, "  prompt cache:    whatever OpenRouter does on its own (provider.prompt_cache: true asks it for Anthropic-style caching)\n")
+			}
+			return
+		}
 		fmt.Fprint(b, "  prompt cache:    automatic on this wire (reported in the session log when the endpoint says so)\n")
 		return
 	}

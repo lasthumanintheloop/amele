@@ -183,6 +183,39 @@ func TestBuildProviderPromptCache(t *testing.T) {
 	}
 }
 
+// TestBuildProviderPromptCacheOpenRouter: on the openai wire the key is
+// opt-in - only an explicit true reaches the client - because the gateway's
+// marker is documented but not yet observed live (issue #25).
+func TestBuildProviderPromptCacheOpenRouter(t *testing.T) {
+	cases := []struct {
+		name  string
+		value *bool
+		want  bool
+	}{
+		{"omitted means off", nil, false},
+		{"true means on", ptrBool(true), true},
+		{"false means off", ptrBool(false), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Model: "m", Provider: config.ProviderConfig{
+				Dialect: "openrouter", PromptCache: tc.value,
+			}}
+			provider, err := buildProviderFrom(&cfg.Provider, nil)
+			if err != nil {
+				t.Fatalf("buildProviderFrom: %v", err)
+			}
+			client, ok := provider.(*llm.OpenAIClient)
+			if !ok {
+				t.Fatalf("provider is %T, want *llm.OpenAIClient", provider)
+			}
+			if client.PromptCache != tc.want {
+				t.Errorf("PromptCache = %v, want %v", client.PromptCache, tc.want)
+			}
+		})
+	}
+}
+
 // ptrBool is the literal-to-pointer helper for provider.prompt_cache: the key
 // is a *bool because omitted (cache on) and false must reach the client as
 // different answers.
