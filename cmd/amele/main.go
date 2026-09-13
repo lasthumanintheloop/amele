@@ -193,9 +193,11 @@ DESCRIPTION
   parsing stops at the first non-flag argument, so anything after the task
   text - including --model - is task text.
 
-  A directory argument is shorthand for <dir>/agent.yaml inside it; the run
-  lock is derived from the resolved file, so both spellings contend on the
-  same lock.
+  A directory argument is shorthand for <dir>/agent.yaml inside it, and a
+  bare name that names nothing on disk is looked up as a saved agent:
+  $XDG_CONFIG_HOME/amele/<name>.yaml or <name>/agent.yaml there (~/.config
+  when the variable is unset). The run lock is derived from the resolved
+  file, so every spelling of one config contends on the same lock.
 
   The message the model sees is built from the task text and, when needed,
   piped stdin. A config with a prompt template controls that composition
@@ -398,7 +400,9 @@ DESCRIPTION
   Free-form arguments are rejected (exit 2) with a hint to use run - a chat
   reads its input from stdin.
 
-  A directory argument is shorthand for <dir>/agent.yaml inside it.
+  A directory argument is shorthand for <dir>/agent.yaml inside it, and a
+  bare name that names nothing on disk is looked up as a saved agent under
+  $XDG_CONFIG_HOME/amele (~/.config/amele when unset).
 
   The whole session is one entry in the session log: one run_start (recorded
   with the task "interactive chat") and one run_end with the session totals.
@@ -488,7 +492,9 @@ DESCRIPTION
   interpolate it, so an unset variable is reported here instead of surfacing
   much later as a confusing provider error.
 
-  A directory argument is shorthand for <dir>/agent.yaml inside it.
+  A directory argument is shorthand for <dir>/agent.yaml inside it, and a
+  bare name that names nothing on disk is looked up as a saved agent under
+  $XDG_CONFIG_HOME/amele (~/.config/amele when unset).
 
   Violations are collected and reported together: one invocation names
   everything that is wrong with the file, not just the first problem.
@@ -550,7 +556,9 @@ DESCRIPTION
   to, but not including, provider construction: load, validate, compile
   output.schema, build the real tool registry.
 
-  A directory argument is shorthand for <dir>/agent.yaml inside it.
+  A directory argument is shorthand for <dir>/agent.yaml inside it, and a
+  bare name that names nothing on disk is looked up as a saved agent under
+  $XDG_CONFIG_HOME/amele (~/.config/amele when unset).
 
   explain reports; run gates. A config that cannot run yet - unset ${VAR}s, a
   workspace that does not exist, a schema that will not compile - is still
@@ -1097,7 +1105,7 @@ func cmdHelp(args []string, stdout, stderr io.Writer) int {
 // them, so the command answers "will THIS invocation work?" rather than a
 // question about a file nobody runs bare.
 func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseInspectArgs(context.Background(), "validate", usageValidate, args, stderr)
+	parsed, ok := parseInspectArgs(context.Background(), env, "validate", usageValidate, args, stderr)
 	if !ok {
 		return ExitConfigError
 	}
@@ -1157,7 +1165,7 @@ func cmdValidate(args []string, stdout, stderr io.Writer, env config.LookupEnv) 
 // refuses to touch such a config (exit 2), which is where that judgement
 // belongs.
 func cmdExplain(ctx context.Context, args []string, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, ok := parseInspectArgs(context.Background(), "explain", usageExplain, args, stderr)
+	parsed, ok := parseInspectArgs(context.Background(), env, "explain", usageExplain, args, stderr)
 	if !ok {
 		return ExitConfigError
 	}
@@ -1620,7 +1628,7 @@ func (f *setFlag) Set(v string) error {
 // was never a usable config path, so reading it as a help request is additive.
 // The same slot rejects any other flag-shaped argument outright
 // (rejectFlagInConfigPathSlot): no flag is a config path either.
-func parseAgentArgs(ctx context.Context, name, usage string, args []string, stderr io.Writer) (agentArgs, int) {
+func parseAgentArgs(ctx context.Context, env config.LookupEnv, name, usage string, args []string, stderr io.Writer) (agentArgs, int) {
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(stderr, usage)
 		return agentArgs{}, ExitConfigError
@@ -1680,7 +1688,7 @@ func parseAgentArgs(ctx context.Context, name, usage string, args []string, stde
 	if !parsed.flagsAgree(name, usage, stderr) {
 		return agentArgs{}, ExitConfigError
 	}
-	resolved, err := resolveConfigArg(ctx, parsed.configPath)
+	resolved, err := resolveConfigArg(ctx, env, parsed.configPath)
 	if err != nil {
 		if ctx.Err() != nil {
 			// Not a usage error: a signal arrived while the path was being
@@ -1694,36 +1702,107 @@ func parseAgentArgs(ctx context.Context, name, usage string, args []string, stde
 	return parsed, ExitOK
 }
 
-// resolveConfigArg maps a directory argument to its canonical entry point
-// <dir>/agent.yaml. Files and non-existent paths pass through untouched so
-// Load keeps reporting them with its own errors. CONTRACT: resolution
-// happens at parse time, BEFORE the run lock is derived, so `run pack/`
-// and `run pack/agent.yaml` contend on the same lock file.
+// resolveConfigArg maps the config argument to the file `Load` should open:
+// a directory to its canonical entry point <dir>/agent.yaml, and a bare name
+// that names nothing on disk to a saved agent under the user's config
+// directory (issue #12). Files pass through untouched, and so does anything
+// that is neither a directory nor a resolvable name, so Load keeps reporting
+// them with its own errors.
+//
+// CONTRACT: resolution happens at parse time, BEFORE the run lock is derived,
+// so `run pack/`, `run pack/agent.yaml` and `run <name>` for a saved pack all
+// contend on the same lock file. An existing path always wins over a saved
+// agent of the same spelling: the shell's own view of the filesystem is never
+// second-guessed, and every invocation written before names existed resolves
+// exactly as it did.
 //
 // Both lookups go through the context (issue #29): a stat on a hung mount
 // blocks like a read, and this is the first thing the binary does with the
 // path. A context error is returned as-is so the caller can report an
 // interrupted run rather than a usage error.
-func resolveConfigArg(ctx context.Context, path string) (string, error) {
-	info, err := ctxfile.Stat(ctx, path)
+func resolveConfigArg(ctx context.Context, env config.LookupEnv, arg string) (string, error) {
+	info, err := ctxfile.Stat(ctx, arg)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		// A missing path passes through untouched so Load reports it.
-		return path, nil
+		// Nothing on disk: a bare name may be a saved agent. Anything else
+		// passes through so Load reports the missing file.
+		return resolveAgentName(ctx, env, arg)
 	}
 	if !info.IsDir() {
-		return path, nil
+		return arg, nil
 	}
-	candidate := filepath.Join(path, "agent.yaml")
+	candidate := filepath.Join(arg, "agent.yaml")
 	if _, err := ctxfile.Stat(ctx, candidate); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return "", ctxErr
 		}
-		return "", fmt.Errorf("no agent.yaml in %s", path)
+		return "", fmt.Errorf("no agent.yaml in %s", arg)
 	}
 	return candidate, nil
+}
+
+// resolveAgentName looks a bare name up under the agents directory:
+// <dir>/<name>.yaml first, then <dir>/<name>/agent.yaml (a saved pack). An
+// argument that is not a bare name, or a host with no config directory at all,
+// is handed back unchanged; a bare name that resolves to nothing is an error
+// naming both places the lookup went, so the operator learns where a saved
+// agent is expected to live without reading the docs.
+func resolveAgentName(ctx context.Context, env config.LookupEnv, arg string) (string, error) {
+	dir := agentsDir(env)
+	if !isAgentName(arg) || dir == "" {
+		return arg, nil
+	}
+	for _, candidate := range []string{filepath.Join(dir, arg+".yaml"), filepath.Join(dir, arg, "agent.yaml")} {
+		if _, err := ctxfile.Stat(ctx, candidate); err == nil {
+			return candidate, nil
+		} else if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", ctxErr
+		}
+	}
+	return "", fmt.Errorf("no such file %q and no saved agent named %q (looked in %s)", arg, arg, dir)
+}
+
+// isAgentName reports whether arg is spelled like a saved agent's name rather
+// than like a path: one bare component, no directory separator, no YAML
+// extension. `sentry` is a name; `./sentry`, `sentry.yaml` and `packs/sentry`
+// are paths and are never looked up - a path an operator typed points where it
+// points.
+func isAgentName(arg string) bool {
+	if arg == "" || arg == "." || arg == ".." || filepath.Base(arg) != arg {
+		return false
+	}
+	if strings.ContainsAny(arg, `/\`) {
+		return false
+	}
+	ext := strings.ToLower(filepath.Ext(arg))
+	return ext != ".yaml" && ext != ".yml"
+}
+
+// agentsDir is where saved agents live: the amele directory under the XDG
+// config home - $XDG_CONFIG_HOME/amele, or $HOME/.config/amele when the
+// variable is unset (on Windows %AppData%\amele). Empty when the host names
+// no such place, in which case there is nothing to look in and a bare name
+// is treated as the file it would be anywhere else.
+//
+// The environment is the injected LookupEnv rather than os.Getenv
+// (docs/engineering.md §5.4), which is also what makes the lookup testable
+// without touching the developer's own config directory.
+func agentsDir(env config.LookupEnv) string {
+	if xdg, ok := env("XDG_CONFIG_HOME"); ok && xdg != "" {
+		return filepath.Join(xdg, "amele")
+	}
+	if runtime.GOOS == "windows" {
+		if appData, ok := env("AppData"); ok && appData != "" {
+			return filepath.Join(appData, "amele")
+		}
+		return ""
+	}
+	if home, ok := env("HOME"); ok && home != "" {
+		return filepath.Join(home, ".config", "amele")
+	}
+	return ""
 }
 
 // reportLoadError prints a config-load failure and maps it to an exit code.
@@ -1821,7 +1900,7 @@ type inspectArgs struct {
 // only as the SOLE argument (docs/contracts/cli.md): alongside anything else
 // the invocation remains a usage error, so a wrong argument count is never
 // answered with a help page and an exit 0.
-func parseInspectArgs(ctx context.Context, name, usage string, args []string, stderr io.Writer) (inspectArgs, bool) {
+func parseInspectArgs(ctx context.Context, env config.LookupEnv, name, usage string, args []string, stderr io.Writer) (inspectArgs, bool) {
 	if len(args) < 1 {
 		_, _ = fmt.Fprintln(stderr, usage)
 		return inspectArgs{}, false
@@ -1865,7 +1944,7 @@ func parseInspectArgs(ctx context.Context, name, usage string, args []string, st
 		_, _ = fmt.Fprintln(stderr, usage)
 		return inspectArgs{}, false
 	}
-	resolved, err := resolveConfigArg(ctx, args[0])
+	resolved, err := resolveConfigArg(ctx, env, args[0])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele %s: %v\n", name, err)
 		return inspectArgs{}, false
@@ -1876,7 +1955,7 @@ func parseInspectArgs(ctx context.Context, name, usage string, args []string, st
 // cmdRun executes a one-shot agent run and maps every failure to the exit
 // code contract.
 func cmdRun(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, parseCode := parseAgentArgs(ctx, "run", usageRun, args, stderr)
+	parsed, parseCode := parseAgentArgs(ctx, env, "run", usageRun, args, stderr)
 	if parseCode != ExitOK {
 		return parseCode
 	}
@@ -2461,7 +2540,7 @@ const chatTaskLabel = "interactive chat"
 // (Ctrl-D). Config loading and validation are identical to `run` - the same
 // YAML describes both modes - and so is the exit code contract.
 func cmdChat(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, env config.LookupEnv) int {
-	parsed, parseCode := parseAgentArgs(ctx, "chat", usageChat, args, stderr)
+	parsed, parseCode := parseAgentArgs(ctx, env, "chat", usageChat, args, stderr)
 	if parseCode != ExitOK {
 		return parseCode
 	}

@@ -60,7 +60,7 @@ func cmdMCP(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 	if hasHelpFlag(args) {
 		return printHelp("mcp", stdout, stderr)
 	}
-	sub, rest, ok := parseMCPArgs(args, stderr)
+	sub, rest, ok := parseMCPArgs(env, args, stderr)
 	if !ok {
 		return ExitConfigError
 	}
@@ -101,7 +101,7 @@ type mcpArgs struct {
 // all: the credential commands act on the config as written, and the `--set`
 // allowlist deliberately excludes every mcp.* key, so an override here could
 // only make the CLI point at a server the run would never use.
-func parseMCPArgs(args []string, stderr io.Writer) (string, mcpArgs, bool) {
+func parseMCPArgs(env config.LookupEnv, args []string, stderr io.Writer) (string, mcpArgs, bool) {
 	fail := func() (string, mcpArgs, bool) {
 		_, _ = fmt.Fprintln(stderr, usageMCP)
 		return "", mcpArgs{}, false
@@ -123,7 +123,7 @@ func parseMCPArgs(args []string, stderr io.Writer) (string, mcpArgs, bool) {
 	if len(rest) > maxArgs {
 		return fail()
 	}
-	resolved, err := resolveConfigArg(context.Background(), rest[0])
+	resolved, err := resolveConfigArg(context.Background(), env, rest[0])
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "amele mcp %s: %v\n", sub, err)
 		return "", mcpArgs{}, false

@@ -456,14 +456,40 @@ result is unknown.
 keyboard, and its log carries the fixed task `interactive chat`, which is not
 resumable in the first place.
 
-### Directory arguments
+### Directory and name arguments
 
 If the config argument is a directory, `<dir>/agent.yaml` is used. A
 directory without `agent.yaml` is a config error (exit 2:
 `no agent.yaml in <dir>`). The lock file (`lock: true`) is derived from
 the resolved path, so `run pack/` and `run pack/agent.yaml` are the same
 run for single-flight purposes. Applies to `run`, `chat`, `validate`,
-`explain`. (Additive, 2026-08-12.)
+`explain`, `mcp`. (Additive, 2026-08-12.)
+
+A **bare name** that names nothing on disk is looked up as a saved agent
+(additive, 2026-09-13, issue #12): `<config-home>/amele/<name>.yaml` first,
+then `<config-home>/amele/<name>/agent.yaml` for a saved pack, where
+`<config-home>` is `$XDG_CONFIG_HOME`, or `$HOME/.config` when that variable
+is unset (`%AppData%` on Windows). So `amele run sentry "scan the logs"` runs
+`~/.config/amele/sentry.yaml`. The rules that keep this from surprising a
+script:
+
+- an existing file or directory of that spelling **always wins** - the lookup
+  happens only when the stat fails, so every invocation that worked before
+  resolves exactly as it did;
+- only a bare name is looked up: one path component, no `/` or `\`, no
+  `.yaml`/`.yml` extension. `./sentry`, `sentry.yaml` and `packs/sentry` are
+  paths and are handed to the loader as typed;
+- a name that resolves to nothing is exit 2 with both places named:
+  `no such file "sentry" and no saved agent named "sentry" (looked in
+  /home/x/.config/amele)`;
+- a host with neither variable set has no agents directory, and a bare name
+  is then simply the file it would be anywhere else (`reading sentry: no such
+  file or directory`, exit 2).
+
+The resolved file is what the run lock, `resumed_from` and every other path
+derived from the config argument see; the name itself is not recorded
+anywhere. `amele init ~/.config/amele/<name>.yaml` is how a saved agent is
+created - there is no separate save command.
 
 **Exit codes**: the full [table](exit-codes.md) - 0 success, 1 task failed /
 interrupted, 2 config error, 3 budget, 4 aborting permission denial,

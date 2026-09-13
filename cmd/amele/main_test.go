@@ -906,11 +906,11 @@ func TestDirectoryArgSharesLockWithFileArg(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "agent.yaml"), []byte("model: m\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	pd, code := parseAgentArgs(context.Background(), "run", usageRun, []string{dir}, io.Discard)
+	pd, code := parseAgentArgs(context.Background(), env(t), "run", usageRun, []string{dir}, io.Discard)
 	if code != ExitOK {
 		t.Fatal("parseAgentArgs(dir) failed")
 	}
-	pf, code := parseAgentArgs(context.Background(), "run", usageRun, []string{filepath.Join(dir, "agent.yaml")}, io.Discard)
+	pf, code := parseAgentArgs(context.Background(), env(t), "run", usageRun, []string{filepath.Join(dir, "agent.yaml")}, io.Discard)
 	if code != ExitOK {
 		t.Fatal("parseAgentArgs(file) failed")
 	}
@@ -924,6 +924,96 @@ func TestDirectoryArgSharesLockWithFileArg(t *testing.T) {
 	}
 	if ld != lf {
 		t.Errorf("lock paths differ: dir arg %q vs file arg %q", ld, lf)
+	}
+}
+
+// savedAgents builds a config home holding two saved agents - sentry.yaml and
+// packed/agent.yaml - and returns its amele directory with two environments:
+// one naming it through XDG_CONFIG_HOME, one through HOME (where it sits under
+// .config).
+func savedAgents(t *testing.T) (agents string, withXDG, withHome config.LookupEnv) {
+	t.Helper()
+	xdg := t.TempDir()
+	agents = filepath.Join(xdg, "amele")
+	body := []byte("model: m\nprovider:\n  api_key: ${TEST_KEY}\n")
+	for _, f := range []string{filepath.Join(agents, "sentry.yaml"), filepath.Join(agents, "packed", "agent.yaml"),
+		filepath.Join(xdg, ".config", "amele", "home.yaml")} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	withXDG = func(key string) (string, bool) {
+		if key == "XDG_CONFIG_HOME" {
+			return xdg, true
+		}
+		return env(t)(key)
+	}
+	withHome = func(key string) (string, bool) {
+		if key == "HOME" {
+			return xdg, true
+		}
+		return env(t)(key)
+	}
+	return agents, withXDG, withHome
+}
+
+// TestNamedAgentDiscovery (issue #12): a bare name that names nothing on disk
+// is looked up under the config directory, an existing path always wins, and
+// anything spelled like a path is never looked up.
+func TestNamedAgentDiscovery(t *testing.T) {
+	agents, withXDG, withHome := savedAgents(t)
+	local := filepath.Join(t.TempDir(), "sentry")
+	if err := os.WriteFile(local, []byte("model: local\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		env  config.LookupEnv
+		arg  string
+		want string
+		err  string
+	}{
+		{"a name resolves to <dir>/<name>.yaml", withXDG, "sentry", filepath.Join(agents, "sentry.yaml"), ""},
+		{"a name resolves to <dir>/<name>/agent.yaml", withXDG, "packed", filepath.Join(agents, "packed", "agent.yaml"), ""},
+		{"HOME/.config is the fallback", withHome, "home", filepath.Join(filepath.Dir(agents), ".config", "amele", "home.yaml"), ""},
+		{"an unknown name says where it looked", withXDG, "nope", "", `no such file "nope" and no saved agent named "nope" (looked in ` + agents + ")"},
+		{"a path-like argument is never looked up", withXDG, "sentry.yaml", "sentry.yaml", ""},
+		{"a relative path is never looked up", withXDG, "./sentry", "./sentry", ""},
+		{"no config directory means no lookup", env(t), "sentry", "sentry", ""},
+		{"an existing path wins over a saved agent", withXDG, local, local, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveConfigArg(context.Background(), tc.env, tc.arg)
+			if err == nil {
+				err = errors.New("")
+			}
+			if got != tc.want || err.Error() != tc.err {
+				t.Fatalf("resolveConfigArg(%q) = %q, %q; want %q, %q", tc.arg, got, err, tc.want, tc.err)
+			}
+		})
+	}
+}
+
+// TestNamedAgentEndToEnd: `run <name>` runs the saved agent, and an unknown
+// name is a config error on every command that takes a config argument.
+func TestNamedAgentEndToEnd(t *testing.T) {
+	agents, withXDG, _ := savedAgents(t)
+	srv := scriptedServer(t, textBody("from the saved agent"))
+	if err := os.WriteFile(filepath.Join(agents, "live.yaml"), []byte(fmt.Sprintf("model: m\nprovider:\n  base_url: %s/v1\n  api_key: ${TEST_KEY}\n", srv.URL)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errBuf bytes.Buffer
+	code := run(context.Background(), []string{"run", "live", "hi"}, strings.NewReader(""), &out, &errBuf, withXDG)
+	if code != ExitOK || out.String() != "from the saved agent\n" {
+		t.Fatalf("exit %d, stdout %q, stderr %s", code, out.String(), errBuf.String())
+	}
+	code = run(context.Background(), []string{"validate", "nope"}, strings.NewReader(""), &out, &errBuf, withXDG)
+	if code != ExitConfigError || !strings.Contains(errBuf.String(), "no saved agent named") {
+		t.Fatalf("validate nope: exit %d, stderr %q", code, errBuf.String())
 	}
 }
 
